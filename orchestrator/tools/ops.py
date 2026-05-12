@@ -1,0 +1,275 @@
+"""Operational MCP tools: diagnostics, CI/merge polling, restart recovery, cache reset."""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import sqlite3
+
+from orchestrator import github, github_app, repo_verify, state
+from orchestrator.agents import ManagedAgentWorker
+from orchestrator.models import ACTIVE_UNIT_STATUSES
+from orchestrator.tools import mcp, need_github_token
+
+
+@mcp.tool()
+def hello_world_test() -> str:
+    """Smoke test. Spawns a fresh Managed Agent, asks it to say hello.
+
+    Use to confirm the Claude Code + MCP + Managed Agents chain is healthy.
+    Costs ~one second of session-hour billing; safe to call any time.
+    """
+    worker = ManagedAgentWorker(role="coder")
+    session_id, response = worker.spawn(
+        "Reply with exactly the string: hello from a managed agent",
+        title="smoke-test",
+    )
+    worker.archive(session_id)
+    return f"session_id={session_id}\nresponse={response!r}"
+
+
+@mcp.tool()
+def check_unit_pr(unit_id: str) -> str:
+    """Poll GitHub for the PR's state + check_runs. Flips unit to 'done' if merged."""
+    unit_state = state.get_unit_state(unit_id)
+    if not unit_state or not unit_state.pr_number:
+        return f"ERROR: unit {unit_id} has no PR"
+
+    feature = state.get_feature(unit_state.feature_id)
+    if not feature:
+        return f"ERROR: feature for unit {unit_id} not found"
+
+    if err := need_github_token():
+        return err
+
+    try:
+        pr_state = github.get_pr_state(feature.repo_path, unit_state.pr_number)
+        checks = github.get_pr_check_runs(feature.repo_path, unit_state.pr_number)
+    except Exception as e:  # noqa: BLE001
+        return f"ERROR querying GitHub: {e}"
+
+    if pr_state.get("merged") and unit_state.status != "done":
+        state.touch_unit(unit_id, status="done")
+        state.record_event(
+            unit_id,
+            unit_state.feature_id,
+            "merged",
+            source="human",
+            cycle_number=unit_state.review_round,
+            summary=f"PR #{unit_state.pr_number} merged at {pr_state.get('merged_at')}",
+        )
+
+    # Re-read after potential touch_unit above to surface latest status
+    refreshed = state.get_unit_state(unit_id)
+    return json.dumps(
+        {
+            "unit_id": unit_id,
+            "pr_number": unit_state.pr_number,
+            "pr_state": pr_state,
+            "checks": checks,
+            "orchestrator_status": refreshed.status if refreshed else "unknown",
+        },
+        indent=2,
+    )
+
+
+@mcp.tool()
+def list_in_flight() -> str:
+    """List units in active states across all features.
+
+    Use after an MCP server restart (laptop sleep, crash, /quit + relaunch)
+    to find units whose sessions may still be running on Anthropic's side
+    but whose local state never got finalized. For each, you can call
+    `resume_unit(unit_id, role)` to query the session's current status.
+
+    Returns units with status in: coding, testing, opening_pr, in_ci,
+    reviewing, fixing.
+    """
+    active = tuple(ACTIVE_UNIT_STATUSES)
+    placeholders = ",".join("?" * len(active))
+    with contextlib.closing(sqlite3.connect(state.STATE_DB)) as conn:
+        conn.row_factory = sqlite3.Row
+        # `placeholders` is "?,?,?,..." sized to the fixed ACTIVE_UNIT_STATUSES
+        # tuple; the values themselves bind via the `active` parameter.
+        rows = conn.execute(
+            f"SELECT * FROM work_units WHERE status IN ({placeholders}) ORDER BY last_activity DESC",  # noqa: S608  # nosec B608
+            active,
+        ).fetchall()
+    return json.dumps(
+        [
+            {
+                "unit_id": r["unit_id"],
+                "feature_id": r["feature_id"],
+                "status": r["status"],
+                "branch": r["branch"],
+                "pr_number": r["pr_number"],
+                "has_coder_session": bool(r["coder_session_id"]),
+                "has_tester_session": bool(r["tester_session_id"]),
+                "has_reviewer_session": bool(r["reviewer_session_id"]),
+                "review_round": r["review_round"],
+                "last_activity": r["last_activity"],
+                "last_error": r["last_error"],
+            }
+            for r in rows
+        ],
+        indent=2,
+    )
+
+
+@mcp.tool()
+def resume_unit(unit_id: str, role: str = "coder") -> str:
+    """Check status of a unit's saved session after an MCP server restart.
+
+    Queries Anthropic for the session's current status (idle/running/
+    rescheduling/terminated) and returns it along with local state.
+    Does NOT auto-advance the unit's status — interpret the result and
+    call the appropriate next-step tool manually.
+    """
+    if role not in ("coder", "tester", "reviewer"):
+        return f"ERROR: role must be coder|tester|reviewer, got {role!r}"
+
+    unit_state = state.get_unit_state(unit_id)
+    if not unit_state:
+        return f"ERROR: no state for {unit_id}"
+
+    sid_map = {
+        "coder": unit_state.coder_session_id,
+        "tester": unit_state.tester_session_id,
+        "reviewer": unit_state.reviewer_session_id,
+    }
+    sid = sid_map[role]
+    if not sid:
+        return f"ERROR: no {role} session_id stored for {unit_id}"
+
+    worker = ManagedAgentWorker(role=role)
+    try:
+        session = worker.client.beta.sessions.retrieve(sid)
+    except Exception as e:  # noqa: BLE001
+        return f"ERROR retrieving session {sid}: {e}"
+
+    return json.dumps(
+        {
+            "unit_id": unit_id,
+            "role": role,
+            "session_id": sid,
+            "session_status": getattr(session, "status", "unknown"),
+            "session_title": getattr(session, "title", None),
+            "local_status": unit_state.status,
+            "branch": unit_state.branch,
+            "pr_number": unit_state.pr_number,
+            "review_round": unit_state.review_round,
+            "last_activity": unit_state.last_activity,
+        },
+        indent=2,
+    )
+
+
+# --------------------------- repo verification ---------------------------
+
+
+@mcp.tool()
+def verify_repo(repo_url: str) -> str:
+    """Verify a target repo against the orchestrator's policy and cache the result.
+
+    Runs ~5 GitHub API calls (read access, default branch, branch protection
+    rule, App installation membership for App auth, CODEOWNERS sniff).
+    Stores a row in `verified_repos` if every blocking check passes; that
+    row is trusted by spawn-side gates for 24h before re-verifying.
+
+    Use cases:
+      - First-time onboarding of a target repo (call before `load_feature`)
+      - Re-check after the user fixes a missing branch protection rule
+      - Force a fresh check before resuming a long-paused feature
+
+    Returns a human-readable pass/fail report. The lead should surface it
+    verbatim to the user — it includes the exact fix-it instructions when
+    a check fails.
+    """
+    if err := need_github_token():
+        return err
+    try:
+        token = github_app.get_agent_token()
+    except RuntimeError as e:
+        return f"ERROR: {e}"
+    auth_mode = github_app.auth_mode()
+    try:
+        result = repo_verify.verify(repo_url, token, auth_mode=auth_mode)
+    except ValueError as e:
+        return f"ERROR: {e}"
+    except Exception as e:  # noqa: BLE001
+        return f"ERROR contacting GitHub: {e}"
+
+    lines = repo_verify.format_result_lines(result)
+    if result.passed:
+        state.save_verified_repo(result)
+        lines.append("")
+        lines.append("Cached — spawns against this repo are now allowed for 24h.")
+    else:
+        lines.append("")
+        lines.append("Verification FAILED — spawns against this repo will be blocked until fixed.")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def list_verified_repos() -> str:
+    """List every repo currently in the verification cache.
+
+    Output includes the verified-at timestamp, default branch, and auth
+    identity that did the verification. Use to audit what the orchestrator
+    will allow spawns against right now.
+    """
+    repos = state.list_verified_repos()
+    if not repos:
+        return "No repos have been verified. Call `verify_repo(<url>)` to add one."
+    return json.dumps(
+        [
+            {
+                "repo_url": r.repo_url,
+                "default_branch": r.default_branch,
+                "auth_mode": r.auth_mode,
+                "auth_identity": r.auth_identity,
+                "verified_at": r.verified_at,
+                "required_approvals": r.required_approvals,
+                "has_codeowners": r.has_codeowners,
+                "requires_signed_commits": r.requires_signed_commits,
+            }
+            for r in repos
+        ],
+        indent=2,
+    )
+
+
+@mcp.tool()
+def forget_repo(repo_url: str) -> str:
+    """Remove a repo from the verification cache. Forces re-verify on next use.
+
+    Use after:
+      - You changed branch protection rules and want the cache to refresh
+      - You revoked the App's access and want to confirm the gate kicks in
+      - General debugging
+    """
+    try:
+        normalized = repo_verify.normalize_repo_url(repo_url)
+    except ValueError as e:
+        return f"ERROR: {e}"
+    deleted = state.forget_verified_repo(normalized)
+    if not deleted:
+        return f"{normalized} was not in the cache (already forgotten or never verified)."
+    return f"Forgot {normalized}. Next spawn against it will trigger re-verification."
+
+
+@mcp.tool()
+def reset_cached_resources() -> str:
+    """Drop the cached agent + environment ids. Next spawn creates fresh ones.
+
+    Routine changes (prompt edits, model swap) AUTOMATICALLY invalidate the
+    cache via the resource signature. Use this tool only for edge cases:
+      - Anthropic deprecates a model/feature that breaks existing agents
+      - You suspect cached agent_ids are stale and want a clean slate
+      - Debugging cache-related weirdness
+
+    Old agents/environments on Anthropic's side become orphaned but cost
+    nothing while idle. Returns the count of cache rows deleted.
+    """
+    n = state.clear_cached_resources()
+    return f"Cleared {n} cached resource row(s). Next spawn will create fresh agent + environment."

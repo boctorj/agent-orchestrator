@@ -1,0 +1,549 @@
+"""CLI entry point for the agent orchestrator.
+
+Subcommands:
+    orchestrator version     — show version
+    orchestrator doctor      — health check (verify env, tokens, claude CLI)
+    orchestrator init        — interactive setup wizard
+    orchestrator dashboard   — launch the live TUI dashboard
+    orchestrator run         — launch Claude Code with Remote Control
+
+Install: `pip install -e .` from project root.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import sys
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
+from pathlib import Path
+
+import click
+from rich.console import Console
+
+PKG_NAME = "agent-orchestrator"
+
+
+def _silence_httpx_logging() -> None:
+    """httpx default logger spams INFO 'HTTP Request: …' lines.
+
+    The doctor / init commands make a quick GET /user call — without this,
+    the rich console output gets interleaved with httpx's logger output.
+    """
+    import logging
+
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+def _version() -> str:
+    try:
+        return _pkg_version(PKG_NAME)
+    except PackageNotFoundError:
+        return "unknown (not installed)"
+
+
+@click.group(help="Multi-agent SDLC orchestrator.")
+@click.version_option(_version(), prog_name=PKG_NAME)
+def cli() -> None:
+    pass
+
+
+# --------------------------- version ---------------------------
+
+
+@cli.command(help="Show the installed version.")
+def version() -> None:
+    click.echo(f"{PKG_NAME} {_version()}")
+
+
+# --------------------------- dashboard ---------------------------
+
+
+@cli.command(help="Launch the live TUI dashboard (Ctrl+C to quit).")
+def dashboard() -> None:
+    from orchestrator.dashboard import main as dashboard_main
+
+    raise SystemExit(dashboard_main())
+
+
+# --------------------------- run ---------------------------
+
+
+@cli.command(help="Launch Claude Code with the orchestrator MCP server (Remote Control on).")
+@click.option("--no-remote-control", is_flag=True, help="Skip --remote-control flag.")
+def run(no_remote_control: bool) -> None:
+    console = Console()
+    env_file = Path(".env")
+    if not env_file.exists():
+        console.print("[red]Missing .env[/red] — run [cyan]orchestrator init[/cyan] first.")
+        raise SystemExit(1)
+
+    env_content = env_file.read_text()
+    if not re.search(r"^ANTHROPIC_API_KEY=sk-ant-", env_content, re.MULTILINE):
+        console.print("[red]ANTHROPIC_API_KEY not set in .env[/red] (must start with `sk-ant-`).")
+        raise SystemExit(1)
+
+    if not shutil.which("claude"):
+        console.print(
+            "[red]`claude` CLI not found in PATH.[/red] Install Claude Code first: "
+            "https://claude.com/product/claude-code"
+        )
+        raise SystemExit(1)
+
+    # Belt-and-suspenders: clear API key from parent env so claude uses claude.ai token
+    new_env = dict(os.environ)
+    new_env.pop("ANTHROPIC_API_KEY", None)
+
+    cmd = ["claude"]
+    if not no_remote_control:
+        cmd.append("--remote-control")
+
+    console.print(f"[dim]launching: {' '.join(cmd)}[/dim]")
+    # Intentional no-shell exec: cmd[0] is the literal "claude",
+    # cmd is a list (no shell interpretation), new_env is fully controlled above.
+    os.execvpe(cmd[0], cmd, new_env)  # noqa: S606  # nosec B606
+
+
+# --------------------------- doctor ---------------------------
+
+
+@cli.command(help="Health check — verify everything is configured correctly.")
+def doctor() -> None:
+    _silence_httpx_logging()
+    console = Console()
+    console.print("\n[bold]Orchestrator health check[/bold]\n")
+
+    all_pass = True
+
+    def report(name: str, ok: bool, detail: str = "") -> None:
+        nonlocal all_pass
+        icon = "[green]✓[/green]" if ok else "[red]✗[/red]"
+        line = f"  {icon} {name}"
+        if detail:
+            line += f" [dim]· {detail}[/dim]"
+        console.print(line)
+        if not ok:
+            all_pass = False
+
+    # 1. Python version
+    report(
+        "Python >= 3.11",
+        sys.version_info >= (3, 11),
+        f"running {sys.version.split()[0]}",
+    )
+
+    # 2. Package importable
+    try:
+        from orchestrator import mcp_server  # noqa: F401
+
+        report("orchestrator package importable", True, f"{PKG_NAME} {_version()}")
+    except Exception as e:
+        report("orchestrator package importable", False, str(e))
+
+    # 3. .env file
+    env_file = Path(".env")
+    env_exists = env_file.exists()
+    report(".env file in current directory", env_exists)
+
+    env_content = env_file.read_text() if env_exists else ""
+    ant_match = re.search(r"^ANTHROPIC_API_KEY=(\S+)", env_content, re.MULTILINE)
+    gh_match = re.search(r"^GITHUB_TOKEN=(\S+)", env_content, re.MULTILINE)
+    ntfy_match = re.search(r"^NTFY_TOPIC=(\S+)", env_content, re.MULTILINE)
+    app_id_match = re.search(r"^GITHUB_APP_ID=(\S+)", env_content, re.MULTILINE)
+    app_inst_match = re.search(r"^GITHUB_APP_INSTALLATION_ID=(\S+)", env_content, re.MULTILINE)
+    app_keypath_match = re.search(r"^GITHUB_APP_PRIVATE_KEY_PATH=(\S+)", env_content, re.MULTILINE)
+    app_keyinline_match = re.search(r"^GITHUB_APP_PRIVATE_KEY=(.+)$", env_content, re.MULTILINE)
+
+    # 4. ANTHROPIC_API_KEY
+    if ant_match and ant_match.group(1).startswith("sk-ant-"):
+        report("ANTHROPIC_API_KEY format", True, f"prefix {ant_match.group(1)[:12]}…")
+    else:
+        report("ANTHROPIC_API_KEY format", False, "missing or wrong format")
+
+    # 5. GitHub auth — App takes precedence over PAT
+    # Load .env values into os.environ so github_app helpers see them
+    import os as _os
+
+    if app_id_match:
+        _os.environ["GITHUB_APP_ID"] = app_id_match.group(1)
+    if app_inst_match:
+        _os.environ["GITHUB_APP_INSTALLATION_ID"] = app_inst_match.group(1)
+    if app_keypath_match:
+        _os.environ["GITHUB_APP_PRIVATE_KEY_PATH"] = app_keypath_match.group(1)
+    if app_keyinline_match:
+        _os.environ["GITHUB_APP_PRIVATE_KEY"] = app_keyinline_match.group(1)
+    if gh_match:
+        _os.environ["GITHUB_TOKEN"] = gh_match.group(1)
+
+    from orchestrator import github_app
+
+    if github_app.is_app_configured():
+        # is_app_configured() implies these regex matches succeeded too
+        assert app_id_match is not None and app_inst_match is not None
+        report(
+            "GitHub App configured",
+            True,
+            f"app_id={app_id_match.group(1)} installation={app_inst_match.group(1)}",
+        )
+        # Try minting a real token to confirm App auth works end-to-end
+        try:
+            github_app.clear_token_cache()
+            token = github_app.mint_installation_token()
+            import httpx
+
+            r = httpx.get(
+                "https://api.github.com/installation/repositories",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                repos = r.json().get("total_count", "?")
+                report("GitHub App installation token mints", True, f"{repos} repo(s)")
+            else:
+                report("GitHub App installation token mints", False, f"HTTP {r.status_code}")
+        except Exception as e:
+            report("GitHub App installation token mints", False, str(e))
+    elif gh_match and gh_match.group(1):
+        token = gh_match.group(1)
+        fmt_ok = token.startswith(("github_pat_", "ghp_"))
+        report("GITHUB_TOKEN format (PAT fallback)", fmt_ok, f"prefix {token[:15]}…")
+        if fmt_ok:
+            import httpx
+
+            try:
+                r = httpx.get(
+                    "https://api.github.com/user",
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=10,
+                )
+                if r.status_code == 200:
+                    report(
+                        "GITHUB_TOKEN authenticates",
+                        True,
+                        f"as {r.json().get('login', '?')}",
+                    )
+                else:
+                    report("GITHUB_TOKEN authenticates", False, f"HTTP {r.status_code}")
+            except Exception as e:
+                report("GITHUB_TOKEN authenticates", False, str(e))
+    else:
+        report(
+            "GitHub auth configured",
+            False,
+            "set GITHUB_APP_* (recommended) or GITHUB_TOKEN (PAT fallback)",
+        )
+
+    # 6. NTFY_TOPIC (informational only — not a failure if missing)
+    if ntfy_match and ntfy_match.group(1):
+        topic = ntfy_match.group(1)
+        report("NTFY_TOPIC set (optional)", True, f"{topic[:20]}…")
+    else:
+        report("NTFY_TOPIC set (optional)", True, "[dim]unset → push notifications disabled[/dim]")
+        # don't fail on this
+
+    # 7. Claude Code CLI
+    claude_path = shutil.which("claude")
+    report("claude CLI installed", bool(claude_path), claude_path or "not in PATH")
+
+    # 8. .mcp.json
+    mcp_path = Path(".mcp.json")
+    report(
+        ".mcp.json in project root",
+        mcp_path.exists(),
+        "registers orchestrator MCP server" if mcp_path.exists() else "missing",
+    )
+
+    # 9. state.db (informational)
+    from orchestrator import state
+
+    state_exists = state.STATE_DB.exists()
+    if state_exists:
+        # quick read-only sanity check
+        try:
+            features = state.list_features()
+            report("state.db readable", True, f"{len(features)} feature(s) tracked")
+        except Exception as e:
+            report("state.db readable", False, str(e))
+    else:
+        report(
+            "state.db",
+            True,
+            "[dim]missing — will be created on first orchestrator run[/dim]",
+        )
+
+    # 10. gh CLI (informational — used by snapshot script + can help debug)
+    gh_path = shutil.which("gh")
+    if gh_path:
+        report("gh CLI installed (optional)", True, gh_path)
+    else:
+        report(
+            "gh CLI installed (optional)",
+            True,
+            "[dim]not in PATH — agents bring their own inside containers[/dim]",
+        )
+
+    console.print()
+    if all_pass:
+        console.print("[bold green]✓ all checks passed[/bold green]")
+        console.print("\nNext: [cyan]orchestrator run[/cyan]")
+        raise SystemExit(0)
+    else:
+        console.print("[bold red]✗ some checks failed[/bold red]")
+        console.print("\nFix: [cyan]orchestrator init[/cyan] (interactive setup)")
+        raise SystemExit(1)
+
+
+# --------------------------- verify-repo ---------------------------
+
+
+@cli.command(
+    "verify-repo",
+    help="Verify a target repo against the orchestrator's policy and cache it.",
+)
+@click.argument("repo_url")
+def verify_repo_cmd(repo_url: str) -> None:
+    """Run policy verification against a repo. Caches the result on success.
+
+    The same check that the orchestrator runs implicitly before any spawn —
+    invoke it manually at setup time to confirm branch protection and
+    permissions are in place BEFORE you load a feature.
+    """
+    _silence_httpx_logging()
+    console = Console()
+
+    # Load .env from the current working directory ONLY — not via the
+    # default find_dotenv() walk, which traverses up from this file's
+    # location and would pick up the orchestrator repo's .env during
+    # tests / when the user invokes the CLI from an unrelated directory.
+    from dotenv import load_dotenv
+
+    load_dotenv(dotenv_path=Path(".env"))
+
+    from orchestrator import github_app, repo_verify, state
+
+    try:
+        token = github_app.get_agent_token()
+    except RuntimeError as e:
+        console.print(f"[red]✗ {e}[/red]")
+        console.print("\nFix: run [cyan]orchestrator init[/cyan] to configure GitHub auth.")
+        raise SystemExit(1) from None
+
+    auth_mode = github_app.auth_mode()
+
+    try:
+        result = repo_verify.verify(repo_url, token, auth_mode=auth_mode)
+    except ValueError as e:
+        console.print(f"[red]✗ {e}[/red]")
+        raise SystemExit(1) from None
+    except Exception as e:  # noqa: BLE001
+        console.print(f"[red]✗ error contacting GitHub: {e}[/red]")
+        raise SystemExit(1) from None
+
+    for line in repo_verify.format_result_lines(result):
+        console.print(line)
+
+    if result.passed:
+        state.init_db()  # ensure table exists in case this is run pre-init
+        state.save_verified_repo(result)
+        console.print()
+        console.print("[green]✓ cached — spawns against this repo are allowed for 24h[/green]")
+        raise SystemExit(0)
+    else:
+        console.print()
+        console.print("[red]✗ verification FAILED — spawns against this repo will be blocked[/red]")
+        raise SystemExit(1)
+
+
+# --------------------------- init ---------------------------
+
+
+@cli.command(help="Interactive setup wizard: writes .env, initializes state.db.")
+@click.option("--force", is_flag=True, help="Overwrite existing .env without asking.")
+def init(force: bool) -> None:
+    _silence_httpx_logging()
+    console = Console()
+    console.print("\n[bold cyan]Agent orchestrator setup[/bold cyan]\n")
+
+    # Sanity: are we in an orchestrator project directory?
+    pyproject = Path("pyproject.toml")
+    in_project = pyproject.exists() and "agent-orchestrator" in pyproject.read_text()
+    if not in_project:
+        console.print(
+            "[yellow]Warning:[/yellow] this doesn't look like the agent-orchestrator "
+            "project directory (no matching pyproject.toml).\n"
+            "The wizard will still write to .env here, but Claude Code expects to "
+            "launch from the orchestrator project root."
+        )
+        if not click.confirm("Continue anyway?", default=False):
+            return
+
+    # Check for existing .env
+    env_file = Path(".env")
+    if (
+        env_file.exists()
+        and not force
+        and not click.confirm(
+            f".env already exists at {env_file.resolve()} — overwrite?", default=False
+        )
+    ):
+        console.print("[dim]aborted; existing .env left untouched[/dim]")
+        return
+
+    # 1. Anthropic API key
+    console.print("\n[bold]1. Anthropic API key[/bold]")
+    console.print(
+        "Get one from [link]https://console.anthropic.com[/link] → Settings → API Keys.\n"
+        "Note: this is separate from your claude.ai subscription billing."
+    )
+    api_key = click.prompt("  ANTHROPIC_API_KEY", hide_input=True)
+    while not api_key.startswith("sk-ant-"):
+        console.print("  [red]Must start with sk-ant-[/red]")
+        api_key = click.prompt("  ANTHROPIC_API_KEY", hide_input=True)
+
+    # 2. GitHub auth — App (recommended) or PAT
+    console.print("\n[bold]2. GitHub authentication for worker agents[/bold]")
+    console.print(
+        "Choose [cyan]a[/cyan] for a GitHub App (recommended: bot identity, "
+        "1-hr tokens, easier audit/revocation)\n"
+        "       [cyan]p[/cyan] for a fine-grained PAT (faster setup, single-user)"
+    )
+    choice = click.prompt(
+        "  GitHub auth method (a/p)",
+        type=click.Choice(["a", "p"], case_sensitive=False),
+        default="p",
+    ).lower()
+
+    gh_app_id = ""
+    gh_app_inst = ""
+    gh_app_key_path = ""
+    gh_token = ""  # nosec B105 — placeholder init for the PAT branch below, not a secret
+
+    if choice == "a":
+        console.print(
+            "\n  Register an App at https://github.com/settings/apps/new\n"
+            "  Required permissions: contents:rw, pull_requests:rw, issues:rw,\n"
+            "                        checks:read, metadata:read; webhook off.\n"
+            "  Install it on your target repos."
+        )
+        gh_app_id = click.prompt("  GITHUB_APP_ID (numeric)").strip()
+        gh_app_inst = click.prompt(
+            "  GITHUB_APP_INSTALLATION_ID (numeric, from install URL)"
+        ).strip()
+        gh_app_key_path = click.prompt("  Path to App private key .pem (chmod 600 first)").strip()
+        # Live mint a token to verify
+        import httpx
+
+        from orchestrator import github_app
+
+        os.environ["GITHUB_APP_ID"] = gh_app_id
+        os.environ["GITHUB_APP_INSTALLATION_ID"] = gh_app_inst
+        os.environ["GITHUB_APP_PRIVATE_KEY_PATH"] = gh_app_key_path
+        try:
+            github_app.clear_token_cache()
+            tok = github_app.mint_installation_token()
+            r = httpx.get(
+                "https://api.github.com/installation/repositories",
+                headers={"Authorization": f"Bearer {tok}"},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                console.print(
+                    f"  [green]✓ App token mints OK · "
+                    f"{r.json().get('total_count', '?')} repo(s) installed[/green]"
+                )
+            else:
+                console.print(f"  [yellow]token mint returned HTTP {r.status_code}[/yellow]")
+                if not click.confirm("  Continue anyway?", default=True):
+                    return
+        except Exception as e:
+            console.print(f"  [yellow]could not verify App auth live: {e}[/yellow]")
+            if not click.confirm("  Continue anyway?", default=True):
+                return
+    else:
+        console.print(
+            "  Create a fine-grained PAT: https://github.com/settings/personal-access-tokens/new\n"
+            "  Permissions: contents:rw, pull_requests:rw, issues:rw,\n"
+            "               metadata:read, actions:read, checks:read, commit_statuses:read"
+        )
+        gh_token = click.prompt("  GITHUB_TOKEN", hide_input=True)
+        while not gh_token.startswith(("github_pat_", "ghp_")):
+            console.print("  [red]Must start with github_pat_ or ghp_[/red]")
+            gh_token = click.prompt("  GITHUB_TOKEN", hide_input=True)
+
+        import httpx
+
+        try:
+            r = httpx.get(
+                "https://api.github.com/user",
+                headers={"Authorization": f"Bearer {gh_token}"},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                console.print(f"  [green]✓ authenticated as {r.json()['login']}[/green]")
+            else:
+                console.print(
+                    f"  [yellow]token returned HTTP {r.status_code} — verify manually[/yellow]"
+                )
+                if not click.confirm("  Continue anyway?", default=True):
+                    return
+        except Exception as e:
+            console.print(f"  [yellow]could not verify token live: {e}[/yellow]")
+
+    # 3. NTFY topic (optional)
+    console.print("\n[bold]3. ntfy.sh push topic (optional)[/bold]")
+    console.print(
+        "For phone push notifications on escalations + ready-to-merge events.\n"
+        "Use a hard-to-guess string (treat like a password)."
+    )
+    suggested = "agent-orch-" + os.urandom(9).hex()[:12]
+    ntfy = click.prompt(
+        f"  NTFY_TOPIC (suggested: {suggested}, blank to skip)",
+        default="",
+        show_default=False,
+    )
+
+    # 4. Write .env
+    env_lines = [
+        "# Anthropic API key for Managed Agents (separate from claude.ai subscription)",
+        f"ANTHROPIC_API_KEY={api_key}",
+        "",
+        "# GitHub auth — App (preferred) or PAT (fallback)",
+        f"GITHUB_APP_ID={gh_app_id}",
+        f"GITHUB_APP_INSTALLATION_ID={gh_app_inst}",
+        f"GITHUB_APP_PRIVATE_KEY_PATH={gh_app_key_path}",
+        f"GITHUB_TOKEN={gh_token}",
+        "",
+        "# Optional ntfy.sh push topic (blank to disable)",
+        f"NTFY_TOPIC={ntfy}",
+        "",
+    ]
+    env_file.write_text("\n".join(env_lines))
+    console.print(f"\n[green]✓ wrote {env_file.resolve()}[/green]")
+
+    # 5. Initialize state.db
+    from orchestrator import state
+
+    state.init_db()
+    console.print(f"[green]✓ initialized state.db at {state.STATE_DB}[/green]")
+
+    # 6. Subscribe ntfy reminder
+    if ntfy:
+        console.print(
+            f"\n[bold]Don't forget:[/bold] subscribe to topic [cyan]{ntfy}[/cyan] "
+            "in the ntfy mobile app to receive push notifications."
+        )
+
+    # 7. Next steps
+    console.print("\n[bold]Done![/bold] Next:\n")
+    console.print("  1. [cyan]orchestrator doctor[/cyan]     — verify everything")
+    console.print("  2. [cyan]orchestrator run[/cyan]        — launch Claude Code")
+    console.print(
+        "  3. [cyan]orchestrator dashboard[/cyan]  — live state view (in another terminal)"
+    )
+
+
+if __name__ == "__main__":
+    cli()

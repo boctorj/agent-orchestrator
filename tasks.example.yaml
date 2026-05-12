@@ -1,0 +1,20 @@
+# Example feature input file. Paste into chat, or have the lead read it
+# via its Read tool, then call load_feature(...) with the parsed values.
+#
+# `id`           — optional; orchestrator auto-allocates F-001, F-002, ...
+# `title`        — short noun phrase
+# `description`  — free text, as long as needed; this is what the lead
+#                  breaks down into work units
+# `repo_path`    — local checkout where coder agents will work (set when
+#                  Stage 3 lands; can leave empty in Stage 2)
+# `branch_prefix`— each work unit branches off as `<prefix>-u-N`
+
+id: F-001
+title: Add export-to-PDF
+description: |
+  Users should be able to export the current report view as PDF.
+  Use the existing rendering pipeline. Settings page needs a toggle
+  to enable/disable PDF export per workspace, and existing workspaces
+  should default to enabled with a feature flag for gradual rollout.
+repo_path: /Users/joe.boctor/repos/some-app
+branch_prefix: feature/F-001-pdf-export

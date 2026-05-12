@@ -1,0 +1,124 @@
+[project]
+name = "agent-orchestrator"
+version = "0.2.0"
+description = "Multi-agent SDLC orchestrator: chat with a lead from mobile, spawns coder/tester/reviewer Managed Agents per work unit, runs an automated fix loop, opens PRs."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+keywords = ["claude", "anthropic", "agents", "sdlc", "code-review", "automation"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development",
+]
+dependencies = [
+    "anthropic>=0.50.0",
+    "mcp>=1.5.0",
+    "python-dotenv>=1.0.0",
+    "pyyaml>=6.0",
+    "rich>=13.0",
+    "click>=8.0",
+    "httpx>=0.27",
+    # GitHub App identity: PyJWT signs the App JWT, cryptography backs RS256
+    "pyjwt[crypto]>=2.8",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "pytest-timeout>=2.3",
+    # ruff is EXACT-pinned (not >=) because the formatter's conventions
+    # evolve between minor releases. Mismatched local/CI versions cause
+    # "passes locally, fails CI" loops. Bump both this and the matching
+    # `rev:` in .pre-commit-config.yaml in the same commit.
+    "ruff==0.15.12",
+    "mypy>=1.10",
+    # Pinned for the same reason as ruff: bandit's exit-code behavior
+    # changed between minor versions (1.7 didn't fail on low/medium-only
+    # findings; 1.9 does). Pinning prevents silent CI regressions.
+    "bandit==1.9.4",
+    "types-pyyaml",
+    "pre-commit>=3.7",
+]
+
+[project.scripts]
+orchestrator = "orchestrator.cli:cli"
+
+[project.urls]
+Repository = "https://github.com/joeboctor/agent-orchestrator"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["orchestrator*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["snapshots", "examples", "build", "dist"]
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",     # pycodestyle / pyflakes
+    "I",               # isort
+    "B",               # bugbear
+    "UP",              # pyupgrade
+    "SIM",             # simplify
+    "TID252",          # absolute imports
+]
+ignore = [
+    "E501",   # line length — Ruff format already targets 100, soft caps are fine
+    "B008",   # function calls in argument defaults (Click idiom)
+    "SIM108", # ternary preference — readability judgment, keep explicit
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["B011"]  # allow assert in tests
+
+[tool.mypy]
+python_version = "3.11"
+files = ["orchestrator"]
+# Pragmatic start — strictness can ratchet up after the codebase settles
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+# Not yet strict: disallow_untyped_defs, no_implicit_optional, etc.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Show coverage on every local run (fast). CI adds --cov-fail-under=80.
+# pytest-timeout: 30s per test by default — kills runaway mocks
+# that infinite-loop without an obvious assertion failure.
+addopts = "-v --tb=short --cov=orchestrator --cov-report=term-missing"
+timeout = 30
+
+[tool.coverage.run]
+source = ["orchestrator"]
+branch = true
+# Don't count main() / __main__ entry points + the mcp_server import-shim
+omit = [
+    "orchestrator/mcp_server.py",
+    "orchestrator/mcp_launcher.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]
+
+[tool.bandit]
+# Skip the project's own assertions and Markdown/.md files; tests use assert by design
+skips = ["B101"]   # assert_used
+exclude_dirs = ["tests", "snapshots", ".venv", "examples"]

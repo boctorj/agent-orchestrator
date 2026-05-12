@@ -1,0 +1,1244 @@
+"""Tests for orchestrator/tools/execution.py — spawn + address + cycle_review.
+
+All `ManagedAgentWorker` instances are replaced with a `FakeWorker` that
+returns canned strings. github.* helpers are patched to no-op so tests
+don't touch the real GitHub API.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from orchestrator import state
+from orchestrator.ci_wait import CIWaitResult
+from orchestrator.models import Feature, WorkUnit, WorkUnitState
+from orchestrator.tools import execution
+
+# --------------------------- autouse: pretend CI is green ---------------------------
+
+
+@pytest.fixture(autouse=True)
+def _ci_green(monkeypatch):
+    """Pretend every PR's CI is green for tests in this module.
+
+    Most tests in this file pre-date the CI gate (added in commit that
+    introduced orchestrator/ci_wait.py). They don't care about CI semantics —
+    they exercise the spawn / address_review / cycle_review state machine.
+    Forcing CI to "green" here keeps those tests focused.
+
+    Tests that DO exercise the CI gate (TestCycleReviewCIGate below) override
+    this fixture by monkeypatching `wait_for_ci` themselves AFTER this
+    fixture runs.
+    """
+
+    def fake_wait(*args, **kwargs):
+        return CIWaitResult(status="green", elapsed_seconds=1.0, total_checks=1)
+
+    monkeypatch.setattr("orchestrator.tools.execution.ci_wait.wait_for_ci", fake_wait)
+
+
+# --------------------------- fakes ---------------------------
+
+
+class FakeWorker:
+    """Stub for ManagedAgentWorker that returns a pre-canned response."""
+
+    def __init__(self, role: str, spawn_response: str = "", resume_response: str = ""):
+        self.role = role
+        self._spawn_response = spawn_response
+        self._resume_response = resume_response
+        self.spawn_calls: list[tuple[str, str | None]] = []
+        self.resume_calls: list[tuple[str, str]] = []
+
+    def spawn(self, task: str, *, title: str | None = None) -> tuple[str, str]:
+        sid = f"sesn-{self.role}-{len(self.spawn_calls)}"
+        self.spawn_calls.append((task, title))
+        return sid, self._spawn_response
+
+    def resume(self, session_id: str, msg: str) -> str:
+        self.resume_calls.append((session_id, msg))
+        return self._resume_response
+
+    def archive(self, session_id: str) -> None:
+        pass
+
+
+def _install_fake_worker(monkeypatch, spawn_response="", resume_response=""):
+    """Return a factory that builds a FakeWorker for any role.
+
+    Each role gets its own FakeWorker instance so tests can inspect calls.
+    """
+    instances: dict[str, FakeWorker] = {}
+
+    def factory(role: str) -> FakeWorker:
+        if role not in instances:
+            instances[role] = FakeWorker(role, spawn_response, resume_response)
+        return instances[role]
+
+    monkeypatch.setattr("orchestrator.tools.execution.ManagedAgentWorker", factory)
+    return instances
+
+
+def _stub_github(monkeypatch, copilot_review=None):
+    """Patch github.* helpers to no-op stubs."""
+    monkeypatch.setattr("orchestrator.tools.execution.safe_amend_pr_body", lambda *a, **k: "")
+    monkeypatch.setattr("orchestrator.tools.execution.safe_comment_pr", lambda *a, **k: "")
+    monkeypatch.setattr(
+        "orchestrator.tools.execution.github.request_copilot_review",
+        lambda *a, **k: {"requested": True, "status_code": 201, "note": ""},
+    )
+    monkeypatch.setattr(
+        "orchestrator.tools.execution.github.wait_for_copilot_review",
+        lambda *a, **k: copilot_review,
+    )
+    monkeypatch.setattr(
+        "orchestrator.tools.execution.github.parse_repo_url",
+        lambda url: ("owner", "repo"),
+    )
+
+
+def _setup_feature(feature_id="F-001", repo="https://github.com/o/r"):
+    state.save_feature(
+        Feature(
+            id=feature_id,
+            title="t",
+            description="d",
+            repo_path=repo,
+            status="approved",
+        )
+    )
+    state.save_plan(
+        feature_id,
+        [
+            WorkUnit(
+                id=f"{feature_id}-U-1", feature_id=feature_id, title="u1", description="impl this"
+            ),
+        ],
+    )
+    state.approve_plan(feature_id)
+
+
+# --------------------------- spawn_unit ---------------------------
+
+
+class TestSpawnUnit:
+    def test_no_feature(self, tmp_state_db):
+        assert "feature F-XXX not found" in execution.spawn_unit("F-XXX", "U-1")
+
+    def test_feature_not_approved(self, tmp_state_db):
+        state.save_feature(Feature(id="F", title="t", description="d", status="draft"))
+        msg = execution.spawn_unit("F", "U-1")
+        assert "ERROR" in msg and "approved" in msg
+
+    def test_no_repo_path(self, tmp_state_db):
+        state.save_feature(Feature(id="F", title="t", description="d", status="approved"))
+        msg = execution.spawn_unit("F", "U-1")
+        assert "no repo_path" in msg
+
+    def test_no_plan(self, tmp_state_db):
+        state.save_feature(
+            Feature(
+                id="F",
+                title="t",
+                description="d",
+                repo_path="https://github.com/o/r",
+                status="approved",
+            ),
+        )
+        msg = execution.spawn_unit("F", "U-1")
+        assert "no plan" in msg
+
+    def test_unit_not_in_plan(self, tmp_state_db):
+        _setup_feature()
+        msg = execution.spawn_unit("F-001", "F-001-U-9")
+        assert "not in plan" in msg
+
+    def test_unit_already_has_coder(self, tmp_state_db):
+        _setup_feature()
+        state.upsert_unit_state(
+            WorkUnitState(
+                unit_id="F-001-U-1",
+                feature_id="F-001",
+                status="coding",
+                coder_session_id="existing",
+            )
+        )
+        msg = execution.spawn_unit("F-001", "F-001-U-1")
+        assert "already has coder session" in msg
+
+    def test_missing_github_token(self, tmp_state_db, no_github_token):
+        _setup_feature()
+        msg = execution.spawn_unit("F-001", "F-001-U-1")
+        assert "no GitHub auth" in msg
+
+    def test_happy_path_with_pr_url(self, tmp_state_db, with_github_token, monkeypatch):
+        _setup_feature()
+        _install_fake_worker(
+            monkeypatch,
+            spawn_response="PR_URL: https://github.com/o/r/pull/42",
+        )
+        _stub_github(monkeypatch)
+
+        out = execution.spawn_unit("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["pr_number"] == 42
+        assert parsed["pr_url"] == "https://github.com/o/r/pull/42"
+
+        # State now reflects in_ci + session id
+        s = state.get_unit_state("F-001-U-1")
+        assert s.status == "in_ci"
+        assert s.pr_number == 42
+        assert s.coder_session_id.startswith("sesn-coder-")
+
+    def test_coder_blocked(self, tmp_state_db, with_github_token, monkeypatch):
+        _setup_feature()
+        _install_fake_worker(monkeypatch, spawn_response="i tried but\nBLOCKED: spec ambiguous")
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_escalation",
+            lambda *a, **k: True,
+        )
+
+        out = execution.spawn_unit("F-001", "F-001-U-1")
+        assert "BLOCKED" in out
+        assert "spec ambiguous" in out
+        assert state.get_unit_state("F-001-U-1").status == "escalated"
+
+    def test_coder_no_marker(self, tmp_state_db, with_github_token, monkeypatch):
+        _setup_feature()
+        _install_fake_worker(monkeypatch, spawn_response="I wandered off topic.")
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_escalation",
+            lambda *a, **k: True,
+        )
+
+        out = execution.spawn_unit("F-001", "F-001-U-1")
+        assert "ESCALATED" in out
+        assert state.get_unit_state("F-001-U-1").status == "escalated"
+
+    def test_worker_raises(self, tmp_state_db, with_github_token, monkeypatch):
+        _setup_feature()
+
+        class BlowUpWorker:
+            def __init__(self, role):
+                pass
+
+            def spawn(self, *a, **k):
+                raise RuntimeError("anthropic 503")
+
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ManagedAgentWorker",
+            BlowUpWorker,
+        )
+        out = execution.spawn_unit("F-001", "F-001-U-1")
+        assert "ERROR spawning coder" in out
+        assert state.get_unit_state("F-001-U-1").status == "escalated"
+
+
+# --------------------------- spawn_tester ---------------------------
+
+
+def _seed_coded_unit(unit_id="F-001-U-1", feature_id="F-001"):
+    """Set up a feature + unit that already has a PR (coder ran successfully)."""
+    _setup_feature(feature_id)
+    state.upsert_unit_state(
+        WorkUnitState(
+            unit_id=unit_id,
+            feature_id=feature_id,
+            status="in_ci",
+            branch="feat/branch",
+            pr_number=5,
+            coder_session_id="sesn-c",
+        )
+    )
+
+
+class TestSpawnTester:
+    def test_no_feature(self, tmp_state_db):
+        assert "feature F-XXX not found" in execution.spawn_tester("F-XXX", "U-1")
+
+    def test_no_state(self, tmp_state_db):
+        _setup_feature()
+        assert "no state for unit" in execution.spawn_tester("F-001", "F-001-U-1")
+
+    def test_no_pr_yet(self, tmp_state_db):
+        _setup_feature()
+        state.upsert_unit_state(
+            WorkUnitState(unit_id="F-001-U-1", feature_id="F-001", status="coding")
+        )
+        msg = execution.spawn_tester("F-001", "F-001-U-1")
+        assert "no branch/PR yet" in msg
+
+    def test_tester_session_already_exists(self, tmp_state_db):
+        _seed_coded_unit()
+        state.upsert_unit_state(
+            WorkUnitState(
+                unit_id="F-001-U-1",
+                feature_id="F-001",
+                status="in_ci",
+                branch="b",
+                pr_number=5,
+                tester_session_id="existing",
+            )
+        )
+        msg = execution.spawn_tester("F-001", "F-001-U-1")
+        assert "tester session already exists" in msg
+
+    def test_missing_token(self, tmp_state_db, no_github_token):
+        _seed_coded_unit()
+        assert "no GitHub auth" in execution.spawn_tester("F-001", "F-001-U-1")
+
+    def test_tests_pass(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        _install_fake_worker(monkeypatch, spawn_response="all good\nTESTS_PASS")
+        _stub_github(monkeypatch)
+
+        out = execution.spawn_tester("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "TESTS_PASS"
+        assert state.get_unit_state("F-001-U-1").status == "in_ci"
+
+    def test_bug_found(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        _install_fake_worker(
+            monkeypatch,
+            spawn_response="failing test:\nBUG_FOUND: divide-by-zero on n=0",
+        )
+        _stub_github(monkeypatch)
+
+        out = execution.spawn_tester("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "BUG_FOUND"
+        assert "divide-by-zero" in parsed["bug"]
+
+    def test_blocked(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        _install_fake_worker(monkeypatch, spawn_response="BLOCKED: pytest not installed")
+        _stub_github(monkeypatch)
+
+        msg = execution.spawn_tester("F-001", "F-001-U-1")
+        assert "BLOCKED" in msg
+        assert state.get_unit_state("F-001-U-1").status == "escalated"
+
+    def test_no_marker(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        _install_fake_worker(monkeypatch, spawn_response="i didn't say anything useful")
+        _stub_github(monkeypatch)
+
+        msg = execution.spawn_tester("F-001", "F-001-U-1")
+        assert "ESCALATED" in msg
+
+    def test_worker_raises(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+
+        class BlowUp:
+            def __init__(self, role):
+                pass
+
+            def spawn(self, *a, **k):
+                raise RuntimeError("network")
+
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ManagedAgentWorker",
+            BlowUp,
+        )
+        msg = execution.spawn_tester("F-001", "F-001-U-1")
+        assert "ERROR spawning tester" in msg
+
+
+# --------------------------- spawn_reviewer ---------------------------
+
+
+class TestSpawnReviewer:
+    def test_no_pr(self, tmp_state_db):
+        _setup_feature()
+        state.upsert_unit_state(
+            WorkUnitState(unit_id="F-001-U-1", feature_id="F-001", status="coding")
+        )
+        msg = execution.spawn_reviewer("F-001", "F-001-U-1")
+        assert "no PR yet" in msg
+
+    def test_reviewer_already_exists(self, tmp_state_db):
+        _seed_coded_unit()
+        state.upsert_unit_state(
+            WorkUnitState(
+                unit_id="F-001-U-1",
+                feature_id="F-001",
+                status="in_ci",
+                pr_number=5,
+                reviewer_session_id="existing",
+            )
+        )
+        msg = execution.spawn_reviewer("F-001", "F-001-U-1")
+        assert "already exists" in msg
+
+    def test_review_approved(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        _install_fake_worker(monkeypatch, spawn_response="looks great\nREVIEW_APPROVED")
+        _stub_github(monkeypatch)
+
+        out = execution.spawn_reviewer("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "REVIEW_APPROVED"
+
+    def test_review_recommend_merge(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        _install_fake_worker(
+            monkeypatch,
+            spawn_response="endorsed\nREVIEW_RECOMMEND_MERGE: tests cover everything",
+        )
+        _stub_github(monkeypatch)
+
+        out = execution.spawn_reviewer("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "REVIEW_RECOMMEND_MERGE"
+        assert "tests cover everything" in parsed["reason"]
+
+    def test_review_request_changes(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        _install_fake_worker(
+            monkeypatch,
+            spawn_response="REVIEW_REQUEST_CHANGES: missing edge case for empty input",
+        )
+        _stub_github(monkeypatch)
+
+        out = execution.spawn_reviewer("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "REVIEW_REQUEST_CHANGES"
+        assert "empty input" in parsed["issue"]
+
+    def test_review_comment_only(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        _install_fake_worker(monkeypatch, spawn_response="REVIEW_COMMENT")
+        _stub_github(monkeypatch)
+
+        out = execution.spawn_reviewer("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "REVIEW_COMMENT"
+
+    def test_review_blocked(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        _install_fake_worker(monkeypatch, spawn_response="BLOCKED: PR diff unreadable")
+        _stub_github(monkeypatch)
+
+        msg = execution.spawn_reviewer("F-001", "F-001-U-1")
+        assert "BLOCKED" in msg
+        assert state.get_unit_state("F-001-U-1").status == "escalated"
+
+    def test_review_no_marker(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        _install_fake_worker(monkeypatch, spawn_response="some prose with no marker")
+        _stub_github(monkeypatch)
+
+        msg = execution.spawn_reviewer("F-001", "F-001-U-1")
+        assert "ESCALATED" in msg
+
+    def test_worker_raises(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+
+        class BlowUp:
+            def __init__(self, role):
+                pass
+
+            def spawn(self, *a, **k):
+                raise RuntimeError("boom")
+
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ManagedAgentWorker",
+            BlowUp,
+        )
+        msg = execution.spawn_reviewer("F-001", "F-001-U-1")
+        assert "ERROR spawning reviewer" in msg
+
+
+# --------------------------- address_review ---------------------------
+
+
+class TestAddressReview:
+    def test_bad_source(self, tmp_state_db):
+        msg = execution.address_review("U1", "hacker", "fix it")
+        assert "source must be" in msg
+
+    def test_no_state(self, tmp_state_db):
+        msg = execution.address_review("nope", "tester", "fix it")
+        assert "no state for" in msg
+
+    def test_no_coder_session(self, tmp_state_db):
+        _setup_feature()
+        state.upsert_unit_state(
+            WorkUnitState(unit_id="F-001-U-1", feature_id="F-001", status="in_ci")
+        )
+        msg = execution.address_review("F-001-U-1", "tester", "fix")
+        assert "no coder session" in msg
+
+    def test_fix_pushed(self, tmp_state_db, monkeypatch):
+        _seed_coded_unit()
+        _install_fake_worker(monkeypatch, resume_response="ok\nFIX_PUSHED\ndone")
+        _stub_github(monkeypatch)
+
+        out = execution.address_review("F-001-U-1", "tester", "fix the bug")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "FIX_PUSHED"
+        assert parsed["cycle"] == 1
+
+    def test_blocked_on_fix(self, tmp_state_db, monkeypatch):
+        _seed_coded_unit()
+        _install_fake_worker(monkeypatch, resume_response="BLOCKED: needs human to redesign")
+        _stub_github(monkeypatch)
+
+        msg = execution.address_review("F-001-U-1", "tester", "fix")
+        assert "BLOCKED" in msg
+        assert state.get_unit_state("F-001-U-1").status == "escalated"
+
+    def test_no_marker_on_fix(self, tmp_state_db, monkeypatch):
+        _seed_coded_unit()
+        _install_fake_worker(monkeypatch, resume_response="mumbled some prose")
+        _stub_github(monkeypatch)
+
+        msg = execution.address_review("F-001-U-1", "tester", "fix")
+        assert "ESCALATED" in msg
+
+    def test_worker_resume_raises(self, tmp_state_db, monkeypatch):
+        _seed_coded_unit()
+
+        class BlowUp:
+            def __init__(self, role):
+                pass
+
+            def resume(self, *a, **k):
+                raise RuntimeError("retrieve failed")
+
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ManagedAgentWorker",
+            BlowUp,
+        )
+        msg = execution.address_review("F-001-U-1", "tester", "fix")
+        assert "ERROR resuming coder" in msg
+
+
+# --------------------------- send_to_unit ---------------------------
+
+
+class TestSendToUnit:
+    def test_bad_role(self, tmp_state_db):
+        msg = execution.send_to_unit("U1", "hacker", "hi")
+        assert "role must be" in msg
+
+    def test_no_state(self, tmp_state_db):
+        msg = execution.send_to_unit("nope", "coder", "hi")
+        assert "no state for" in msg
+
+    def test_no_session(self, tmp_state_db):
+        _setup_feature()
+        state.upsert_unit_state(
+            WorkUnitState(unit_id="F-001-U-1", feature_id="F-001", status="coding")
+        )
+        msg = execution.send_to_unit("F-001-U-1", "tester", "hi")
+        assert "no tester session" in msg
+
+    def test_happy_path(self, tmp_state_db, monkeypatch):
+        _seed_coded_unit()
+        _install_fake_worker(monkeypatch, resume_response="coder responded")
+
+        out = execution.send_to_unit("F-001-U-1", "coder", "what's up?")
+        assert out == "coder responded"
+
+    def test_worker_raises(self, tmp_state_db, monkeypatch):
+        _seed_coded_unit()
+
+        class BlowUp:
+            def __init__(self, role):
+                pass
+
+            def resume(self, *a, **k):
+                raise RuntimeError("session expired")
+
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ManagedAgentWorker",
+            BlowUp,
+        )
+        msg = execution.send_to_unit("F-001-U-1", "coder", "hi")
+        assert "ERROR resuming coder" in msg
+
+
+# --------------------------- cycle_review ---------------------------
+
+
+class TestCycleReview:
+    """Integration-ish tests — exercise the whole _tester_phase → _copilot_phase
+    → _reviewer_phase flow with mocked spawn_tester/spawn_reviewer/address_review.
+    """
+
+    def test_happy_path_no_cycles(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        # Tester: pass immediately. Reviewer: approve immediately.
+        monkeypatch.setattr(
+            execution,
+            "spawn_tester",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "TESTS_PASS", "session_id": "t"}),
+        )
+        monkeypatch.setattr(
+            execution,
+            "spawn_reviewer",
+            lambda f, u: json.dumps(
+                {"unit_id": u, "outcome": "REVIEW_APPROVED", "session_id": "r"}
+            ),
+        )
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_ready_to_merge",
+            lambda *a, **k: True,
+        )
+
+        out = execution.cycle_review("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "approved_awaiting_merge"
+
+    def test_tester_blocked_escalates(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        monkeypatch.setattr(
+            execution,
+            "spawn_tester",
+            lambda f, u: "BLOCKED — tester for U: spec ambiguous",
+        )
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_escalation",
+            lambda *a, **k: True,
+        )
+
+        out = execution.cycle_review("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "escalated"
+        assert "tester" in parsed["message"]
+
+    def test_bug_found_fix_then_pass(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        # First tester run finds bug; address_review pushes fix; second tester passes
+        tester_responses = iter(
+            [
+                json.dumps({"unit_id": "U", "outcome": "BUG_FOUND", "bug": "div by zero"}),
+                json.dumps({"unit_id": "U", "outcome": "TESTS_PASS"}),
+            ]
+        )
+        monkeypatch.setattr(
+            execution,
+            "spawn_tester",
+            lambda f, u: next(tester_responses),
+        )
+
+        def fake_address_review(uid, src, fb):
+            state.increment_review_round(uid)
+            return json.dumps({"outcome": "FIX_PUSHED", "cycle": 1})
+
+        monkeypatch.setattr(execution, "address_review", fake_address_review)
+        monkeypatch.setattr(
+            execution,
+            "spawn_reviewer",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "REVIEW_APPROVED"}),
+        )
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_ready_to_merge",
+            lambda *a, **k: True,
+        )
+
+        out = execution.cycle_review("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "approved_awaiting_merge"
+
+    def test_cap_3_hit_on_tester_bugs(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        # Tester always finds a bug; fix always pushes; review_round must
+        # actually increment so the cap check trips.
+        monkeypatch.setattr(
+            execution,
+            "spawn_tester",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "BUG_FOUND", "bug": "x"}),
+        )
+
+        def fake_address_review(uid, src, fb):
+            state.increment_review_round(uid)
+            return json.dumps({"outcome": "FIX_PUSHED", "cycle": 1})
+
+        monkeypatch.setattr(execution, "address_review", fake_address_review)
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_escalation",
+            lambda *a, **k: True,
+        )
+
+        out = execution.cycle_review("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "escalated"
+        assert "cap" in parsed["message"].lower()
+
+    def test_reviewer_request_changes_then_approve(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        _seed_coded_unit()
+        monkeypatch.setattr(
+            execution,
+            "spawn_tester",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "TESTS_PASS"}),
+        )
+        reviewer_responses = iter(
+            [
+                json.dumps(
+                    {"unit_id": "U", "outcome": "REVIEW_REQUEST_CHANGES", "issue": "rename x"}
+                ),
+                json.dumps({"unit_id": "U", "outcome": "REVIEW_APPROVED"}),
+            ]
+        )
+        monkeypatch.setattr(
+            execution,
+            "spawn_reviewer",
+            lambda f, u: next(reviewer_responses),
+        )
+        monkeypatch.setattr(
+            execution,
+            "address_review",
+            lambda u, src, fb: json.dumps({"outcome": "FIX_PUSHED", "cycle": 1}),
+        )
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_ready_to_merge",
+            lambda *a, **k: True,
+        )
+
+        out = execution.cycle_review("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "approved_awaiting_merge"
+
+    def test_copilot_review_recorded(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        monkeypatch.setattr(
+            execution,
+            "spawn_tester",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "TESTS_PASS"}),
+        )
+        monkeypatch.setattr(
+            execution,
+            "spawn_reviewer",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "REVIEW_APPROVED"}),
+        )
+        copilot_review = {
+            "state": "COMMENTED",
+            "inline_count": 2,
+            "body": "found two nits",
+        }
+        _stub_github(monkeypatch, copilot_review=copilot_review)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_ready_to_merge",
+            lambda *a, **k: True,
+        )
+
+        out = execution.cycle_review("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        # History should include the copilot_review step
+        copilot_steps = [s for s in parsed["history"] if s.get("step") == "copilot_review"]
+        assert len(copilot_steps) == 1
+        assert copilot_steps[0]["outcome"] == "received"
+        assert copilot_steps[0]["inline_count"] == 2
+
+    def test_copilot_review_timeout(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        monkeypatch.setattr(
+            execution,
+            "spawn_tester",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "TESTS_PASS"}),
+        )
+        monkeypatch.setattr(
+            execution,
+            "spawn_reviewer",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "REVIEW_APPROVED"}),
+        )
+        _stub_github(monkeypatch, copilot_review=None)  # timeout
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_ready_to_merge",
+            lambda *a, **k: True,
+        )
+
+        out = execution.cycle_review("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        copilot_steps = [s for s in parsed["history"] if s.get("step") == "copilot_review"]
+        assert copilot_steps[0]["outcome"] == "timeout"
+
+    def test_review_recommend_merge_is_terminal_success(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        _seed_coded_unit()
+        monkeypatch.setattr(
+            execution,
+            "spawn_tester",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "TESTS_PASS"}),
+        )
+        monkeypatch.setattr(
+            execution,
+            "spawn_reviewer",
+            lambda f, u: json.dumps(
+                {
+                    "unit_id": u,
+                    "outcome": "REVIEW_RECOMMEND_MERGE",
+                    "reason": "self-approval blocked",
+                }
+            ),
+        )
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_ready_to_merge",
+            lambda *a, **k: True,
+        )
+
+        out = execution.cycle_review("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "approved_awaiting_merge"
+
+
+# --------------------------- internal helpers ---------------------------
+
+
+class TestRecordStep:
+    def test_records_parsed_json(self, tmp_state_db):
+        ctx = execution.CycleContext(feature_id="F", unit_id="U", history=[])
+        r = execution._record_step(ctx, "test", json.dumps({"outcome": "X"}))
+        assert r == {"outcome": "X"}
+        assert ctx.history[-1]["step"] == "test"
+
+    def test_records_raw_when_non_json(self, tmp_state_db):
+        ctx = execution.CycleContext(feature_id="F", unit_id="U", history=[])
+        r = execution._record_step(ctx, "test", "not json output")
+        assert r["outcome"] == "RAW"
+        assert r["raw"] == "not json output"
+
+
+class TestPrUrlFor:
+    def test_returns_none_without_pr(self, tmp_state_db):
+        assert execution._pr_url_for("F", None) is None
+
+    def test_returns_none_without_state(self, tmp_state_db):
+        from orchestrator.models import WorkUnitState as W
+
+        s = W(unit_id="U", feature_id="F", status="coding")  # no pr_number
+        assert execution._pr_url_for("F", s) is None
+
+    def test_reconstructs_url(self, tmp_state_db):
+        state.save_feature(
+            Feature(id="F", title="t", description="d", repo_path="https://github.com/joe/repo"),
+        )
+        from orchestrator.models import WorkUnitState as W
+
+        s = W(unit_id="U", feature_id="F", status="in_ci", pr_number=42)
+        url = execution._pr_url_for("F", s)
+        assert url == "https://github.com/joe/repo/pull/42"
+
+    def test_bad_repo_url_returns_none(self, tmp_state_db):
+        state.save_feature(
+            Feature(id="F", title="t", description="d", repo_path="not-a-url"),
+        )
+        from orchestrator.models import WorkUnitState as W
+
+        s = W(unit_id="U", feature_id="F", status="in_ci", pr_number=42)
+        assert execution._pr_url_for("F", s) is None
+
+
+# --------------------------- verification gate ---------------------------
+
+
+class TestVerificationGate:
+    """Every spawn surface must refuse to act on an unverified target repo.
+
+    The conftest `tmp_state_db` fixture pre-seeds `https://github.com/o/r`
+    as verified. We use a *different* URL here so the gate triggers.
+    """
+
+    UNVERIFIED = "https://github.com/never/verified"
+
+    def _seed_unverified(self, feature_id="F-001"):
+        state.save_feature(
+            Feature(
+                id=feature_id,
+                title="t",
+                description="d",
+                repo_path=self.UNVERIFIED,
+                status="approved",
+            )
+        )
+        state.save_plan(
+            feature_id,
+            [WorkUnit(id=f"{feature_id}-U-1", feature_id=feature_id, title="u", description="d")],
+        )
+        state.approve_plan(feature_id)
+
+    def test_spawn_unit_blocks(self, tmp_state_db, with_github_token):
+        self._seed_unverified()
+        msg = execution.spawn_unit("F-001", "F-001-U-1")
+        assert "ERROR" in msg
+        assert "not verified" in msg
+        assert "verify_repo" in msg
+        # The unit must not have been created
+        assert state.get_unit_state("F-001-U-1") is None
+
+    def test_spawn_tester_blocks(self, tmp_state_db, with_github_token):
+        self._seed_unverified()
+        state.upsert_unit_state(
+            WorkUnitState(
+                unit_id="F-001-U-1",
+                feature_id="F-001",
+                status="in_ci",
+                branch="b",
+                pr_number=1,
+                coder_session_id="sesn-c",
+            )
+        )
+        msg = execution.spawn_tester("F-001", "F-001-U-1")
+        assert "ERROR" in msg and "not verified" in msg
+
+    def test_spawn_reviewer_blocks(self, tmp_state_db, with_github_token):
+        self._seed_unverified()
+        state.upsert_unit_state(
+            WorkUnitState(
+                unit_id="F-001-U-1",
+                feature_id="F-001",
+                status="in_ci",
+                branch="b",
+                pr_number=1,
+                coder_session_id="sesn-c",
+            )
+        )
+        msg = execution.spawn_reviewer("F-001", "F-001-U-1")
+        assert "ERROR" in msg and "not verified" in msg
+
+    def test_address_review_blocks(self, tmp_state_db, with_github_token):
+        self._seed_unverified()
+        state.upsert_unit_state(
+            WorkUnitState(
+                unit_id="F-001-U-1",
+                feature_id="F-001",
+                status="reviewing",
+                branch="b",
+                pr_number=1,
+                coder_session_id="sesn-c",
+            )
+        )
+        msg = execution.address_review("F-001-U-1", "tester", "fix the bug")
+        assert "ERROR" in msg and "not verified" in msg
+
+    def test_cycle_review_blocks(self, tmp_state_db, with_github_token):
+        self._seed_unverified()
+        msg = execution.cycle_review("F-001", "F-001-U-1")
+        assert "ERROR" in msg and "not verified" in msg
+
+    def test_send_to_unit_blocks(self, tmp_state_db, with_github_token):
+        self._seed_unverified()
+        state.upsert_unit_state(
+            WorkUnitState(
+                unit_id="F-001-U-1",
+                feature_id="F-001",
+                status="coding",
+                branch="b",
+                coder_session_id="sesn-c",
+            )
+        )
+        msg = execution.send_to_unit("F-001-U-1", "coder", "do a thing")
+        assert "ERROR" in msg and "not verified" in msg
+
+    def test_stale_verification_blocks(self, tmp_state_db, with_github_token):
+        """A verified row older than TTL should be treated as unverified."""
+        from datetime import UTC, datetime, timedelta
+
+        from orchestrator.models import CheckResult, VerificationResult
+
+        state.save_verified_repo(
+            VerificationResult(
+                repo_url=self.UNVERIFIED,
+                default_branch="main",
+                auth_mode="pat",
+                auth_identity="u:t",
+                checks=[
+                    CheckResult("read access", True),
+                    CheckResult("write access", True),
+                    CheckResult("branch protection exists", True),
+                    CheckResult(
+                        "≥1 approving review required",
+                        True,
+                        "required_approving_review_count = 1",
+                    ),
+                    CheckResult("force push blocked", True),
+                    CheckResult("deletion blocked", True),
+                    CheckResult("admin bypass blocked", True),
+                ],
+            )
+        )
+        # Backdate the row to past the TTL
+        import sqlite3
+
+        old = (datetime.now(UTC) - timedelta(hours=state.VERIFY_TTL_HOURS + 1)).isoformat()
+        with sqlite3.connect(tmp_state_db) as conn:
+            conn.execute(
+                "UPDATE verified_repos SET verified_at = ? WHERE repo_url = ?",
+                (old, self.UNVERIFIED),
+            )
+
+        self._seed_unverified()
+        msg = execution.spawn_unit("F-001", "F-001-U-1")
+        assert "ERROR" in msg
+        assert "not verified" in msg or "expired" in msg.lower()
+
+
+# --------------------------- CI gate ---------------------------
+
+
+def _set_ci(monkeypatch, status: str, **kw):
+    """Override the autouse `_ci_green` fixture with a different status.
+
+    Use inside a test to drive the CI gate into the failed/timeout/no_ci
+    branches.
+    """
+
+    def fake(*args, **kwargs):
+        return CIWaitResult(
+            status=status,
+            elapsed_seconds=kw.get("elapsed", 1.0),
+            **{k: v for k, v in kw.items() if k != "elapsed"},
+        )
+
+    monkeypatch.setattr("orchestrator.tools.execution.ci_wait.wait_for_ci", fake)
+
+
+class TestCIGateStandalone:
+    """`spawn_tester` and `spawn_reviewer` refuse to spawn when CI is red.
+
+    The standalone gate is no-fix-loop — it just returns an ERROR so the
+    lead surfaces it. `cycle_review` is where the automated fix loop lives.
+    """
+
+    def _seed_unit_with_pr(self, feature_id="F", unit_id="U"):
+        state.save_feature(
+            Feature(
+                id=feature_id,
+                title="t",
+                description="d",
+                repo_path="https://github.com/o/r",
+                status="approved",
+            )
+        )
+        state.save_plan(
+            feature_id,
+            [WorkUnit(id=unit_id, feature_id=feature_id, title="u", description="d")],
+        )
+        state.approve_plan(feature_id)
+        state.upsert_unit_state(
+            WorkUnitState(
+                unit_id=unit_id,
+                feature_id=feature_id,
+                status="in_ci",
+                branch="b",
+                pr_number=42,
+                coder_session_id="sesn-c",
+            )
+        )
+
+    def test_spawn_tester_refuses_on_red_ci(self, tmp_state_db, with_github_token, monkeypatch):
+        self._seed_unit_with_pr()
+        _set_ci(
+            monkeypatch,
+            status="failed",
+            total_checks=2,
+            failing_runs=[{"name": "tests", "details_url": "https://x"}],
+        )
+
+        msg = execution.spawn_tester("F", "U")
+        assert "ERROR" in msg
+        assert "refusing to spawn tester" in msg.lower() or "ci is failing" in msg.lower()
+        assert "tests" in msg  # failing check name surfaced
+
+    def test_spawn_reviewer_refuses_on_red_ci(self, tmp_state_db, with_github_token, monkeypatch):
+        self._seed_unit_with_pr()
+        _set_ci(
+            monkeypatch,
+            status="failed",
+            total_checks=1,
+            failing_runs=[{"name": "lint", "details_url": "https://x"}],
+        )
+
+        msg = execution.spawn_reviewer("F", "U")
+        assert "ERROR" in msg
+        assert "lint" in msg
+
+    def test_spawn_tester_refuses_on_ci_timeout(self, tmp_state_db, with_github_token, monkeypatch):
+        self._seed_unit_with_pr()
+        _set_ci(monkeypatch, status="timeout", elapsed=600.0, total_checks=3)
+
+        msg = execution.spawn_tester("F", "U")
+        assert "ERROR" in msg
+        assert "did not settle" in msg or "timeout" in msg.lower()
+
+    def test_no_ci_configured_lets_spawn_proceed(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """Sandbox repos without GH Actions still work — `no_ci` is a pass-through."""
+        self._seed_unit_with_pr()
+        _set_ci(monkeypatch, status="no_ci", elapsed=30.0)
+        _install_fake_worker(monkeypatch, spawn_response="TESTS_PASS")
+        _stub_github(monkeypatch)
+
+        out = execution.spawn_tester("F", "U")
+        # No ERROR — proceeds to actual spawn
+        assert "ERROR" not in out
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "TESTS_PASS"
+
+
+class TestCycleReviewCIGate:
+    """`cycle_review` waits for CI between phases AND runs an embedded
+    fix loop when CI is red (counts toward CAP_3).
+    """
+
+    def _seed_full_unit(self, feature_id="F-001", unit_id="F-001-U-1"):
+        state.save_feature(
+            Feature(
+                id=feature_id,
+                title="t",
+                description="d",
+                repo_path="https://github.com/o/r",
+                status="approved",
+            )
+        )
+        state.save_plan(
+            feature_id,
+            [WorkUnit(id=unit_id, feature_id=feature_id, title="u", description="d")],
+        )
+        state.approve_plan(feature_id)
+        state.upsert_unit_state(
+            WorkUnitState(
+                unit_id=unit_id,
+                feature_id=feature_id,
+                status="in_ci",
+                branch="b",
+                pr_number=42,
+                coder_session_id="sesn-c",
+            )
+        )
+
+    def test_ci_red_at_gate1_triggers_fix_loop_then_recovers(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """Coder PR push is red → address_review(ci) → push fix → CI green → continue."""
+        self._seed_full_unit()
+
+        # Per-role responses: each role gets its terminal marker
+        def factory(role: str):
+            spawn_response = {
+                "coder": "PR_URL: https://github.com/o/r/pull/42",
+                "tester": "TESTS_PASS",
+                "reviewer": "REVIEW_APPROVED",
+            }.get(role, "")
+            return FakeWorker(role, spawn_response, "FIX_PUSHED")
+
+        monkeypatch.setattr("orchestrator.tools.execution.ManagedAgentWorker", factory)
+        _stub_github(monkeypatch)
+
+        # Drive CI: first call (gate 1, pre-tester) = failed, then green for
+        # all subsequent calls (post-fix wait, gate 2 after tester, gate 3 final).
+        results = iter(
+            [
+                CIWaitResult(
+                    status="failed",
+                    elapsed_seconds=20.0,
+                    total_checks=2,
+                    failing_runs=[{"name": "tests", "details_url": "https://x"}],
+                ),
+            ]
+        )
+
+        def driver(*args, **kwargs):
+            try:
+                return next(results)
+            except StopIteration:
+                return CIWaitResult(status="green", elapsed_seconds=10.0, total_checks=2)
+
+        monkeypatch.setattr("orchestrator.tools.execution.ci_wait.wait_for_ci", driver)
+
+        out = execution.cycle_review("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "approved_awaiting_merge"
+        # History should include the CI fix step
+        steps = [h.get("step", "") for h in parsed["history"]]
+        assert any("ci" in s.lower() for s in steps)
+
+    def test_ci_timeout_escalates_cycle_review(self, tmp_state_db, with_github_token, monkeypatch):
+        self._seed_full_unit()
+        _install_fake_worker(monkeypatch, spawn_response="ignored")
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_escalation",
+            lambda *a, **k: True,
+        )
+        _set_ci(monkeypatch, status="timeout", elapsed=600.0, total_checks=2)
+
+        out = execution.cycle_review("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "escalated"
+        assert "ci timeout" in parsed["message"].lower() or "timeout" in parsed["message"].lower()
+
+    def test_ci_fix_failures_count_toward_cap_3(self, tmp_state_db, with_github_token, monkeypatch):
+        """Three CI fixes in a row exhaust CAP_3 → escalate (cap-hit)."""
+        self._seed_full_unit()
+        _install_fake_worker(
+            monkeypatch,
+            spawn_response="ignored",
+            resume_response="FIX_PUSHED",
+        )
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_escalation",
+            lambda *a, **k: True,
+        )
+
+        # CI is ALWAYS failing — each fix push triggers a new CI wait that fails
+        # again. After CAP_3 attempts, the helper bails.
+        _set_ci(
+            monkeypatch,
+            status="failed",
+            total_checks=1,
+            failing_runs=[{"name": "tests", "details_url": "https://x"}],
+        )
+
+        out = execution.cycle_review("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "escalated"
+        assert "cap of 3" in parsed["message"].lower() or "ci" in parsed["message"].lower()
+
+    def test_no_ci_configured_passes_through_cycle(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """Sandbox repos with no GH Actions still complete a full cycle."""
+        self._seed_full_unit()
+        _install_fake_worker(
+            monkeypatch,
+            spawn_response="TESTS_PASS",
+            resume_response="REVIEW_APPROVED",
+        )
+        _stub_github(monkeypatch)
+
+        # spawn_tester returns TESTS_PASS; spawn_reviewer returns REVIEW_APPROVED.
+        # The FakeWorker's spawn() returns the canned response for EVERY spawn
+        # though — so reviewer would also return TESTS_PASS. Override per-role.
+        def two_role_factory(role: str):
+            spawn_response = {
+                "coder": "PR_URL: https://github.com/o/r/pull/42",
+                "tester": "TESTS_PASS",
+                "reviewer": "REVIEW_APPROVED",
+            }.get(role, "")
+            return FakeWorker(role, spawn_response, "FIX_PUSHED")
+
+        monkeypatch.setattr("orchestrator.tools.execution.ManagedAgentWorker", two_role_factory)
+        _set_ci(monkeypatch, status="no_ci", elapsed=30.0)
+
+        out = execution.cycle_review("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "approved_awaiting_merge"
