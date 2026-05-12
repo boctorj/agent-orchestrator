@@ -572,6 +572,359 @@ class TestVerifyRulesetSupport:
         assert any("branch protection exists" in line and "ruleset" in line for line in lines)
 
 
+# --------------------------- F-003-U-1 tester triangulation ---------------------------
+#
+# These tests were written by the tester agent independently of the coder's
+# tests above. They re-assert the unit description's matrix from a separate
+# angle and add two cases the coder's tests don't cover:
+#   - classic-fails-but-ruleset-passes  (description: "Accept either system if
+#     it satisfies the orchestrator policy")
+#   - the /rules/branches/{branch} endpoint is actually queried (regression
+#     against silently skipping the new API call)
+
+
+class _RecordingClient:
+    """httpx.Client double that records every URL requested.
+
+    Used to assert that verify() actually hits /rules/branches/{branch}, not
+    just to canned-response the URL.
+    """
+
+    requested_urls: list[str] = []
+
+    def __init__(self, *args, **kwargs):
+        self.headers = kwargs.get("headers", {})
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    # Per-instance request log lives in the class so it can be inspected
+    # after the `with` block exits.
+    @classmethod
+    def reset(cls):
+        cls.requested_urls = []
+
+
+def _recording_client_factory(responses: dict[str, _FakeResponse]):
+    """Build a recording httpx.Client double that returns canned responses."""
+
+    class RecordingClient(_RecordingClient):
+        def get(self, url, params=None, **kw):
+            _RecordingClient.requested_urls.append(url)
+            path = url.split("?", 1)[0]
+            for key, resp in responses.items():
+                if path.endswith(key):
+                    return resp
+            return _FakeResponse(404)
+
+    _RecordingClient.reset()
+    return RecordingClient
+
+
+class TestF003U1RulesetTesterTriangulation:
+    """F-003-U-1 — independently re-check the description's matrix.
+
+    The unit description is the source of truth: verify_repo must also query
+    /rules/branches/{branch}, accept either system that satisfies policy
+    (pull_request rule + ≥1 approval, non_fast_forward, deletion, no
+    maintain/admin bypass), and annotate the "branch protection exists"
+    check with `source: classic` or `source: ruleset`. Both present →
+    prefer classic for display.
+    """
+
+    # --- 1. classic-only pass ---
+
+    def test_classic_only_path_passes_and_shows_source_classic(self, monkeypatch):
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(200, _good_protection()),
+            "/user": _FakeResponse(200, {"login": "u"}),
+        }
+        monkeypatch.setattr("httpx.Client", _make_client(responses))
+
+        result = verify("github.com/owner/repo", token="ghp_fake")
+        assert result.passed
+        prot = next(c for c in result.checks if c.name == "branch protection exists")
+        # Description: "source: classic | ruleset" annotation
+        assert prot.detail == "source: classic"
+
+    # --- 2. ruleset-only pass ---
+
+    def test_ruleset_only_path_passes_and_shows_source_ruleset(self, monkeypatch):
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(404),
+            "/repos/owner/repo/rules/branches/main": _FakeResponse(200, _good_ruleset_rules()),
+            "/repos/owner/repo/rulesets/42": _FakeResponse(200, _good_ruleset_detail()),
+            "/user": _FakeResponse(200, {"login": "u"}),
+        }
+        monkeypatch.setattr("httpx.Client", _make_client(responses))
+
+        result = verify("github.com/owner/repo", token="ghp_fake")
+        assert result.passed
+        prot = next(c for c in result.checks if c.name == "branch protection exists")
+        assert prot.detail == "source: ruleset"
+        # All four policy sub-checks must be derived from the ruleset:
+        sub_names = {c.name for c in result.checks}
+        for required in (
+            "≥1 approving review required",
+            "force push blocked",
+            "deletion blocked",
+            "admin bypass blocked",
+        ):
+            assert required in sub_names, f"{required} sub-check missing"
+
+    # --- 3. both present — prefer classic for display ---
+
+    def test_both_systems_present_classic_is_displayed(self, monkeypatch):
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(200, _good_protection()),
+            "/repos/owner/repo/rules/branches/main": _FakeResponse(200, _good_ruleset_rules()),
+            "/repos/owner/repo/rulesets/42": _FakeResponse(200, _good_ruleset_detail()),
+            "/user": _FakeResponse(200, {"login": "u"}),
+        }
+        monkeypatch.setattr("httpx.Client", _make_client(responses))
+
+        result = verify("github.com/owner/repo", token="ghp_fake")
+        assert result.passed
+        prot = next(c for c in result.checks if c.name == "branch protection exists")
+        # Description: "If both exist, prefer classic for display;
+        # report ruleset only when classic is absent."
+        assert prot.detail == "source: classic"
+
+    # --- 4. neither (still fails) ---
+
+    def test_neither_classic_nor_ruleset_still_fails(self, monkeypatch):
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(404),
+            "/repos/owner/repo/rules/branches/main": _FakeResponse(200, []),
+            "/user": _FakeResponse(200, {"login": "u"}),
+        }
+        monkeypatch.setattr("httpx.Client", _make_client(responses))
+
+        result = verify("github.com/owner/repo", token="ghp_fake")
+        assert not result.passed
+        prot = next(c for c in result.checks if c.name == "branch protection exists")
+        assert not prot.passed
+        # No sub-checks should be appended when neither system applies — the
+        # verifier short-circuits because policy is meaningless.
+        assert not any(c.name == "≥1 approving review required" for c in result.checks)
+
+    def test_neither_when_rules_endpoint_404s(self, monkeypatch):
+        """Some accounts may 404 on /rules/branches; that path must also fail."""
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(404),
+            "/repos/owner/repo/rules/branches/main": _FakeResponse(404),
+            "/user": _FakeResponse(200, {"login": "u"}),
+        }
+        monkeypatch.setattr("httpx.Client", _make_client(responses))
+
+        result = verify("github.com/owner/repo", token="ghp_fake")
+        assert not result.passed
+        prot = next(c for c in result.checks if c.name == "branch protection exists")
+        assert not prot.passed
+
+    # --- 5. ruleset with approvals=0 (fails) ---
+
+    def test_ruleset_pull_request_rule_with_zero_approvals_fails(self, monkeypatch):
+        rules = [
+            {
+                "type": "pull_request",
+                "ruleset_id": 100,
+                "parameters": {"required_approving_review_count": 0},
+            },
+            {"type": "non_fast_forward", "ruleset_id": 100},
+            {"type": "deletion", "ruleset_id": 100},
+        ]
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(404),
+            "/repos/owner/repo/rules/branches/main": _FakeResponse(200, rules),
+            "/repos/owner/repo/rulesets/100": _FakeResponse(200, _good_ruleset_detail(100)),
+            "/user": _FakeResponse(200, {"login": "u"}),
+        }
+        monkeypatch.setattr("httpx.Client", _make_client(responses))
+
+        result = verify("github.com/owner/repo", token="ghp_fake")
+        assert not result.passed
+        approvals = next(c for c in result.checks if c.name == "≥1 approving review required")
+        assert not approvals.passed
+        # state.py regex parses "= N" out of detail — must use that exact form
+        assert "= 0" in approvals.detail
+
+    def test_ruleset_with_no_pull_request_rule_fails(self, monkeypatch):
+        """A ruleset that omits the pull_request rule entirely doesn't satisfy
+        the description's "pull_request rule present with required_approving_review_count >= 1"
+        requirement."""
+        rules = [
+            {"type": "non_fast_forward", "ruleset_id": 101},
+            {"type": "deletion", "ruleset_id": 101},
+        ]
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(404),
+            "/repos/owner/repo/rules/branches/main": _FakeResponse(200, rules),
+            "/repos/owner/repo/rulesets/101": _FakeResponse(200, _good_ruleset_detail(101)),
+            "/user": _FakeResponse(200, {"login": "u"}),
+        }
+        monkeypatch.setattr("httpx.Client", _make_client(responses))
+
+        result = verify("github.com/owner/repo", token="ghp_fake")
+        assert not result.passed
+        approvals = next(c for c in result.checks if c.name == "≥1 approving review required")
+        assert not approvals.passed
+
+    # --- 6. ruleset with bypass actor (fails) — admin AND maintain ---
+
+    def test_ruleset_admin_tier_bypass_actor_disqualifies(self, monkeypatch):
+        rs_detail = _good_ruleset_detail(
+            ruleset_id=200,
+            bypass_actors=[{"actor_id": 5, "actor_type": "RepositoryRole"}],
+        )
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(404),
+            "/repos/owner/repo/rules/branches/main": _FakeResponse(200, _good_ruleset_rules(200)),
+            "/repos/owner/repo/rulesets/200": _FakeResponse(200, rs_detail),
+            "/user": _FakeResponse(200, {"login": "u"}),
+        }
+        monkeypatch.setattr("httpx.Client", _make_client(responses))
+
+        result = verify("github.com/owner/repo", token="ghp_fake")
+        assert not result.passed
+        bypass = next(c for c in result.checks if c.name == "admin bypass blocked")
+        assert not bypass.passed
+
+    def test_ruleset_maintain_tier_bypass_actor_disqualifies(self, monkeypatch):
+        rs_detail = _good_ruleset_detail(
+            ruleset_id=201,
+            bypass_actors=[{"actor_id": 4, "actor_type": "RepositoryRole"}],
+        )
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(404),
+            "/repos/owner/repo/rules/branches/main": _FakeResponse(200, _good_ruleset_rules(201)),
+            "/repos/owner/repo/rulesets/201": _FakeResponse(200, rs_detail),
+            "/user": _FakeResponse(200, {"login": "u"}),
+        }
+        monkeypatch.setattr("httpx.Client", _make_client(responses))
+
+        result = verify("github.com/owner/repo", token="ghp_fake")
+        assert not result.passed
+        bypass = next(c for c in result.checks if c.name == "admin bypass blocked")
+        assert not bypass.passed
+
+    # --- 7. ruleset missing non_fast_forward (fails) ---
+
+    def test_ruleset_missing_non_fast_forward_rule_fails(self, monkeypatch):
+        rules = [
+            {
+                "type": "pull_request",
+                "ruleset_id": 300,
+                "parameters": {"required_approving_review_count": 2},
+            },
+            {"type": "deletion", "ruleset_id": 300},
+            # no non_fast_forward
+        ]
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(404),
+            "/repos/owner/repo/rules/branches/main": _FakeResponse(200, rules),
+            "/repos/owner/repo/rulesets/300": _FakeResponse(200, _good_ruleset_detail(300)),
+            "/user": _FakeResponse(200, {"login": "u"}),
+        }
+        monkeypatch.setattr("httpx.Client", _make_client(responses))
+
+        result = verify("github.com/owner/repo", token="ghp_fake")
+        assert not result.passed
+        force = next(c for c in result.checks if c.name == "force push blocked")
+        assert not force.passed
+        # Approvals & deletion should still pass — only force-push fails
+        approvals = next(c for c in result.checks if c.name == "≥1 approving review required")
+        deletion = next(c for c in result.checks if c.name == "deletion blocked")
+        assert approvals.passed
+        assert deletion.passed
+
+    # --- Additional tester-discovered cases ---
+
+    def test_rules_branches_endpoint_is_actually_queried(self, monkeypatch):
+        """Regression: the new /rules/branches/{branch} endpoint must be hit.
+
+        Earlier verify_repo only called /branches/{branch}/protection. This
+        test would have caught the bug from F-001 onboarding where the
+        ruleset went undetected.
+        """
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(404),
+            "/repos/owner/repo/rules/branches/main": _FakeResponse(200, _good_ruleset_rules()),
+            "/repos/owner/repo/rulesets/42": _FakeResponse(200, _good_ruleset_detail()),
+            "/user": _FakeResponse(200, {"login": "u"}),
+        }
+        monkeypatch.setattr("httpx.Client", _recording_client_factory(responses))
+
+        verify("github.com/owner/repo", token="ghp_fake")
+        urls = _RecordingClient.requested_urls
+        assert any("/rules/branches/main" in u for u in urls), (
+            f"verify() never queried /rules/branches/main; URLs hit: {urls}"
+        )
+
+    def test_classic_fails_but_ruleset_passes_overall_passes(self, monkeypatch):
+        """Description: "Accept either system if it satisfies the orchestrator policy."
+
+        Classic protection exists but is misconfigured (approvals=0). A
+        properly-configured ruleset also exists. Overall verification must
+        pass, with the ruleset chosen as the display source.
+        """
+        bad_classic = _good_protection()
+        bad_classic["required_pull_request_reviews"] = {"required_approving_review_count": 0}
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(200, bad_classic),
+            "/repos/owner/repo/rules/branches/main": _FakeResponse(200, _good_ruleset_rules()),
+            "/repos/owner/repo/rulesets/42": _FakeResponse(200, _good_ruleset_detail()),
+            "/user": _FakeResponse(200, {"login": "u"}),
+        }
+        monkeypatch.setattr("httpx.Client", _make_client(responses))
+
+        result = verify("github.com/owner/repo", token="ghp_fake")
+        assert result.passed, (
+            f"verify should pass when ruleset satisfies policy even if classic doesn't; "
+            f"failed checks: {result.failure_summary}"
+        )
+        prot = next(c for c in result.checks if c.name == "branch protection exists")
+        assert prot.detail == "source: ruleset", (
+            "When classic exists but fails policy and ruleset passes, display "
+            "source must be 'ruleset' so the user can see which system carried it."
+        )
+
+    def test_format_result_lines_renders_source_in_parens(self, monkeypatch):
+        """Description gives the exact line shape:
+        '✓ branch protection exists (source: classic | ruleset)'
+        """
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(200, _good_protection()),
+            "/user": _FakeResponse(200, {"login": "u"}),
+        }
+        monkeypatch.setattr("httpx.Client", _make_client(responses))
+
+        result = verify("github.com/owner/repo", token="ghp_fake")
+        lines = repo_verify.format_result_lines(result)
+        prot_lines = [line for line in lines if "branch protection exists" in line and "✓" in line]
+        assert prot_lines, f"no formatted branch-protection line found in: {lines}"
+        # Must show parenthesized source annotation, not a bullet "·"
+        assert any("(source: classic)" in line for line in prot_lines), (
+            f"expected '(source: classic)' in formatted line; got: {prot_lines}"
+        )
+
+
 # --------------------------- format_result_lines ---------------------------
 
 
