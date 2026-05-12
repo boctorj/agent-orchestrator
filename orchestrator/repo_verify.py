@@ -24,6 +24,8 @@ transparently on next access.
 from __future__ import annotations
 
 import os
+import re
+from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
@@ -31,6 +33,11 @@ import httpx
 from orchestrator.models import CheckResult, VerificationResult
 
 GITHUB_API_BASE = "https://api.github.com"
+
+# Regex matches the standard KEY=value form in a .env file (one per line).
+# The same shape `orchestrator doctor` uses — kept consistent so the two
+# call sites can't drift on what "the GITHUB_TOKEN in .env" means.
+_ENV_GITHUB_TOKEN_RE = re.compile(r"^GITHUB_TOKEN=(\S+)", re.MULTILINE)
 
 
 # --------------------------- URL canonicalization ---------------------------
@@ -95,6 +102,98 @@ def _api_headers(token: str) -> dict[str, str]:
     }
 
 
+# --------------------------- identity match ---------------------------
+
+
+def _identity_match_check(
+    client: httpx.Client, owner: str, repo: str, token_user: str
+) -> CheckResult:
+    """Build the "identity match" CheckResult for a PAT-authenticated verify().
+
+    Pass cases:
+      * token user IS the repo owner (case-insensitive login compare), OR
+      * token user appears in the collaborators list with push permission.
+
+    Failure case (the bug F-002 exists to fix): token user is neither the
+    owner nor a push-capable collaborator. The detail string includes the
+    exact fix-it instructions a user needs — generate a PAT from the owner
+    account, or grant the current user push access on this repo.
+    """
+    if token_user.lower() == owner.lower():
+        return CheckResult(
+            "identity match",
+            True,
+            f"token user ({token_user}) is the repo owner",
+        )
+
+    # Different login. Check collaborators with push.
+    cr = client.get(f"{GITHUB_API_BASE}/repos/{owner}/{repo}/collaborators")
+    push_capable_collaborators: set[str] = set()
+    if cr.status_code == 200:
+        for collab in cr.json() or []:
+            login = (collab.get("login") or "").lower()
+            perms = collab.get("permissions") or {}
+            if login and perms.get("push"):
+                push_capable_collaborators.add(login)
+
+    if token_user.lower() in push_capable_collaborators:
+        return CheckResult(
+            "identity match",
+            True,
+            f"token user ({token_user}) is a collaborator with push access",
+        )
+
+    detail = (
+        f"token user ({token_user}) is not the repo owner ({owner}) "
+        f"and is not a collaborator with push access. Generate a PAT "
+        f"from the {owner} account, or grant {token_user} push access "
+        f"on this repo."
+    )
+    return CheckResult("identity match", False, detail)
+
+
+# --------------------------- stale-env detection ---------------------------
+
+
+def detect_stale_env(env_path: Path | str = Path(".env")) -> str | None:
+    """Return a warning if the loaded GITHUB_TOKEN differs from the .env file's.
+
+    The MCP server reads `.env` once at startup via `load_dotenv()`. If the
+    user has since edited `.env` (e.g., rotated the token) but hasn't
+    restarted the server, the in-process `os.environ['GITHUB_TOKEN']`
+    still holds the OLD value. That's invisible to the user and surfaces
+    only as confusing downstream auth failures.
+
+    This helper compares the two and returns a multi-line warning string
+    when they differ. The token VALUE is never logged — only the fact of
+    a mismatch.
+
+    Returns ``None`` when:
+      * `.env` doesn't exist on disk (nothing to compare against),
+      * `.env` has no `GITHUB_TOKEN` line, or
+      * the on-disk value matches the loaded value.
+    """
+    path = Path(env_path)
+    if not path.exists():
+        return None
+    try:
+        content = path.read_text()
+    except OSError:
+        return None
+    match = _ENV_GITHUB_TOKEN_RE.search(content)
+    if not match:
+        return None
+    on_disk = match.group(1)
+    loaded = os.environ.get("GITHUB_TOKEN", "")
+    if on_disk == loaded:
+        return None
+    return (
+        "⚠ Loaded GITHUB_TOKEN differs from the value currently in .env.\n"
+        "  The MCP server cached the old value at startup. Restart the server\n"
+        "  to pick up the new token before retrying."
+    )
+
+
 # --------------------------- verify() ---------------------------
 
 
@@ -146,6 +245,31 @@ def verify(repo_url: str, token: str, auth_mode: str = "pat") -> VerificationRes
         result.default_branch = meta.get("default_branch", "main")
         perms = meta.get("permissions") or {}
         result.checks.append(CheckResult("read access", bool(perms.get("pull", False))))
+
+        # Auth identity (best-effort — never blocks). Fetched BEFORE the
+        # write/branch-protection checks so the identity-match check below
+        # can use it; otherwise an identity mismatch surfaces only as a
+        # confusing downstream "write access" failure.
+        token_user_login = ""  # nosec B105 — placeholder for the PAT branch below, not a secret
+        if auth_mode == "pat":
+            ur = client.get(f"{GITHUB_API_BASE}/user")
+            if ur.status_code == 200:
+                token_user_login = ur.json().get("login", "") or ""
+                result.auth_identity = f"user:{token_user_login or '?'}"
+        elif auth_mode == "app":
+            inst = os.getenv("GITHUB_APP_INSTALLATION_ID", "?")
+            result.auth_identity = f"app:installation:{inst}"
+
+        # 1.5. Identity match — does the token user own this repo, or are
+        # they at least a push-capable collaborator? Runs BEFORE write/
+        # branch-protection so the root cause surfaces as a first-class
+        # check instead of as a downstream symptom. PAT-only: in App mode
+        # the identity is `app:installation:N`, which doesn't compare
+        # 1:1 with a repo owner login.
+        if auth_mode == "pat" and token_user_login:
+            result.checks.append(_identity_match_check(client, owner, repo, token_user_login))
+
+        # Write access check (uses cached perms from the /repos call above).
         result.checks.append(
             CheckResult(
                 "write access",
@@ -153,15 +277,6 @@ def verify(repo_url: str, token: str, auth_mode: str = "pat") -> VerificationRes
                 "" if perms.get("push") else "token lacks push permission for this repo",
             )
         )
-
-        # Auth identity (best-effort — never blocks)
-        if auth_mode == "pat":
-            ur = client.get(f"{GITHUB_API_BASE}/user")
-            if ur.status_code == 200:
-                result.auth_identity = f"user:{ur.json().get('login', '?')}"
-        elif auth_mode == "app":
-            inst = os.getenv("GITHUB_APP_INSTALLATION_ID", "?")
-            result.auth_identity = f"app:installation:{inst}"
 
         # 2. Branch protection on the default branch
         br = client.get(
@@ -337,6 +452,7 @@ def format_result_lines(result: VerificationResult) -> list[str]:
 
 __all__ = [
     "GITHUB_API_BASE",
+    "detect_stale_env",
     "format_result_lines",
     "normalize_repo_url",
     "verify",
