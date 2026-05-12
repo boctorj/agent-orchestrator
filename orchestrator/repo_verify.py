@@ -4,12 +4,22 @@ A repo is verifiable only if all of the following hold:
 
   1. The configured token can READ the repo (`permissions.pull = true`).
   2. The configured token can WRITE to the repo (`permissions.push = true`).
-  3. Branch protection rules exist on the repo's default branch.
+  3. Branch protection exists on the repo's default branch — via EITHER the
+     classic ``/branches/{branch}/protection`` API or the modern Rulesets
+     system (``/rules/branches/{branch}``). Either system that satisfies
+     orchestrator policy yields green; both is fine too.
   4. Required-approving-review count is at least 1.
-  5. Force pushes are blocked (`allow_force_pushes = false`).
-  6. Branch deletion is blocked (`allow_deletions = false`).
-  7. Admins cannot bypass protection (`enforce_admins = true`).
+  5. Force pushes are blocked (classic: ``allow_force_pushes = false``;
+     ruleset: a ``non_fast_forward`` rule applies).
+  6. Branch deletion is blocked (classic: ``allow_deletions = false``;
+     ruleset: a ``deletion`` rule applies).
+  7. Admins cannot bypass protection (classic: ``enforce_admins = true``;
+     ruleset: no bypass actor at maintain/admin tier).
   8. (App auth only) The repo is in the App installation's repo list.
+
+When both classic protection and a ruleset apply, classic is preferred for
+display (the ``source: classic`` annotation on the "branch protection
+exists" check). Ruleset is reported only when classic is absent.
 
 Non-blocking warnings: CODEOWNERS present (may block bot endorsement),
 required signed commits (bot commits aren't signed), required status
@@ -95,6 +105,235 @@ def _api_headers(token: str) -> dict[str, str]:
     }
 
 
+# --------------------------- branch-protection evaluators ---------------------------
+#
+# verify() consults BOTH the classic /branches/{branch}/protection API and
+# the modern Rulesets system (/rules/branches/{branch}). Each evaluator
+# returns a uniform dict the dispatcher in verify() can reason about:
+#
+#   {
+#       "exists":     bool,           # endpoint returned a configured policy
+#       "http_error": str,            # non-empty if a transient HTTP error
+#                                     # occurred (surfaced only if NEITHER
+#                                     # system has protection)
+#       "sub_checks": list[CheckResult],  # the four per-policy checks
+#                                         # (approvals, force-push, deletion,
+#                                         # admin-bypass)
+#       "raw":        dict | list,    # the original API payload — only used
+#                                     # downstream to extract classic-only
+#                                     # warnings (required_signatures etc.)
+#   }
+#
+# A system is said to "pass policy" iff `exists` is True AND every CheckResult
+# in `sub_checks` has `passed = True`. The dispatcher prefers the passing
+# system; on a tie it prefers classic.
+
+# Bypass-actor tiers that disqualify a ruleset under orchestrator policy.
+# The numeric IDs map GitHub's built-in RepositoryRole identifiers:
+#   1=read, 2=triage, 3=write, 4=maintain, 5=admin.
+# Anything write-tier or below is informational (a write-tier collaborator
+# is already trusted to push to feature branches and request review).
+# Maintain or admin bypassing protection short-circuits the review gate.
+_DISQUALIFYING_REPO_ROLE_IDS: dict[int, str] = {4: "maintain", 5: "admin"}
+
+
+def _evaluate_classic_protection(client: httpx.Client, owner: str, repo: str, branch: str) -> dict:
+    """Query classic /branches/{branch}/protection; return uniform evaluator dict."""
+    out: dict = {"exists": False, "http_error": "", "sub_checks": [], "raw": {}}
+    br = client.get(f"{GITHUB_API_BASE}/repos/{owner}/{repo}/branches/{branch}/protection")
+    if br.status_code == 404:
+        return out
+    if br.status_code != 200:
+        out["http_error"] = (
+            f"HTTP {br.status_code} reading classic protection rule "
+            "(token may lack admin:repo_hook or admin:org scope)"
+        )
+        return out
+
+    out["exists"] = True
+    prot = br.json() or {}
+    out["raw"] = prot
+
+    rev = prot.get("required_pull_request_reviews") or {}
+    n_approvals = int(rev.get("required_approving_review_count") or 0)
+    out["sub_checks"].append(
+        CheckResult(
+            "≥1 approving review required",
+            n_approvals >= 1,
+            f"required_approving_review_count = {n_approvals}",
+        )
+    )
+    force_push = bool((prot.get("allow_force_pushes") or {}).get("enabled", True))
+    out["sub_checks"].append(
+        CheckResult(
+            "force push blocked",
+            not force_push,
+            "allow_force_pushes is enabled" if force_push else "",
+        )
+    )
+    deletion = bool((prot.get("allow_deletions") or {}).get("enabled", True))
+    out["sub_checks"].append(
+        CheckResult(
+            "deletion blocked",
+            not deletion,
+            "allow_deletions is enabled" if deletion else "",
+        )
+    )
+    enforce_admins = bool((prot.get("enforce_admins") or {}).get("enabled", False))
+    out["sub_checks"].append(
+        CheckResult(
+            "admin bypass blocked",
+            enforce_admins,
+            "" if enforce_admins else "enforce_admins is off — admins can bypass protection",
+        )
+    )
+    return out
+
+
+def _evaluate_ruleset_protection(client: httpx.Client, owner: str, repo: str, branch: str) -> dict:
+    """Query /rules/branches/{branch} (Rulesets); return uniform evaluator dict.
+
+    The endpoint returns a flat list of rules; each rule carries a ``type``,
+    ``parameters``, and ``ruleset_id``. To check for disqualifying bypass
+    actors we additionally fetch ``/rulesets/{id}`` for each contributing
+    ruleset (a best-effort call — non-200 responses are tolerated, since
+    the rules endpoint itself already filters out rules the calling token
+    can bypass).
+    """
+    out: dict = {"exists": False, "http_error": "", "sub_checks": [], "raw": []}
+    rr = client.get(f"{GITHUB_API_BASE}/repos/{owner}/{repo}/rules/branches/{branch}")
+    if rr.status_code == 404:
+        return out
+    if rr.status_code != 200:
+        out["http_error"] = (
+            f"HTTP {rr.status_code} from /repos/{owner}/{repo}/rules/branches/{branch}"
+        )
+        return out
+
+    rules = rr.json() or []
+    if not rules:
+        # Empty list means no rules apply — same as 404 for our purposes.
+        return out
+
+    out["exists"] = True
+    out["raw"] = rules
+
+    has_pr_rule = False
+    max_approvals = 0
+    has_non_fast_forward = False
+    has_deletion = False
+    ruleset_ids: set[int] = set()
+    for rule in rules:
+        rtype = rule.get("type")
+        params = rule.get("parameters") or {}
+        if rtype == "pull_request":
+            has_pr_rule = True
+            n = int(params.get("required_approving_review_count") or 0)
+            if n > max_approvals:
+                max_approvals = n
+        elif rtype == "non_fast_forward":
+            has_non_fast_forward = True
+        elif rtype == "deletion":
+            has_deletion = True
+        rsid = rule.get("ruleset_id")
+        if rsid is not None:
+            ruleset_ids.add(int(rsid))
+
+    # Approvals — same detail format as classic so state.py's regex (which
+    # parses "= N" out of detail) keeps working.
+    if has_pr_rule:
+        out["sub_checks"].append(
+            CheckResult(
+                "≥1 approving review required",
+                max_approvals >= 1,
+                f"required_approving_review_count = {max_approvals}",
+            )
+        )
+    else:
+        out["sub_checks"].append(
+            CheckResult(
+                "≥1 approving review required",
+                False,
+                "no pull_request rule in ruleset",
+            )
+        )
+
+    out["sub_checks"].append(
+        CheckResult(
+            "force push blocked",
+            has_non_fast_forward,
+            "" if has_non_fast_forward else "no non_fast_forward rule in ruleset",
+        )
+    )
+    out["sub_checks"].append(
+        CheckResult(
+            "deletion blocked",
+            has_deletion,
+            "" if has_deletion else "no deletion rule in ruleset",
+        )
+    )
+
+    # Inspect each contributing ruleset for disqualifying bypass actors.
+    # Sorted for deterministic ordering when multiple rulesets contribute.
+    bad_bypass_detail = ""
+    for rsid in sorted(ruleset_ids):
+        rs = client.get(f"{GITHUB_API_BASE}/repos/{owner}/{repo}/rulesets/{rsid}")
+        if rs.status_code != 200:
+            continue
+        rs_json = rs.json() or {}
+        for actor in rs_json.get("bypass_actors") or []:
+            actor_type = actor.get("actor_type")
+            actor_id = actor.get("actor_id")
+            if actor_type == "OrganizationAdmin":
+                bad_bypass_detail = f"ruleset {rsid} grants OrganizationAdmin a bypass actor entry"
+                break
+            if actor_type == "RepositoryRole" and actor_id in _DISQUALIFYING_REPO_ROLE_IDS:
+                tier = _DISQUALIFYING_REPO_ROLE_IDS[actor_id]
+                bad_bypass_detail = (
+                    f"ruleset {rsid} grants RepositoryRole {tier}-tier a bypass actor entry"
+                )
+                break
+        if bad_bypass_detail:
+            break
+
+    out["sub_checks"].append(
+        CheckResult(
+            "admin bypass blocked",
+            not bad_bypass_detail,
+            bad_bypass_detail,
+        )
+    )
+    return out
+
+
+def _select_protection_source(classic_eval: dict, ruleset_eval: dict) -> tuple[str | None, dict]:
+    """Pick which evaluator drives the displayed sub-checks.
+
+    Returns ``(source, chosen_eval)`` where ``source`` is one of
+    ``"classic"``, ``"ruleset"``, or ``None`` (no system has protection).
+
+    Selection rules:
+      1. If classic passes policy → classic (preferred on a tie).
+      2. Else if ruleset passes policy → ruleset.
+      3. Else if classic exists → classic (show its failures).
+      4. Else if ruleset exists → ruleset (show its failures).
+      5. Else → None.
+    """
+
+    def _passes(ev: dict) -> bool:
+        return bool(ev["exists"]) and all(c.passed for c in ev["sub_checks"])
+
+    if _passes(classic_eval):
+        return "classic", classic_eval
+    if _passes(ruleset_eval):
+        return "ruleset", ruleset_eval
+    if classic_eval["exists"]:
+        return "classic", classic_eval
+    if ruleset_eval["exists"]:
+        return "ruleset", ruleset_eval
+    return None, {}
+
+
 # --------------------------- verify() ---------------------------
 
 
@@ -163,74 +402,42 @@ def verify(repo_url: str, token: str, auth_mode: str = "pat") -> VerificationRes
             inst = os.getenv("GITHUB_APP_INSTALLATION_ID", "?")
             result.auth_identity = f"app:installation:{inst}"
 
-        # 2. Branch protection on the default branch
-        br = client.get(
-            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/branches/{result.default_branch}/protection"
-        )
-        if br.status_code == 404:
-            result.checks.append(
-                CheckResult(
-                    "branch protection exists",
-                    False,
+        # 2. Branch protection on the default branch — classic OR ruleset.
+        #    Evaluate both systems independently, then pick the source that
+        #    satisfies policy (preferring classic on a tie). The selected
+        #    system supplies the per-policy sub-checks below.
+        classic_eval = _evaluate_classic_protection(client, owner, repo, result.default_branch)
+        ruleset_eval = _evaluate_ruleset_protection(client, owner, repo, result.default_branch)
+
+        source, chosen = _select_protection_source(classic_eval, ruleset_eval)
+        if source is None:
+            # Neither system has protection on this branch.
+            errs = [e for e in (classic_eval["http_error"], ruleset_eval["http_error"]) if e]
+            if errs:
+                detail = (
+                    f"no readable branch protection on `{result.default_branch}` — "
+                    "neither classic nor ruleset endpoint returned a result ("
+                    + "; ".join(errs)
+                    + ")"
+                )
+            else:
+                detail = (
                     f"no branch protection rule on `{result.default_branch}` — "
-                    f"set one up at github.com/{owner}/{repo}/settings/branches",
+                    f"neither classic protection nor a ruleset applies; "
+                    f"set one up at github.com/{owner}/{repo}/settings/branches"
                 )
-            )
+            result.checks.append(CheckResult("branch protection exists", False, detail))
             return result  # short-circuit; sub-rules are meaningless without protection
-        if br.status_code != 200:
-            result.checks.append(
-                CheckResult(
-                    "branch protection exists",
-                    False,
-                    f"HTTP {br.status_code} reading protection rule "
-                    f"(token may lack admin:repo_hook or admin:org scope)",
-                )
-            )
-            return result
 
-        result.checks.append(CheckResult("branch protection exists", True))
-        prot = br.json()
+        # Top-level "exists" check, annotated with which system passed.
+        result.checks.append(CheckResult("branch protection exists", True, f"source: {source}"))
+        for sub in chosen["sub_checks"]:
+            result.checks.append(sub)
 
-        # 3. ≥1 approving review required
-        rev = prot.get("required_pull_request_reviews") or {}
-        n_approvals = int(rev.get("required_approving_review_count") or 0)
-        result.checks.append(
-            CheckResult(
-                "≥1 approving review required",
-                n_approvals >= 1,
-                f"required_approving_review_count = {n_approvals}",
-            )
-        )
-
-        # 4. No force push
-        force_push = bool((prot.get("allow_force_pushes") or {}).get("enabled", True))
-        result.checks.append(
-            CheckResult(
-                "force push blocked",
-                not force_push,
-                "allow_force_pushes is enabled" if force_push else "",
-            )
-        )
-
-        # 5. No deletion
-        deletion = bool((prot.get("allow_deletions") or {}).get("enabled", True))
-        result.checks.append(
-            CheckResult(
-                "deletion blocked",
-                not deletion,
-                "allow_deletions is enabled" if deletion else "",
-            )
-        )
-
-        # 6. No admin bypass
-        enforce_admins = bool((prot.get("enforce_admins") or {}).get("enabled", False))
-        result.checks.append(
-            CheckResult(
-                "admin bypass blocked",
-                enforce_admins,
-                "" if enforce_admins else "enforce_admins is off — admins can bypass protection",
-            )
-        )
+        # `prot` is only populated when classic is the display source; the
+        # required_signatures / required_status_checks warnings below are
+        # classic-specific signals and are skipped when ruleset is the source.
+        prot: dict = classic_eval["raw"] if source == "classic" else {}
 
         # 7. App-only: this repo is in the App installation
         if auth_mode == "app":
@@ -320,7 +527,13 @@ def format_result_lines(result: VerificationResult) -> list[str]:
         mark = "✓" if c.passed else "✗"
         line = f"  {mark} {c.name}"
         if c.detail:
-            line += f"  · {c.detail}"
+            # The branch-protection check stashes "source: classic" or
+            # "source: ruleset" in detail; render it in parens so the line
+            # reads cleanly: "✓ branch protection exists (source: classic)".
+            if c.detail.startswith("source:"):
+                line += f" ({c.detail})"
+            else:
+                line += f"  · {c.detail}"
         lines.append(line)
     if result.notes:
         lines.append("")
