@@ -111,7 +111,9 @@ class TestVerify:
         responses = {
             "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
             "/repos/owner/repo/branches/main/protection": _FakeResponse(200, _good_protection()),
-            "/user": _FakeResponse(200, {"login": "tester"}),
+            # Token user matches the repo owner so the identity-match check
+            # passes trivially without needing to mock /collaborators.
+            "/user": _FakeResponse(200, {"login": "owner"}),
             # CODEOWNERS: 404 everywhere
         }
         monkeypatch.setattr("httpx.Client", _make_client(responses))
@@ -121,10 +123,11 @@ class TestVerify:
         assert result.passed
         assert result.default_branch == "main"
         assert result.auth_mode == "pat"
-        assert result.auth_identity == "user:tester"
+        assert result.auth_identity == "user:owner"
         # All check names present
         names = [c.name for c in result.checks]
         assert "read access" in names
+        assert "identity match" in names
         assert "write access" in names
         assert "branch protection exists" in names
         assert "≥1 approving review required" in names
@@ -137,7 +140,7 @@ class TestVerify:
         responses = {
             "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
             "/repos/owner/repo/branches/main/protection": _FakeResponse(404),
-            "/user": _FakeResponse(200, {"login": "tester"}),
+            "/user": _FakeResponse(200, {"login": "owner"}),
         }
         monkeypatch.setattr("httpx.Client", _make_client(responses))
 
@@ -165,7 +168,7 @@ class TestVerify:
         responses = {
             "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
             "/repos/owner/repo/branches/main/protection": _FakeResponse(200, prot),
-            "/user": _FakeResponse(200, {"login": "u"}),
+            "/user": _FakeResponse(200, {"login": "owner"}),
         }
         monkeypatch.setattr("httpx.Client", _make_client(responses))
 
@@ -181,7 +184,7 @@ class TestVerify:
         responses = {
             "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
             "/repos/owner/repo/branches/main/protection": _FakeResponse(200, prot),
-            "/user": _FakeResponse(200, {"login": "u"}),
+            "/user": _FakeResponse(200, {"login": "owner"}),
         }
         monkeypatch.setattr("httpx.Client", _make_client(responses))
 
@@ -196,7 +199,7 @@ class TestVerify:
         responses = {
             "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
             "/repos/owner/repo/branches/main/protection": _FakeResponse(200, prot),
-            "/user": _FakeResponse(200, {"login": "u"}),
+            "/user": _FakeResponse(200, {"login": "owner"}),
         }
         monkeypatch.setattr("httpx.Client", _make_client(responses))
 
@@ -215,7 +218,7 @@ class TestVerify:
             "/repos/owner/repo/contents/CODEOWNERS": _FakeResponse(200, {"path": "CODEOWNERS"}),
             "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
             "/repos/owner/repo/branches/main/protection": _FakeResponse(200, _good_protection()),
-            "/user": _FakeResponse(200, {"login": "u"}),
+            "/user": _FakeResponse(200, {"login": "owner"}),
         }
         monkeypatch.setattr("httpx.Client", _make_client(responses))
 
@@ -233,7 +236,7 @@ class TestVerify:
         responses = {
             "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
             "/repos/owner/repo/branches/main/protection": _FakeResponse(200, prot),
-            "/user": _FakeResponse(200, {"login": "u"}),
+            "/user": _FakeResponse(200, {"login": "owner"}),
         }
         monkeypatch.setattr("httpx.Client", _make_client(responses))
 
@@ -247,7 +250,7 @@ class TestVerify:
         responses = {
             "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
             "/repos/owner/repo/branches/main/protection": _FakeResponse(200, prot),
-            "/user": _FakeResponse(200, {"login": "u"}),
+            "/user": _FakeResponse(200, {"login": "owner"}),
         }
         monkeypatch.setattr("httpx.Client", _make_client(responses))
 
@@ -295,7 +298,7 @@ class TestVerify:
         responses = {
             "/repos/owner/repo": _FakeResponse(200, _good_repo_meta(default_branch="master")),
             "/repos/owner/repo/branches/master/protection": _FakeResponse(200, _good_protection()),
-            "/user": _FakeResponse(200, {"login": "u"}),
+            "/user": _FakeResponse(200, {"login": "owner"}),
         }
         monkeypatch.setattr("httpx.Client", _make_client(responses))
 

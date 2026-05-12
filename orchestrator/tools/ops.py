@@ -207,6 +207,15 @@ def verify_repo(repo_url: str) -> str:
     else:
         lines.append("")
         lines.append("Verification FAILED — spawns against this repo will be blocked until fixed.")
+
+    # Diagnostic prepend: if `.env` on disk has a different GITHUB_TOKEN
+    # than the value loaded in-process, the MCP server is using a stale
+    # token (user rotated it without restarting). Surface that BEFORE the
+    # report so it frames downstream auth/permission failures. Silent
+    # when .env is missing or matches — non-blocking on its own.
+    stale_warning = repo_verify.detect_stale_env()
+    if stale_warning:
+        lines = [stale_warning, ""] + lines
     return "\n".join(lines)
 
 
