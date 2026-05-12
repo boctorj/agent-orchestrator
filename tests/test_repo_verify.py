@@ -641,7 +641,7 @@ class TestF003U1RulesetTesterTriangulation:
         responses = {
             "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
             "/repos/owner/repo/branches/main/protection": _FakeResponse(200, _good_protection()),
-            "/user": _FakeResponse(200, {"login": "u"}),
+            "/user": _FakeResponse(200, {"login": "owner"}),
         }
         monkeypatch.setattr("httpx.Client", _make_client(responses))
 
@@ -659,7 +659,7 @@ class TestF003U1RulesetTesterTriangulation:
             "/repos/owner/repo/branches/main/protection": _FakeResponse(404),
             "/repos/owner/repo/rules/branches/main": _FakeResponse(200, _good_ruleset_rules()),
             "/repos/owner/repo/rulesets/42": _FakeResponse(200, _good_ruleset_detail()),
-            "/user": _FakeResponse(200, {"login": "u"}),
+            "/user": _FakeResponse(200, {"login": "owner"}),
         }
         monkeypatch.setattr("httpx.Client", _make_client(responses))
 
@@ -685,7 +685,7 @@ class TestF003U1RulesetTesterTriangulation:
             "/repos/owner/repo/branches/main/protection": _FakeResponse(200, _good_protection()),
             "/repos/owner/repo/rules/branches/main": _FakeResponse(200, _good_ruleset_rules()),
             "/repos/owner/repo/rulesets/42": _FakeResponse(200, _good_ruleset_detail()),
-            "/user": _FakeResponse(200, {"login": "u"}),
+            "/user": _FakeResponse(200, {"login": "owner"}),
         }
         monkeypatch.setattr("httpx.Client", _make_client(responses))
 
@@ -703,7 +703,7 @@ class TestF003U1RulesetTesterTriangulation:
             "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
             "/repos/owner/repo/branches/main/protection": _FakeResponse(404),
             "/repos/owner/repo/rules/branches/main": _FakeResponse(200, []),
-            "/user": _FakeResponse(200, {"login": "u"}),
+            "/user": _FakeResponse(200, {"login": "owner"}),
         }
         monkeypatch.setattr("httpx.Client", _make_client(responses))
 
@@ -721,7 +721,7 @@ class TestF003U1RulesetTesterTriangulation:
             "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
             "/repos/owner/repo/branches/main/protection": _FakeResponse(404),
             "/repos/owner/repo/rules/branches/main": _FakeResponse(404),
-            "/user": _FakeResponse(200, {"login": "u"}),
+            "/user": _FakeResponse(200, {"login": "owner"}),
         }
         monkeypatch.setattr("httpx.Client", _make_client(responses))
 
@@ -747,7 +747,7 @@ class TestF003U1RulesetTesterTriangulation:
             "/repos/owner/repo/branches/main/protection": _FakeResponse(404),
             "/repos/owner/repo/rules/branches/main": _FakeResponse(200, rules),
             "/repos/owner/repo/rulesets/100": _FakeResponse(200, _good_ruleset_detail(100)),
-            "/user": _FakeResponse(200, {"login": "u"}),
+            "/user": _FakeResponse(200, {"login": "owner"}),
         }
         monkeypatch.setattr("httpx.Client", _make_client(responses))
 
@@ -771,7 +771,7 @@ class TestF003U1RulesetTesterTriangulation:
             "/repos/owner/repo/branches/main/protection": _FakeResponse(404),
             "/repos/owner/repo/rules/branches/main": _FakeResponse(200, rules),
             "/repos/owner/repo/rulesets/101": _FakeResponse(200, _good_ruleset_detail(101)),
-            "/user": _FakeResponse(200, {"login": "u"}),
+            "/user": _FakeResponse(200, {"login": "owner"}),
         }
         monkeypatch.setattr("httpx.Client", _make_client(responses))
 
@@ -792,7 +792,7 @@ class TestF003U1RulesetTesterTriangulation:
             "/repos/owner/repo/branches/main/protection": _FakeResponse(404),
             "/repos/owner/repo/rules/branches/main": _FakeResponse(200, _good_ruleset_rules(200)),
             "/repos/owner/repo/rulesets/200": _FakeResponse(200, rs_detail),
-            "/user": _FakeResponse(200, {"login": "u"}),
+            "/user": _FakeResponse(200, {"login": "owner"}),
         }
         monkeypatch.setattr("httpx.Client", _make_client(responses))
 
@@ -811,7 +811,7 @@ class TestF003U1RulesetTesterTriangulation:
             "/repos/owner/repo/branches/main/protection": _FakeResponse(404),
             "/repos/owner/repo/rules/branches/main": _FakeResponse(200, _good_ruleset_rules(201)),
             "/repos/owner/repo/rulesets/201": _FakeResponse(200, rs_detail),
-            "/user": _FakeResponse(200, {"login": "u"}),
+            "/user": _FakeResponse(200, {"login": "owner"}),
         }
         monkeypatch.setattr("httpx.Client", _make_client(responses))
 
@@ -837,7 +837,7 @@ class TestF003U1RulesetTesterTriangulation:
             "/repos/owner/repo/branches/main/protection": _FakeResponse(404),
             "/repos/owner/repo/rules/branches/main": _FakeResponse(200, rules),
             "/repos/owner/repo/rulesets/300": _FakeResponse(200, _good_ruleset_detail(300)),
-            "/user": _FakeResponse(200, {"login": "u"}),
+            "/user": _FakeResponse(200, {"login": "owner"}),
         }
         monkeypatch.setattr("httpx.Client", _make_client(responses))
 
@@ -865,7 +865,7 @@ class TestF003U1RulesetTesterTriangulation:
             "/repos/owner/repo/branches/main/protection": _FakeResponse(404),
             "/repos/owner/repo/rules/branches/main": _FakeResponse(200, _good_ruleset_rules()),
             "/repos/owner/repo/rulesets/42": _FakeResponse(200, _good_ruleset_detail()),
-            "/user": _FakeResponse(200, {"login": "u"}),
+            "/user": _FakeResponse(200, {"login": "owner"}),
         }
         monkeypatch.setattr("httpx.Client", _recording_client_factory(responses))
 
@@ -889,7 +889,7 @@ class TestF003U1RulesetTesterTriangulation:
             "/repos/owner/repo/branches/main/protection": _FakeResponse(200, bad_classic),
             "/repos/owner/repo/rules/branches/main": _FakeResponse(200, _good_ruleset_rules()),
             "/repos/owner/repo/rulesets/42": _FakeResponse(200, _good_ruleset_detail()),
-            "/user": _FakeResponse(200, {"login": "u"}),
+            "/user": _FakeResponse(200, {"login": "owner"}),
         }
         monkeypatch.setattr("httpx.Client", _make_client(responses))
 
@@ -911,7 +911,7 @@ class TestF003U1RulesetTesterTriangulation:
         responses = {
             "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
             "/repos/owner/repo/branches/main/protection": _FakeResponse(200, _good_protection()),
-            "/user": _FakeResponse(200, {"login": "u"}),
+            "/user": _FakeResponse(200, {"login": "owner"}),
         }
         monkeypatch.setattr("httpx.Client", _make_client(responses))
 
