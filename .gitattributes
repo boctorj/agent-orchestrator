@@ -1,0 +1,11 @@
+# Normalize all text files to LF in the repo and on checkout.
+#
+# Without this, Windows CI runners (where git's `core.autocrlf=true` is
+# the default) check out files with CRLF endings, which then trips the
+# `mixed-line-ending` pre-commit hook with `--fix=lf` and fails the
+# matrix's Windows leg. With `eol=lf`, .gitattributes overrides
+# `core.autocrlf` and forces LF everywhere — same bytes on every OS.
+#
+# `text=auto` lets git auto-detect binary files (PNG, sqlite, etc.) and
+# leave them untouched.
+* text=auto eol=lf
