@@ -158,6 +158,55 @@ def test_list_in_flight_includes_session_flags(tmp_state_db):
     assert row["has_reviewer_session"] is False
 
 
+def test_list_in_flight_no_reason_filter_excludes_escalated(tmp_state_db):
+    """Default call (no reason= arg) preserves the original active-only
+    semantics — escalated units stay out of the result."""
+    state.save_feature(Feature(id="F", title="t", description="d"))
+    state.upsert_unit_state(WorkUnitState(unit_id="U1", feature_id="F", status="coding"))
+    state.upsert_unit_state(WorkUnitState(unit_id="U2", feature_id="F", status="escalated"))
+    parsed = json.loads(ops.list_in_flight())
+    ids = sorted(r["unit_id"] for r in parsed)
+    assert ids == ["U1"]
+
+
+def test_list_in_flight_reason_filter_returns_only_matching_units(tmp_state_db):
+    """F-005-U-2 query path: lead asks 'show me everything blocked on auth'
+    via list_in_flight(reason='auth_failure'). The escalated-status gate
+    opens up, and only units whose latest blocked event slug matches
+    come back."""
+    state.save_feature(Feature(id="F", title="t", description="d"))
+    # Three units, each escalated with a different (or no) reason
+    state.upsert_unit_state(WorkUnitState(unit_id="U-auth", feature_id="F", status="escalated"))
+    state.record_event(
+        "U-auth",
+        "F",
+        "coder_blocked",
+        details=json.dumps({"reason": "auth_failure", "prose": "401"}),
+    )
+    state.upsert_unit_state(WorkUnitState(unit_id="U-bp", feature_id="F", status="escalated"))
+    state.record_event(
+        "U-bp",
+        "F",
+        "coder_blocked",
+        details=json.dumps({"reason": "branch_protection_blocked_push", "prose": "denied"}),
+    )
+    state.upsert_unit_state(WorkUnitState(unit_id="U-active", feature_id="F", status="coding"))
+
+    parsed = json.loads(ops.list_in_flight(reason="auth_failure"))
+    ids = [r["unit_id"] for r in parsed]
+    assert ids == ["U-auth"]
+    # Filtered results expose the slug match for downstream display.
+    assert parsed[0]["reason"] == "auth_failure"
+
+
+def test_list_in_flight_reason_filter_with_no_matches_returns_empty(tmp_state_db):
+    state.save_feature(Feature(id="F", title="t", description="d"))
+    state.upsert_unit_state(WorkUnitState(unit_id="U1", feature_id="F", status="escalated"))
+    state.record_event("U1", "F", "coder_blocked", details="plain prose")
+    parsed = json.loads(ops.list_in_flight(reason="auth_failure"))
+    assert parsed == []
+
+
 # --------------------------- resume_unit ---------------------------
 
 

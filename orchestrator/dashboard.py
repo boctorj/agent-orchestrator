@@ -26,7 +26,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from orchestrator import costs, state
+from orchestrator import blocked_hints, costs, state
 
 REFRESH_SECONDS = 2.0
 
@@ -164,19 +164,41 @@ def _awaiting_merge_data() -> list[dict]:
 
 
 def _escalated_data() -> list[dict]:
+    """Return rows for the dashboard's escalated panel.
+
+    For units whose most-recent BLOCKED-style event carries a structured
+    reason (see :mod:`orchestrator.blocked_hints`), the ``last_error``
+    field is rendered as the full ``reason -> hint -> prose`` summary
+    with no truncation — the remediation tail is exactly the part the
+    lead needs to read. For unclassified failures (``reason="unknown"``)
+    the legacy 120-char truncation is preserved so the panel stays
+    compact on noisy/longer messages.
+    """
     with contextlib.closing(_open_db_ro()) as conn:
         rows = conn.execute(
             "SELECT * FROM work_units WHERE status = 'escalated' ORDER BY last_activity DESC"
         ).fetchall()
-    return [
-        {
-            "unit_id": r["unit_id"],
-            "feature_id": r["feature_id"],
-            "last_error": (r["last_error"] or "(no error message)")[:120],
-            "pr": f"#{r['pr_number']}" if r["pr_number"] else "—",
-        }
-        for r in rows
-    ]
+    out: list[dict] = []
+    for r in rows:
+        raw_error = r["last_error"] or "(no error message)"
+        reason, prose = blocked_hints.latest_blocked_reason(r["unit_id"])
+        if reason != blocked_hints.UNKNOWN_REASON:
+            # Build a structured rendering; combine prose from the event
+            # with the unit-state's last_error so both are visible.
+            display_prose = prose or raw_error
+            display = blocked_hints.format_escalation_summary(reason, display_prose)
+        else:
+            display = raw_error[:120]
+        out.append(
+            {
+                "unit_id": r["unit_id"],
+                "feature_id": r["feature_id"],
+                "last_error": display,
+                "reason": reason,
+                "pr": f"#{r['pr_number']}" if r["pr_number"] else "—",
+            }
+        )
+    return out
 
 
 def _events_data(limit: int = 10) -> list[dict]:

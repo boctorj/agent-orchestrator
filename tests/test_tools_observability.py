@@ -61,6 +61,55 @@ def test_unit_history_returns_events(tmp_state_db):
     assert len(parsed) == 2
 
 
+def test_unit_history_reason_filter_matches_structured_events(tmp_state_db):
+    """When `reason=` is passed, only events whose details JSON carries
+    that reason slug come back. This is the chat-level filter from
+    F-005-U-2 ('show me everything blocked on auth')."""
+    _seed()
+    state.record_event(
+        "U1",
+        "F",
+        "coder_blocked",
+        details=json.dumps({"reason": "auth_failure", "prose": "401"}),
+    )
+    state.record_event("U1", "F", "spawn_tester", details="plain prose, no reason")
+    state.record_event(
+        "U1",
+        "F",
+        "coder_blocked",
+        details=json.dumps({"reason": "branch_protection_blocked_push", "prose": "denied"}),
+    )
+
+    out = observability.unit_history("U1", reason="auth_failure")
+    parsed = json.loads(out)
+    assert len(parsed) == 1
+    assert parsed[0]["event_type"] == "coder_blocked"
+
+
+def test_unit_history_reason_filter_with_no_matches_returns_message(tmp_state_db):
+    _seed()
+    state.record_event("U1", "F", "spawn_coder", details="prose")
+    out = observability.unit_history("U1", reason="auth_failure")
+    assert "matching reason" in out
+    assert "auth_failure" in out
+
+
+def test_unit_history_no_reason_is_unchanged(tmp_state_db):
+    """Default behavior — no `reason` arg — returns all events including
+    those carrying a structured reason, identical to pre-F-005-U-2."""
+    _seed()
+    state.record_event("U1", "F", "spawn_coder", summary="start")
+    state.record_event(
+        "U1",
+        "F",
+        "coder_blocked",
+        details=json.dumps({"reason": "auth_failure", "prose": "401"}),
+    )
+    out = observability.unit_history("U1")
+    parsed = json.loads(out)
+    assert len(parsed) == 2
+
+
 def test_unit_summary_returns_digest(tmp_state_db):
     _seed()
     state.record_event("U1", "F", "spawn_coder")

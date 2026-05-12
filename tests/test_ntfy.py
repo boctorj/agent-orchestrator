@@ -106,6 +106,78 @@ def test_push_escalation_includes_pr_url(monkeypatch, with_ntfy_topic):
     assert captured_headers["Click"] == "https://github.com/o/r/pull/5"
 
 
+def test_push_escalation_unknown_reason_keeps_prose_body(monkeypatch, with_ntfy_topic):
+    """Default reason_slug ('unknown') must preserve today's single-line body —
+    F-005-U-2's spec requires no regression for unclassifiable failures."""
+    body_seen = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def post(self, url, content=None, headers=None):
+            body_seen["content"] = content
+            return FakeResponse()
+
+    monkeypatch.setattr("orchestrator.ntfy.httpx.Client", FakeClient)
+    ntfy.push_escalation("F-001-U-1", "cap-3 hit")
+    # Unknown reason → single-line prose body, no "Reason:" header, no hint.
+    assert body_seen["content"] == "Unit F-001-U-1 escalated: cap-3 hit"
+    assert "Reason:" not in body_seen["content"]
+
+
+def test_push_escalation_known_reason_embeds_hint(monkeypatch, with_ntfy_topic):
+    """When reason_slug resolves to a taxonomy entry, the push body must
+    surface the slug + multi-line fix-it options so the user can action
+    from phone."""
+    body_seen = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def post(self, url, content=None, headers=None):
+            body_seen["content"] = content
+            return FakeResponse()
+
+    monkeypatch.setattr("orchestrator.ntfy.httpx.Client", FakeClient)
+    ntfy.push_escalation(
+        "F-005-U-2",
+        "git push rejected on f-005-u-2",
+        pr_url="https://github.com/o/r/pull/9",
+        reason_slug="branch_protection_blocked_push",
+    )
+    body = body_seen["content"]
+    assert "F-005-U-2" in body
+    assert "Reason: branch_protection_blocked_push" in body
+    # All three fix-it options should be visible in the push body.
+    assert "main" in body
+    assert "bypass actor" in body
+    assert "PAT" in body
+    # Prose tail preserved
+    assert "git push rejected on f-005-u-2" in body
+
+
 def test_push_ready_to_merge_uses_check_mark(monkeypatch, with_ntfy_topic):
     captured = {}
 
