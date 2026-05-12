@@ -6,7 +6,7 @@ import json
 from dataclasses import asdict
 
 from orchestrator import repo_verify, state
-from orchestrator.models import Feature, WorkUnit
+from orchestrator.models import Feature, FeatureStatus, WorkUnit
 from orchestrator.tools import mcp
 
 
@@ -25,17 +25,70 @@ def load_feature(
     verification is stale (>24h). Planning continues regardless — but
     any subsequent spawn against the feature WILL be blocked until the
     user runs `verify_repo(<url>)`.
+
+    Update semantics: calling load_feature with an `id` that already
+    exists is treated as a metadata update, not a re-creation. If the
+    plan's units are unchanged since approval (plan.status == 'approved'),
+    feature.status is preserved as 'approved' — fixing a wrong repo_path
+    does not require the user to re-call `approve_plan`. If save_plan was
+    called between approval and now (plan.status == 'draft', meaning the
+    units list materially changed), the feature drops back to 'draft' —
+    material change requires re-approval.
     """
-    feature_id = id or state.next_feature_id()
-    feature = Feature(
-        id=feature_id,
-        title=title,
-        description=description,
-        repo_path=repo_path,
-        branch_prefix=branch_prefix,
-    )
-    state.save_feature(feature)
-    msg = f"Loaded feature {feature.id}: {feature.title}"
+    existing = state.get_feature(id) if id else None
+
+    if existing is None:
+        # New feature creation — existing behavior.
+        feature_id = id or state.next_feature_id()
+        feature = Feature(
+            id=feature_id,
+            title=title,
+            description=description,
+            repo_path=repo_path,
+            branch_prefix=branch_prefix,
+        )
+        state.save_feature(feature)
+        msg = f"Loaded feature {feature.id}: {feature.title}"
+    else:
+        # Existing id — decide whether to preserve approval.
+        #
+        # load_feature itself only carries metadata fields, so the units
+        # list is unchanged by this call. The plan's own status tells us
+        # whether they changed via a prior save_plan: that helper resets
+        # plan.status to 'draft' whenever the units list is re-saved.
+        # So plan.status == 'approved' here means "units unchanged since
+        # the last approve_plan" — a true metadata-only update.
+        plan = state.get_plan(existing.id)
+        plan_still_approved = plan is not None and plan.status == "approved"
+
+        new_status: FeatureStatus
+        if existing.status == "approved" and plan_still_approved:
+            new_status = "approved"
+            path_desc = "metadata-only — approval preserved"
+        elif existing.status == "approved":
+            # plan was re-saved (units changed) between approval and now;
+            # the feature row hadn't caught up. Drop to draft — material
+            # change requires re-approval.
+            new_status = "draft"
+            path_desc = "units changed — reset to draft"
+        else:
+            # Feature was never approved; metadata update doesn't shift
+            # its status one way or the other.
+            new_status = existing.status
+            path_desc = "metadata updated"
+
+        feature = Feature(
+            id=existing.id,
+            title=title,
+            description=description,
+            repo_path=repo_path,
+            branch_prefix=branch_prefix,
+            status=new_status,
+            created_at=existing.created_at,
+        )
+        state.save_feature(feature)
+        msg = f"Updated feature {feature.id} ({path_desc})"
+
     # Surface verification status as a warning so the lead can prompt the
     # user to verify before spawning (rather than discovering at spawn time).
     if repo_path:
