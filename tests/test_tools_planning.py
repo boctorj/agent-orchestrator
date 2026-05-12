@@ -74,6 +74,128 @@ def test_load_feature_warns_on_malformed_repo_path(tmp_state_db):
     assert "malformed" in msg
 
 
+# --------- load_feature update semantics (F-004: preserve approval) ---------
+
+
+def test_load_feature_new_creation_uses_loaded_message(tmp_state_db):
+    """A brand-new feature surfaces 'Loaded feature' — existing behavior intact."""
+    msg = planning.load_feature(title="hello", description="d")
+    assert "Loaded feature" in msg
+    assert "Updated feature" not in msg
+
+
+def test_load_feature_metadata_only_on_approved_preserves_approval(tmp_state_db):
+    """Calling load_feature on an approved feature with new metadata (e.g.
+    fixing a wrong repo_path) MUST preserve status='approved'."""
+    planning.load_feature(title="t", description="d", repo_path="https://github.com/o/r")
+    planning.save_plan(
+        "F-001",
+        [{"id": "U1", "title": "u", "description": "d", "depends_on": []}],
+    )
+    planning.approve_plan("F-001")
+    assert state.get_feature("F-001").status == "approved"
+
+    msg = planning.load_feature(
+        title="new title",
+        description="new desc",
+        id="F-001",
+        repo_path="https://github.com/o/r",
+    )
+
+    feat = state.get_feature("F-001")
+    assert feat.status == "approved"
+    assert feat.title == "new title"
+    assert feat.description == "new desc"
+    assert "Updated feature F-001" in msg
+    assert "metadata-only" in msg
+    assert "approval preserved" in msg
+
+
+def test_load_feature_metadata_only_on_draft_stays_draft(tmp_state_db):
+    """Metadata-only update on a never-approved feature keeps status non-approved
+    and message doesn't falsely claim 'approval preserved'."""
+    planning.load_feature(title="t", description="d")
+    before = state.get_feature("F-001").status
+    assert before != "approved"
+
+    msg = planning.load_feature(title="renamed", description="new desc", id="F-001")
+
+    feat = state.get_feature("F-001")
+    assert feat.status != "approved"
+    assert feat.status == before  # status unchanged
+    assert feat.title == "renamed"
+    assert "Updated feature F-001" in msg
+    assert "approval preserved" not in msg
+    assert "reset to draft" not in msg
+
+
+def test_load_feature_units_changed_on_approved_resets_to_draft(tmp_state_db):
+    """If save_plan was called between approval and this load_feature (i.e.
+    units list materially changed), the feature drops back to draft."""
+    planning.load_feature(title="t", description="d", repo_path="https://github.com/o/r")
+    planning.save_plan(
+        "F-001",
+        [{"id": "U1", "title": "u", "description": "d", "depends_on": []}],
+    )
+    planning.approve_plan("F-001")
+    assert state.get_feature("F-001").status == "approved"
+
+    # Re-save the plan with a different unit list. save_plan resets plan
+    # status to 'draft' but does NOT reset feature.status (only bumps
+    # draft -> planned). After this step, feature is still 'approved'
+    # while plan is 'draft' — the inconsistency this unit detects.
+    planning.save_plan(
+        "F-001",
+        [
+            {"id": "U1", "title": "u", "description": "d", "depends_on": []},
+            {"id": "U2", "title": "u2", "description": "d2", "depends_on": []},
+        ],
+    )
+    assert state.get_plan("F-001").status == "draft"
+    assert state.get_feature("F-001").status == "approved"
+
+    msg = planning.load_feature(
+        title="t",
+        description="d",
+        id="F-001",
+        repo_path="https://github.com/o/r",
+    )
+
+    feat = state.get_feature("F-001")
+    assert feat.status == "draft"
+    assert "Updated feature F-001" in msg
+    assert "units changed" in msg
+    assert "reset to draft" in msg
+
+
+def test_load_feature_units_changed_on_draft_does_not_claim_approval_reset(tmp_state_db):
+    """Same flow as the approved-reset case but starting from a never-approved
+    feature: result must NOT be 'approved' and message must NOT claim it was
+    reset from approval (there was nothing to reset)."""
+    planning.load_feature(title="t", description="d")
+    planning.save_plan(
+        "F-001",
+        [{"id": "U1", "title": "u", "description": "d", "depends_on": []}],
+    )
+    # No approve_plan call — feature is 'planned', plan is 'draft'.
+    planning.save_plan(
+        "F-001",
+        [
+            {"id": "U1", "title": "u", "description": "d", "depends_on": []},
+            {"id": "U2", "title": "u2", "description": "d2", "depends_on": []},
+        ],
+    )
+    assert state.get_feature("F-001").status != "approved"
+
+    msg = planning.load_feature(title="t", description="d", id="F-001")
+
+    feat = state.get_feature("F-001")
+    assert feat.status != "approved"
+    assert "Updated feature F-001" in msg
+    assert "approval preserved" not in msg
+    assert "reset to draft" not in msg
+
+
 # --------------------------- list_features ---------------------------
 
 
