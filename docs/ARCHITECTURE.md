@@ -758,8 +758,7 @@ See `SECURITY.md` for the full threat model + reporting policy.
 |---|---|---|
 | Local pre-commit | every `git commit` | ruff lint (`--fix`), ruff format, file hygiene (trailing whitespace, EOF, YAML/TOML check, large-file blocker, merge-conflict markers, line-ending norm, case-conflict, detect-private-key) |
 | Local pytest | every `pytest` | all 289 tests + coverage report (no `--cov-fail-under` locally) |
-| CI pre-commit job | every push/PR | same hooks |
-| CI test matrix | every push/PR | ubuntu + macOS + Windows × Python 3.11 + 3.12 = **6 jobs**. Each runs: ruff check, ruff format check, mypy, bandit, pytest with `--cov-fail-under=80` |
+| CI test matrix | every push/PR | ubuntu + macOS + Windows × Python 3.11 + 3.12 = **6 jobs**. Each runs: `pre-commit run --all-files` (same hooks as local), mypy, bandit, pytest with `--cov-fail-under=80` |
 | CI dependency audit | every push/PR | pip-audit (warning-only) |
 
 ### Coverage by module

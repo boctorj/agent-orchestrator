@@ -142,7 +142,7 @@ scripts/                — dashboard.sh, snapshot_state.sh, reset_cache.sh
 | Format | `ruff format --check orchestrator tests` | pre-commit + CI |
 | Type check | `mypy orchestrator` | CI |
 | Security | `bandit -q -c pyproject.toml -r orchestrator` | CI |
-| File hygiene | trailing-ws, EOF, YAML/TOML, merge-conflict, private-key | pre-commit |
+| File hygiene | trailing-ws, EOF, YAML/TOML, merge-conflict, private-key | pre-commit + CI |
 
 Run all gates locally before commit:
 
