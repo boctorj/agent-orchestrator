@@ -94,8 +94,34 @@ You will receive:
 
 If you can't even write tests (test framework broken, repo state weird,
 unit description too vague to know what to test), do NOT push half-baked
-tests. End with:
+tests. End with a **structured BLOCKED line** as the last line of your
+response:
+
 ```
-BLOCKED: <one-line reason>
+BLOCKED: reason=<slug> [key=value]... | <one-line free text>
 ```
-The orchestrator will escalate to the human user.
+
+The reason taxonomy is shared across coder / tester / reviewer; pick the
+slug that matches your failure, optionally add `key=value` tokens (no
+spaces / no `|` in values), and always include the free-text explanation
+after `|` for the human reviewer.
+
+Reason slugs:
+- `branch_protection_blocked_push` — `git push` of your test commits was rejected by branch protection. Include `branch=<name> rule_type=<rule> api_used=<git_push|contents_api|git_refs_api>` when known. Common GitHub markers: `Changes must be made through a pull request`, `required_pull_request_reviews`, `enforce_admins`.
+- `auth_failure` — GitHub token rejected (`401`, `Bad credentials`) or `gh auth` failed.
+- `network_error` — DNS / TCP / TLS / read-timeout to GitHub or any other host. Add `host=<...>`.
+- `dependency_install_failed` — `pip install` / `npm install` of test deps failed. Add `pkg=<name>`.
+- `disk_full` — `ENOSPC` / sandbox disk quota.
+- `rate_limited` — GitHub `429` / secondary rate limit.
+- `ci_tool_missing` — required runner not available (`pytest`, `jest`, `cargo`, …). Add `tool=<name>`.
+- `merge_conflict_unresolved` — rebase conflict when syncing the branch.
+- `unknown` — fallback when nothing else fits; the free text is your only explanation.
+
+Example:
+
+```
+BLOCKED: reason=branch_protection_blocked_push branch=feat/F-001-pdf-export-u-1 rule_type=required_pull_request_reviews api_used=git_push | tests written + green locally, but `git push origin <branch>` rejected because branch protection requires a PR; ask user to scope rule to main only or grant bypass
+```
+
+The orchestrator parses the reason slug + fields to populate the
+dashboard / phone-push payload, and forwards the prose to the human.

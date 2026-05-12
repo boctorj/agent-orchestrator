@@ -103,5 +103,34 @@ You will receive:
 
 If you can't complete the unit (build broken, deps unresolvable, unit description ambiguous, etc.), do NOT open a half-done PR. Instead, in your final response:
 - Explain what blocked you
-- Output: `BLOCKED: <one-line reason>` on the last line (no `PR_URL:` line)
+- Output a structured `BLOCKED:` line as the **last line** of your response (no `PR_URL:` line). The orchestrator parses this to classify the failure for the dashboard and the human's push notification.
 - The orchestrator will escalate to the human.
+
+### Structured BLOCKED format
+
+```
+BLOCKED: reason=<slug> [key=value]... | <one-line free text>
+```
+
+- `<slug>` must be one of the taxonomy below.
+- Optional `key=value` tokens carry domain-specific context. Values must not contain spaces or `|` (encode complex values in the free text after `|`). Useful keys: `branch`, `rule_type`, `api_used`, `host`, `tool`, `pkg`.
+- The free text after `|` is your normal one-line explanation (what you tried, what to do next). Always include it.
+
+Reason slugs:
+- `branch_protection_blocked_push` — `git push` / Contents API / Git Refs API rejected your write because branch protection requires PRs, required reviews, or `enforce_admins`. Common GitHub markers: `Changes must be made through a pull request`, `required_pull_request_reviews`, `enforce_admins`. Include `branch=<name> rule_type=<rule> api_used=<git_push|contents_api|git_refs_api>` when you know them.
+- `auth_failure` — token rejected (`401`, `Bad credentials`), `gh auth` failed, or App permissions insufficient.
+- `network_error` — DNS / TCP / TLS / read-timeout to GitHub or another host. Add `host=<...>` when relevant.
+- `dependency_install_failed` — `pip install` / `npm install` / `bundle install` non-zero exit. Add `pkg=<name>` when one package is the culprit.
+- `disk_full` — `ENOSPC`, `No space left on device`, sandbox disk quota hit.
+- `rate_limited` — `429 Too Many Requests`, `API rate limit exceeded`, GitHub secondary rate limit.
+- `ci_tool_missing` — required tool not available in the sandbox (`pytest`, `npm`, `cargo`, …). Add `tool=<name>`.
+- `merge_conflict_unresolved` — rebase / merge conflict you cannot mechanically resolve.
+- `unknown` — none of the above fits; the free text is your only explanation.
+
+### Examples
+
+```
+BLOCKED: reason=branch_protection_blocked_push branch=feat/F-001-pdf-export-u-1 rule_type=required_pull_request_reviews api_used=git_push | push to feature branch rejected; main scope works, ask user to scope rule to main only or grant bypass
+BLOCKED: reason=dependency_install_failed pkg=playwright | pip install playwright failed with exit 1 (sandbox missing chromium prerequisite)
+BLOCKED: reason=unknown | spec says "make it faster" with no measurable target; need user clarification
+```

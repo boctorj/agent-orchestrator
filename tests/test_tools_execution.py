@@ -1242,3 +1242,266 @@ class TestCycleReviewCIGate:
         out = execution.cycle_review("F-001", "F-001-U-1")
         parsed = json.loads(out)
         assert parsed["outcome"] == "approved_awaiting_merge"
+
+
+# --------------------------- structured BLOCKED end-to-end ---------------------------
+
+
+class TestStructuredBlockedPayload:
+    """End-to-end coverage for F-005-U-1: a coder/tester/reviewer emits a
+    BLOCKED marker → the orchestrator parses it (structured tag OR
+    recogniser fallback OR unknown), stores the reason slug + structured
+    fields on the unit_event, and surfaces the reason code in last_error.
+
+    Three required scenarios:
+      (a) Prompt-emitted ``reason=`` end-to-end.
+      (b) Free-form prose classified by a built-in recogniser.
+      (c) Unrecognised prose falls back to ``reason='unknown'`` without
+          losing the worker's own message.
+    """
+
+    def _last_blocked_event_details(self, unit_id: str) -> dict:
+        """Return the JSON-decoded details payload for the most recent
+        blocked event on ``unit_id`` (covers all four event_types:
+        ``coder_blocked``, ``tester_blocked``, ``reviewer_blocked``,
+        ``coder_blocked_on_fix``)."""
+        events = state.list_events(unit_id)
+        blocked = [e for e in events if "blocked" in e["event_type"]]
+        assert blocked, f"no blocked event recorded for {unit_id}"
+        return json.loads(blocked[-1]["details"])
+
+    # ----- (a) structured reason= tag, coder -----
+
+    def test_coder_structured_branch_protection_reason(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        _setup_feature()
+        response = (
+            "tried to push, got 403 from github.\n"
+            "BLOCKED: reason=branch_protection_blocked_push "
+            "branch=feat/F-001-foo-u-1 "
+            "rule_type=required_pull_request_reviews "
+            "api_used=git_push "
+            "| push rejected; ask user to scope rule to main only"
+        )
+        _install_fake_worker(monkeypatch, spawn_response=response)
+        _stub_github(monkeypatch)
+
+        pushed = []
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_escalation",
+            lambda unit_id, reason, **k: pushed.append((unit_id, reason)) or True,
+        )
+
+        out = execution.spawn_unit("F-001", "F-001-U-1")
+
+        # Returned string carries both slug + prose for the lead
+        assert "branch_protection_blocked_push" in out
+        assert "scope rule to main only" in out
+
+        # State: escalated + last_error includes the slug
+        s = state.get_unit_state("F-001-U-1")
+        assert s.status == "escalated"
+        assert "[branch_protection_blocked_push]" in s.last_error
+        assert "scope rule to main only" in s.last_error
+
+        # Event payload: structured fields preserved
+        details = self._last_blocked_event_details("F-001-U-1")
+        assert details["reason"] == "branch_protection_blocked_push"
+        assert details["fields"] == {
+            "branch": "feat/F-001-foo-u-1",
+            "rule_type": "required_pull_request_reviews",
+            "api_used": "git_push",
+        }
+        assert "scope rule to main only" in details["prose"]
+        assert "recognized_by" not in details  # prompt-emitted, not pattern-matched
+
+        # ntfy push surfaces the slug to the human's phone
+        assert pushed
+        _, reason_pushed = pushed[0]
+        assert "branch_protection_blocked_push" in reason_pushed
+
+    # ----- (a) structured reason= tag, tester -----
+
+    def test_tester_structured_auth_failure_reason(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        _seed_coded_unit()
+        response = (
+            "gh pr view returned 401\n"
+            "BLOCKED: reason=auth_failure | token rejected by GitHub, ask user for fresh PAT"
+        )
+        _install_fake_worker(monkeypatch, spawn_response=response)
+        _stub_github(monkeypatch)
+
+        msg = execution.spawn_tester("F-001", "F-001-U-1")
+        assert "auth_failure" in msg
+        assert "token rejected" in msg
+
+        s = state.get_unit_state("F-001-U-1")
+        assert s.status == "escalated"
+        assert "[auth_failure]" in s.last_error
+
+        details = self._last_blocked_event_details("F-001-U-1")
+        assert details["reason"] == "auth_failure"
+        assert details["prose"] == "token rejected by GitHub, ask user for fresh PAT"
+        assert details.get("fields", {}) == {}
+
+    # ----- (a) structured reason= tag, reviewer -----
+
+    def test_reviewer_structured_rate_limited_reason(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        _seed_coded_unit()
+        response = (
+            "gh api hammered until 429\n"
+            "BLOCKED: reason=rate_limited host=api.github.com | secondary rate limit; "
+            "retry after backoff"
+        )
+        _install_fake_worker(monkeypatch, spawn_response=response)
+        _stub_github(monkeypatch)
+
+        msg = execution.spawn_reviewer("F-001", "F-001-U-1")
+        assert "rate_limited" in msg
+
+        details = self._last_blocked_event_details("F-001-U-1")
+        assert details["reason"] == "rate_limited"
+        assert details["fields"] == {"host": "api.github.com"}
+        assert "secondary rate limit" in details["prose"]
+
+    # ----- (a) structured reason= tag, address_review (coder resume) -----
+
+    def test_address_review_structured_merge_conflict_reason(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        _seed_coded_unit()
+        response = (
+            "rebase conflicted on three files I can't merge mechanically\n"
+            "BLOCKED: reason=merge_conflict_unresolved | conflicts in "
+            "coder.md/tester.md need human guidance"
+        )
+        _install_fake_worker(monkeypatch, resume_response=response)
+        _stub_github(monkeypatch)
+
+        msg = execution.address_review("F-001-U-1", "tester", "fix this bug")
+        assert "merge_conflict_unresolved" in msg
+
+        s = state.get_unit_state("F-001-U-1")
+        assert s.status == "escalated"
+        assert "[merge_conflict_unresolved]" in s.last_error
+
+        details = self._last_blocked_event_details("F-001-U-1")
+        assert details["reason"] == "merge_conflict_unresolved"
+        assert "conflicts" in details["prose"]
+
+    # ----- (b) recogniser classifies free-form output -----
+
+    def test_recognizer_classifies_legacy_branch_protection_prose(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """A worker that pre-dates F-005-U-1 emits bare prose; the
+        orchestrator's recogniser still tags the event with the
+        branch_protection_blocked_push slug so the dashboard / push
+        body can call out the failure mode."""
+        _setup_feature()
+        response = (
+            "ran git push origin feat/...\n"
+            "remote: error: GH013: Changes must be made through a pull request.\n"
+            "BLOCKED: remote rejected push: Changes must be made through a pull request"
+        )
+        _install_fake_worker(monkeypatch, spawn_response=response)
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_escalation",
+            lambda *a, **k: True,
+        )
+
+        execution.spawn_unit("F-001", "F-001-U-1")
+
+        s = state.get_unit_state("F-001-U-1")
+        assert s.status == "escalated"
+        # The recogniser tags this as branch_protection_blocked_push
+        assert "[branch_protection_blocked_push]" in s.last_error
+        # Prose preserved
+        assert "Changes must be made through a pull request" in s.last_error
+
+        details = self._last_blocked_event_details("F-001-U-1")
+        assert details["reason"] == "branch_protection_blocked_push"
+        assert details["recognized_by"] == "branch_protection_pr_required"
+        assert details.get("fields", {}) == {}
+
+    def test_recognizer_required_pull_request_reviews_token(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        _seed_coded_unit()
+        response = (
+            "BLOCKED: GitHub API rejected the push citing "
+            "required_pull_request_reviews on the feature branch"
+        )
+        _install_fake_worker(monkeypatch, spawn_response=response)
+        _stub_github(monkeypatch)
+
+        execution.spawn_tester("F-001", "F-001-U-1")
+
+        details = self._last_blocked_event_details("F-001-U-1")
+        assert details["reason"] == "branch_protection_blocked_push"
+        assert details["recognized_by"] == "branch_protection_required_reviews"
+
+    def test_recognizer_enforce_admins_token(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        response = (
+            "BLOCKED: cannot push - branch protection set with "
+            "enforce_admins=true blocks even admins from pushing direct"
+        )
+        _install_fake_worker(monkeypatch, spawn_response=response)
+        _stub_github(monkeypatch)
+
+        execution.spawn_reviewer("F-001", "F-001-U-1")
+
+        details = self._last_blocked_event_details("F-001-U-1")
+        assert details["reason"] == "branch_protection_blocked_push"
+        assert details["recognized_by"] == "branch_protection_enforce_admins"
+
+    # ----- (c) unknown fallback preserves prose -----
+
+    def test_unknown_fallback_preserves_prose(self, tmp_state_db, with_github_token, monkeypatch):
+        """No structured tag, no recogniser match -> reason='unknown' but
+        the worker's prose is still surfaced to the human verbatim."""
+        _setup_feature()
+        response = "BLOCKED: spec is too vague; cannot decide what to build"
+        _install_fake_worker(monkeypatch, spawn_response=response)
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_escalation",
+            lambda *a, **k: True,
+        )
+
+        out = execution.spawn_unit("F-001", "F-001-U-1")
+
+        # Reason code surfaced as 'unknown'
+        assert "unknown" in out
+        # Prose preserved verbatim -- the whole reason a human reads this
+        assert "spec is too vague" in out
+
+        s = state.get_unit_state("F-001-U-1")
+        assert "[unknown]" in s.last_error
+        assert "spec is too vague" in s.last_error
+
+        details = self._last_blocked_event_details("F-001-U-1")
+        assert details["reason"] == "unknown"
+        assert "spec is too vague" in details["prose"]
+        # No recogniser fired -> key omitted
+        assert "recognized_by" not in details
+
+    def test_unknown_fallback_in_address_review(self, tmp_state_db, monkeypatch):
+        _seed_coded_unit()
+        response = "BLOCKED: the failure mode is unprecedented"
+        _install_fake_worker(monkeypatch, resume_response=response)
+        _stub_github(monkeypatch)
+
+        msg = execution.address_review("F-001-U-1", "tester", "fix")
+        assert "unknown" in msg
+        assert "unprecedented" in msg
+
+        s = state.get_unit_state("F-001-U-1")
+        assert "[unknown]" in s.last_error

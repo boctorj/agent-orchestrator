@@ -228,8 +228,37 @@ is the correct terminal marker.
 
 ## On failure
 
-If you can't review (PR doesn't exist, diff unreadable, repo state weird):
+If you can't review (PR doesn't exist, diff unreadable, repo state weird),
+end with a **structured BLOCKED line** as the last line of your response:
+
 ```
-BLOCKED: <one-line reason>
+BLOCKED: reason=<slug> [key=value]... | <one-line free text>
 ```
-The orchestrator escalates to the human.
+
+You are read-only, so the most likely failure modes for you are
+`auth_failure` (token can't read the PR / repo), `network_error`,
+`rate_limited`, or `unknown` (the diff is corrupt / no diff exists / spec
+unintelligible). The full taxonomy:
+
+- `branch_protection_blocked_push` — surfaced by tester / coder, not you.
+- `auth_failure` — `gh` returned `401` / `Bad credentials` / permission denied for the PR.
+- `network_error` — DNS / TCP / TLS / timeout. Add `host=<...>`.
+- `dependency_install_failed` — `pip install` / `npm install` failed (rare for you).
+- `disk_full` — sandbox `ENOSPC`.
+- `rate_limited` — GitHub `429` / secondary rate limit.
+- `ci_tool_missing` — required tool not available (rare for you).
+- `merge_conflict_unresolved` — PR can't be checked out cleanly.
+- `unknown` — fallback; free text after `|` is your only explanation.
+
+Optional `key=value` tokens carry context (no spaces / no `|` in values).
+Always include the free-text explanation after `|` so the human can
+diagnose without digging into the worker log.
+
+Example:
+
+```
+BLOCKED: reason=auth_failure | `gh pr view` returned 401 Bad credentials; the PAT in the task message appears revoked or scope-missing — orchestrator needs a fresh token
+```
+
+The orchestrator parses the reason slug + fields to populate the dashboard
+/ phone-push payload, and forwards the prose to the human.
