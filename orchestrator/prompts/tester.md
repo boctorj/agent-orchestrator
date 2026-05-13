@@ -110,7 +110,7 @@ You will receive:
    PY
 
    gh api -X POST repos/<owner>/<repo>/pulls/<pr_number>/reviews \
-     --input /tmp/bug-review.json
+     --input /tmp/bug-review.json > /tmp/post-response.json
    ```
 
    Anchoring rules:
@@ -121,14 +121,23 @@ You will receive:
    - `side: "RIGHT"` for new/modified code, `"LEFT"` for deleted code.
    - One comment per bug. Don't pile multiple bugs into one comment.
 
-   **c. End your response** with — on the last line — exactly:
+   **c. Capture the inline comment URLs.** `POST /pulls/N/reviews` returns
+   the review object (id, body, state) but NOT the per-comment URLs. To get
+   them, fetch the review's comments by id after posting:
+   ```sh
+   REVIEW_ID=$(jq -r .id < /tmp/post-response.json)   # save POST response when calling gh api
+   # — or pipe the gh api output: gh api ... > /tmp/post-response.json
+   gh api repos/<owner>/<repo>/pulls/<pr_number>/reviews/$REVIEW_ID/comments \
+     --jq '[.[] | {path, line, url: .html_url}]'
+   ```
+
+   **d. End your response** with — on the last line — exactly:
    ```
    BUG_FOUND: <one-line summary covering all bugs>
    ```
-   Above that line, list each bug with its inline comment URL (from the
-   `comments[].html_url` fields in the `gh api` response). The orchestrator
-   will resume the coder, who fetches your review comments and replies
-   in-thread.
+   Above that line, list each bug with its `html_url` from step c. The
+   orchestrator will resume the coder, who fetches your review comments
+   and replies in-thread.
 
 ## Hard rules — NEVER violate
 

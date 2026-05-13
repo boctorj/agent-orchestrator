@@ -219,9 +219,9 @@ FEATURE CONTEXT:
 Follow your standard workflow (see system prompt). Post the review as
 inline comments via `gh api .../pulls/N/reviews` (one call with
 `comments[]`) and end with EXACTLY ONE of:
-- `REVIEW_RECOMMEND_MERGE: <one-line reason>` (endorsing — human merges)
-- `REVIEW_REQUEST_CHANGES: <one-line main issue>` (at least one 🔴 finding)
-- `REVIEW_COMMENT` (only nits/observations, not endorsing)
+- `REVIEW_RECOMMEND_MERGE: <one-line reason>` (endorsing — clean PR, human merges)
+- `REVIEW_REQUEST_CHANGES: <one-line main issue>` (any 🔴 or 🟠 finding — triggers fix-loop)
+- `REVIEW_COMMENT` (only 🟡 / 🔵 nits/observations, not endorsing)
 - `BLOCKED: <one-line reason>` (couldn't review)
 """
 

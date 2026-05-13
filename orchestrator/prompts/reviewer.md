@@ -250,10 +250,16 @@ Decision rule (deterministic — pick the first row that matches):
 
 | Findings | Marker | GitHub API `event` |
 |----------|--------|----|
-| At least one 🔴 | `REVIEW_REQUEST_CHANGES: <one-line main issue>` | `"REQUEST_CHANGES"` |
-| Zero 🔴, at least one 🟠 or 🟡 | `REVIEW_RECOMMEND_MERGE: <one-line reason>` | `"COMMENT"` |
+| At least one 🔴 **or** 🟠 | `REVIEW_REQUEST_CHANGES: <one-line main issue>` | `"REQUEST_CHANGES"` |
+| Zero 🔴 / 🟠, at least one 🟡 | `REVIEW_COMMENT` | `"COMMENT"` |
 | Only 🔵 (nits, observations) | `REVIEW_COMMENT` | `"COMMENT"` |
 | Nothing material at all | `REVIEW_RECOMMEND_MERGE: clean` | `"COMMENT"` |
+
+🟠 is defined as **"High — fix before merge"** in the severity tiers above.
+Letting 🟠 escape into `REVIEW_RECOMMEND_MERGE` would contradict that — and
+since the orchestrator only resumes the coder fix-loop on
+`REVIEW_REQUEST_CHANGES`, an endorsed-but-🟠 PR would never get the high
+issues fixed. Always escalate 🟠 to the fix-loop.
 
 **Do not emit `REVIEW_APPROVED`** — the orchestrator never uses GitHub's
 `--approve`. Approval is reserved for the human reviewer (CODEOWNERS team

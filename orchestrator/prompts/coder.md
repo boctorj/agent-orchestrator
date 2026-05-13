@@ -107,35 +107,70 @@ orchestrator's tag — don't address only that.
 
 ### Common flow (sources: reviewer / tester / human)
 
-1. **Refresh your branch and fetch open inline comments.**
+1. **Fast-forward your local branch to pick up tester / reviewer commits.**
    ```sh
-   git fetch origin && git status         # confirm you're on your branch
-   gh api repos/<owner>/<repo>/pulls/<pr_number>/comments \
-     --jq '[.[] | select(.in_reply_to_id == null) | {id, path, line, body, user: .user.login}]'
+   git fetch origin
+   git merge --ff-only origin/<branch_name>   # pulls in failing tests from tester, etc.
    ```
-   These are the *top-level* threads (no `in_reply_to_id`). Each has an
-   `id` you'll need to reply to.
+   If `--ff-only` fails (your local has commits not on the remote — shouldn't
+   happen in normal flow), `git pull --ff-only origin <branch_name>` and
+   resolve manually before continuing. Without this step you'll commit from
+   stale HEAD and `git push` will be non-fast-forward.
 
-2. **For each comment, decide and act:**
+2. **Fetch unresolved review threads** (the source of truth for what needs
+   action this cycle). Use GraphQL `pullRequest.reviewThreads.isResolved` —
+   the REST `/comments` endpoint can't filter resolved threads, so without
+   this the coder reprocesses stale findings on retry cycles.
+   ```sh
+   gh api graphql -f query='
+     query($owner:String!, $repo:String!, $pr:Int!) {
+       repository(owner:$owner, name:$repo) {
+         pullRequest(number:$pr) {
+           reviewThreads(first:100) {
+             nodes {
+               id isResolved isOutdated
+               comments(first:1) {
+                 nodes { databaseId path line body author { login } }
+               }
+             }
+           }
+         }
+       }
+     }' -F owner=<owner> -F repo=<repo> -F pr=<pr_number> \
+     --jq '[.data.repository.pullRequest.reviewThreads.nodes[]
+            | select(.isResolved == false and .isOutdated == false)
+            | .comments.nodes[0]
+            | {id: .databaseId, path, line, body, user: .author.login}]'
+   ```
+   Each entry's `id` is the REST comment id you'll reply to in step 5.
+
+3. **For each unresolved thread, decide and act:**
    - **Address in code** — make the smallest fix that resolves the finding.
-   - **Disagree** — leave code as-is; reply explaining why in step 4.
+   - **Disagree** — leave code as-is; reply explaining why in step 5.
    - **Out of scope** — leave code as-is; reply pointing to the right
      place / unit.
 
    Group related fixes into one commit. Don't touch unrelated code.
 
-3. **Commit and push:**
+4. **Commit and push only if you changed code.** `git commit` with nothing
+   staged fails, which would block you before you reply to threads.
    ```sh
    git add <only changed files>
-   git -c user.email=agent@orchestrator -c user.name="orchestrator-coder" \
-     commit -m "<one-line>: address <source> feedback"
-   git push origin <branch_name>
-   NEW_SHA=$(git rev-parse HEAD)
+   if ! git diff --cached --quiet; then
+     git -c user.email=agent@orchestrator -c user.name="orchestrator-coder" \
+       commit -m "<one-line>: address <source> feedback"
+     git push origin <branch_name>
+     NEW_SHA=$(git rev-parse HEAD)
+   else
+     NEW_SHA=""   # everything was disagree/out-of-scope; no code change
+   fi
    ```
 
-4. **Reply inline to each comment thread you considered:**
+5. **Reply inline to every thread you considered** — addressed, disagreed,
+   or out-of-scope. Silence on a thread = you missed it = the next reviewer
+   cycle re-flags it.
    ```sh
-   # Addressed:
+   # Addressed (NEW_SHA is set):
    gh api -X POST repos/<owner>/<repo>/pulls/<pr_number>/comments/<comment_id>/replies \
      -f body="Fixed in $NEW_SHA — <one-line of what you did>."
 
@@ -145,23 +180,23 @@ orchestrator's tag — don't address only that.
 
    # Out of scope:
    gh api -X POST repos/<owner>/<repo>/pulls/<pr_number>/comments/<comment_id>/replies \
-     -f body="Out of scope for $<unit_id>: <where this belongs / which unit owns it>."
+     -f body="Out of scope for <unit_id>: <where this belongs / which unit owns it>."
    ```
 
-   Every top-level comment gets exactly one reply. Silence on a thread =
-   you missed it = the next reviewer cycle will re-flag it.
-
-5. **End your response** with `FIX_PUSHED` on its own line. The cycle
+6. **End your response** with `FIX_PUSHED` on its own line. The cycle
    counter increments; if cap-3 hits, the orchestrator escalates.
 
 ### `SOURCE: ci` — no inline replies, no comment fetching
 
 CI failures have no inline anchors. The FEEDBACK text is the full context
-(failing job, error log). Read it, fix the failure, commit + push:
+(failing job, error log). Fast-forward, fix the failure, commit + push:
 
 ```sh
+git fetch origin && git merge --ff-only origin/<branch_name>
+# ... fix the CI failure ...
 git add <changed files>
-git commit -m "ci: <one-line>"
+git -c user.email=agent@orchestrator -c user.name="orchestrator-coder" \
+  commit -m "ci: <one-line>"
 git push origin <branch_name>
 ```
 
