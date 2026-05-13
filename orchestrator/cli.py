@@ -285,6 +285,33 @@ def doctor() -> None:
             "[dim]not in PATH — agents bring their own inside containers[/dim]",
         )
 
+    # 11. Worker backend + credential boundary audit. Always show the
+    # backend; the docker-specific receipts only render under the
+    # `docker` backend (the managed_agents path runs on Anthropic infra,
+    # not in a local container, so there's nothing to audit here).
+    backend = os.environ.get("ORCH_WORKER_BACKEND", "managed_agents")
+    if backend == "docker":
+        from orchestrator.workers.docker_claude_code import (
+            build_cred_audit,
+            run_doctor_probes,
+        )
+
+        console.print()
+        console.print("[bold]Worker credential audit (ORCH_WORKER_BACKEND=docker)[/bold]")
+        audit = build_cred_audit()
+        console.print(audit.render())
+
+        console.print()
+        console.print("[bold]Docker worker probes[/bold]")
+        for probe in run_doctor_probes(image=audit.image):
+            report(probe.name, probe.ok, probe.detail)
+    else:
+        report(
+            f"Worker backend: {backend}",
+            True,
+            "[dim]managed_agents → no local container audit[/dim]",
+        )
+
     console.print()
     if all_pass:
         console.print("[bold green]✓ all checks passed[/bold green]")
