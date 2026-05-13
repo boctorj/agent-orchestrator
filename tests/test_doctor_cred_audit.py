@@ -63,6 +63,12 @@ def test_audit_api_key_mode_snapshot():
     }
     rendered = _render(host_env)
 
+    # Path-bearing lines are computed from the same Path objects the
+    # audit uses so the snapshot matches identically on every OS
+    # (Windows renders Path with backslashes; Unix with slashes).
+    workspace_mount = f"  + {WORKDIR} -> /workspace (rw)"
+    sessions_mount = f"  + {HOME / '.claude' / 'sessions'} -> /home/agent/.claude/sessions (rw)"
+
     expected = "\n".join(
         [
             "Worker backend: docker",
@@ -79,8 +85,8 @@ def test_audit_api_key_mode_snapshot():
             "  - SSH_AUTH_SOCK",
             "",
             "Mounts into worker:",
-            "  + /home/lead -> /workspace (rw)",
-            "  + /home/lead/.claude/sessions -> /home/agent/.claude/sessions (rw)",
+            workspace_mount,
+            sessions_mount,
             "  + tmpfs -> /tmp (rw, 512M)",
             "  + tmpfs -> /home/agent/.cache (rw, 512M)",
             "",
@@ -88,9 +94,6 @@ def test_audit_api_key_mode_snapshot():
             *[f"  - {p}" for p in NEVER_MOUNTED_HOST_PATHS],
         ]
     )
-    # The workdir line shows the WORKDIR const, but the snapshot above
-    # uses /home/lead. Recompute with WORKDIR for precision.
-    expected = expected.replace("/home/lead -> /workspace", "/repo -> /workspace")
     assert rendered == expected, (
         f"audit snapshot drifted:\n--- expected ---\n{expected}\n--- got ---\n{rendered}"
     )
@@ -111,6 +114,12 @@ def test_audit_oauth_mode_snapshot():
     }
     rendered = _render(host_env)
 
+    # Path-bearing lines computed from the same Path objects the audit
+    # uses, so the snapshot matches on Windows (backslashes) as well.
+    workspace_mount = f"  + {WORKDIR} -> /workspace (rw)"
+    claude_mount = f"  + {HOME / '.claude'} -> /home/agent/.claude (ro)"
+    sessions_mount = f"  + {HOME / '.claude' / 'sessions'} -> /home/agent/.claude/sessions (rw)"
+
     expected = "\n".join(
         [
             "Worker backend: docker",
@@ -127,9 +136,9 @@ def test_audit_oauth_mode_snapshot():
             "  - SSH_AUTH_SOCK",
             "",
             "Mounts into worker:",
-            "  + /repo -> /workspace (rw)",
-            "  + /home/lead/.claude -> /home/agent/.claude (ro)",
-            "  + /home/lead/.claude/sessions -> /home/agent/.claude/sessions (rw)",
+            workspace_mount,
+            claude_mount,
+            sessions_mount,
             "  + tmpfs -> /tmp (rw, 512M)",
             "  + tmpfs -> /home/agent/.cache (rw, 512M)",
             "",
