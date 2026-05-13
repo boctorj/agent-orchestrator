@@ -13,9 +13,9 @@ from typing import Any
 
 from orchestrator import ci_wait, github, ntfy, state
 from orchestrator.agents import ManagedAgentWorker
+from orchestrator.blocked_reasons import parse_blocked_marker
 from orchestrator.models import WorkUnitState
 from orchestrator.tools import (
-    BLOCKED_RE,
     BUG_FOUND_RE,
     CAP_3,
     FIX_PUSHED_RE,
@@ -25,6 +25,7 @@ from orchestrator.tools import (
     REVIEW_COMMENT_RE,
     REVIEW_RECOMMEND_MERGE_RE,
     TESTS_PASS_RE,
+    blocked_event_details,
     branch_for,
     compose_coder_task,
     compose_fix_task,
@@ -32,6 +33,7 @@ from orchestrator.tools import (
     compose_tester_task,
     ensure_verified_for_feature,
     ensure_verified_for_unit,
+    format_blocked_last_error,
     get_agent_token,
     mcp,
     need_github_token,
@@ -112,7 +114,7 @@ def spawn_unit(feature_id: str, unit_id: str) -> str:
         return f"ERROR spawning coder for {unit_id}: {e}"
 
     pr_match = PR_URL_RE.search(response)
-    blocked_match = BLOCKED_RE.search(response)
+    blocked_payload = parse_blocked_marker(response)
 
     if pr_match:
         pr_url = pr_match.group(1)
@@ -154,8 +156,7 @@ def spawn_unit(feature_id: str, unit_id: str) -> str:
             result["amend_warning"] = amend_warn
         return json.dumps(result, indent=2)
 
-    if blocked_match:
-        reason = blocked_match.group(1).strip()
+    if blocked_payload is not None:
         state.upsert_unit_state(
             WorkUnitState(
                 unit_id=unit_id,
@@ -163,7 +164,7 @@ def spawn_unit(feature_id: str, unit_id: str) -> str:
                 status="escalated",
                 branch=branch,
                 coder_session_id=session_id,
-                last_error=f"BLOCKED: {reason}",
+                last_error=format_blocked_last_error(blocked_payload),
             )
         )
         state.record_event(
@@ -172,13 +173,17 @@ def spawn_unit(feature_id: str, unit_id: str) -> str:
             "coder_blocked",
             source="coder",
             cycle_number=0,
-            summary=reason,
+            summary=blocked_payload.prose,
             session_id=session_id,
-            details=tail(response),
+            details=blocked_event_details(blocked_payload, tail(response)),
         )
-        ntfy.push_escalation(unit_id, f"coder blocked: {reason}")
+        ntfy.push_escalation(
+            unit_id, f"coder blocked [{blocked_payload.reason}]: {blocked_payload.prose}"
+        )
         return (
-            f"BLOCKED — unit {unit_id} escalated.\nReason: {reason}\n"
+            f"BLOCKED — unit {unit_id} escalated.\n"
+            f"Reason code: {blocked_payload.reason}\n"
+            f"Reason: {blocked_payload.prose}\n"
             f"Session: {session_id}\nLast output:\n{tail(response)}"
         )
 
@@ -337,26 +342,28 @@ def spawn_tester(feature_id: str, unit_id: str) -> str:
             indent=2,
         )
 
-    blocked = BLOCKED_RE.search(response)
-    if blocked:
-        reason = blocked.group(1).strip()
-        state.touch_unit(unit_id, status="escalated", error=f"Tester BLOCKED: {reason}")
+    blocked_payload = parse_blocked_marker(response)
+    if blocked_payload is not None:
+        state.touch_unit(
+            unit_id, status="escalated", error=format_blocked_last_error(blocked_payload)
+        )
         state.record_event(
             unit_id,
             feature_id,
             "tester_blocked",
             source="tester",
             cycle_number=unit_state.review_round,
-            summary=reason,
+            summary=blocked_payload.prose,
             session_id=session_id,
-            details=tail(response),
+            details=blocked_event_details(blocked_payload, tail(response)),
         )
         safe_comment_pr(
             feature.repo_path,
             unit_state.pr_number,
-            f"🚨 **Tester BLOCKED:** {reason}\n_Escalated to human._",
+            f"🚨 **Tester BLOCKED [{blocked_payload.reason}]:** {blocked_payload.prose}\n"
+            f"_Escalated to human._",
         )
-        return f"BLOCKED — tester for {unit_id}: {reason}"
+        return f"BLOCKED — tester for {unit_id} [{blocked_payload.reason}]: {blocked_payload.prose}"
 
     return _escalate_no_marker(
         unit_id=unit_id,
@@ -534,26 +541,30 @@ def spawn_reviewer(feature_id: str, unit_id: str) -> str:
             indent=2,
         )
 
-    blocked = BLOCKED_RE.search(response)
-    if blocked:
-        reason = blocked.group(1).strip()
-        state.touch_unit(unit_id, status="escalated", error=f"Reviewer BLOCKED: {reason}")
+    blocked_payload = parse_blocked_marker(response)
+    if blocked_payload is not None:
+        state.touch_unit(
+            unit_id, status="escalated", error=format_blocked_last_error(blocked_payload)
+        )
         state.record_event(
             unit_id,
             feature_id,
             "reviewer_blocked",
             source="reviewer",
             cycle_number=unit_state.review_round,
-            summary=reason,
+            summary=blocked_payload.prose,
             session_id=session_id,
-            details=tail(response),
+            details=blocked_event_details(blocked_payload, tail(response)),
         )
         safe_comment_pr(
             feature.repo_path,
             unit_state.pr_number,
-            f"🚨 **Reviewer BLOCKED:** {reason}\n_Escalated to human._",
+            f"🚨 **Reviewer BLOCKED [{blocked_payload.reason}]:** {blocked_payload.prose}\n"
+            f"_Escalated to human._",
         )
-        return f"BLOCKED — reviewer for {unit_id}: {reason}"
+        return (
+            f"BLOCKED — reviewer for {unit_id} [{blocked_payload.reason}]: {blocked_payload.prose}"
+        )
 
     return _escalate_no_marker(
         unit_id=unit_id,
@@ -651,21 +662,27 @@ def address_review(unit_id: str, source: str, feedback: str) -> str:
             indent=2,
         )
 
-    blocked = BLOCKED_RE.search(response)
-    if blocked:
-        reason = blocked.group(1).strip()
-        state.touch_unit(unit_id, status="escalated", error=f"Coder BLOCKED on fix: {reason}")
+    blocked_payload = parse_blocked_marker(response)
+    if blocked_payload is not None:
+        state.touch_unit(
+            unit_id,
+            status="escalated",
+            error=f"Coder BLOCKED on fix [{blocked_payload.reason}]: {blocked_payload.prose}",
+        )
         state.record_event(
             unit_id,
             unit_state.feature_id,
             "coder_blocked_on_fix",
             source="coder",
             cycle_number=round_num,
-            summary=reason,
+            summary=blocked_payload.prose,
             session_id=unit_state.coder_session_id,
-            details=tail(response),
+            details=blocked_event_details(blocked_payload, tail(response)),
         )
-        return f"BLOCKED — coder couldn't apply fix: {reason}"
+        return (
+            f"BLOCKED — coder couldn't apply fix [{blocked_payload.reason}]: "
+            f"{blocked_payload.prose}"
+        )
 
     return _escalate_no_marker(
         unit_id=unit_id,

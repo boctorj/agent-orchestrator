@@ -10,11 +10,13 @@ those registrations before calling `mcp.run()`.
 
 from __future__ import annotations
 
+import json
 import re
 
 from mcp.server.fastmcp import FastMCP
 
 from orchestrator import github, github_app, repo_verify, state
+from orchestrator.blocked_reasons import BlockedPayload
 from orchestrator.models import Feature, WorkUnit
 
 # --- the FastMCP instance every tool module imports ---
@@ -27,6 +29,9 @@ CAP_3 = 3
 # --- marker regexes (agents emit these as final-line sentinels) ---
 PR_URL_RE = re.compile(r"PR_URL:\s*(https://github\.com/[\w.-]+/[\w.-]+/pull/(\d+))", re.IGNORECASE)
 BLOCKED_RE = re.compile(r"^BLOCKED:\s*(.+)$", re.MULTILINE)
+"""Legacy line-only matcher; structured parsing lives in
+:func:`orchestrator.blocked_reasons.parse_blocked_marker`. Kept here so existing
+import sites (and tests) continue to work."""
 TESTS_PASS_RE = re.compile(r"^TESTS_PASS\s*$", re.MULTILINE)
 BUG_FOUND_RE = re.compile(r"^BUG_FOUND:\s*(.+)$", re.MULTILINE)
 REVIEW_APPROVED_RE = re.compile(r"^REVIEW_APPROVED\s*$", re.MULTILINE)
@@ -238,6 +243,32 @@ branch.
 End your response with `FIX_PUSHED` on its own line, OR `BLOCKED: <reason>`
 if you couldn't apply the fix.
 """
+
+
+# --- BLOCKED-marker helpers (see orchestrator.blocked_reasons) ---
+
+
+def format_blocked_last_error(payload: BlockedPayload) -> str:
+    """One-line human-readable form for ``WorkUnitState.last_error``.
+
+    Includes the reason slug in square brackets so the dashboard /
+    next_ready_units listing surfaces the classification immediately even
+    when the prose is long.
+    """
+    return f"BLOCKED [{payload.reason}]: {payload.prose}"
+
+
+def blocked_event_details(payload: BlockedPayload, response_tail: str) -> str:
+    """JSON-encoded ``details`` value for a BLOCKED unit_event.
+
+    The orchestrator stores BLOCKED events with the structured payload + the
+    truncated worker response together. Downstream consumers (dashboard,
+    escalation summaries, ntfy bodies) can ``json.loads`` this to lift the
+    reason slug and structured fields without re-parsing the prose.
+    """
+    out = payload.to_event_payload()
+    out["response_tail"] = response_tail
+    return json.dumps(out)
 
 
 # --- side-effect helpers (best-effort: never raise) ---
