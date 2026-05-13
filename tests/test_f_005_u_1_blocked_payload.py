@@ -44,7 +44,6 @@ from orchestrator.ci_wait import CIWaitResult
 from orchestrator.models import Feature, WorkUnit, WorkUnitState
 from orchestrator.tools import execution
 
-
 # --------------------------- shared helpers / fakes ---------------------------
 
 
@@ -241,9 +240,7 @@ class TestPromptsTeachStructuredFormat:
     def test_each_role_prompt_lists_every_slug(self, role, slug, prompts):
         """All nine slugs must be documented in each role's prompt so the
         agent has a complete menu to pick from."""
-        assert slug in prompts[role], (
-            f"prompt {role}.md is missing slug {slug!r} from the taxonomy"
-        )
+        assert slug in prompts[role], f"prompt {role}.md is missing slug {slug!r} from the taxonomy"
 
 
 # --------------------------- (3) parser + payload ---------------------------
@@ -294,9 +291,7 @@ class TestParseBlockedBody:
     def test_legacy_bare_prose_with_recognizer_match(self):
         """Pre-F-005-U-1 workers emit ``BLOCKED: <prose>`` (no pipe).
         Parser must still classify via recognizer."""
-        p = parse_blocked_body(
-            "remote: error: GH013: Changes must be made through a pull request"
-        )
+        p = parse_blocked_body("remote: error: GH013: Changes must be made through a pull request")
         assert p.reason == "branch_protection_blocked_push"
         assert p.recognized_by == "branch_protection_pr_required"
         assert "Changes must be made through a pull request" in p.prose
@@ -396,10 +391,7 @@ class TestParseBlockedMarker:
         assert parse_blocked_marker("PR_URL: https://x/pull/1") is None
 
     def test_finds_terminal_marker(self):
-        resp = (
-            "first I tried foo, then bar.\n"
-            "BLOCKED: reason=disk_full | /workspace is full\n"
-        )
+        resp = "first I tried foo, then bar.\nBLOCKED: reason=disk_full | /workspace is full\n"
         p = parse_blocked_marker(resp)
         assert p is not None
         assert p.reason == "disk_full"
@@ -599,9 +591,7 @@ class TestRecognizerFallbackEndToEnd:
         _seed_with_pr()
         _install_worker(
             monkeypatch,
-            spawn_response=(
-                "BLOCKED: protection rule with enforce_admins=true blocks even admins"
-            ),
+            spawn_response=("BLOCKED: protection rule with enforce_admins=true blocks even admins"),
         )
         _silence_side_effects(monkeypatch)
 
@@ -620,9 +610,7 @@ class TestUnknownFallback:
     reason slug is ``unknown`` and the worker's prose is preserved verbatim
     so the escalation summary still carries their explanation."""
 
-    def test_spawn_unit_unknown_preserves_prose(
-        self, tmp_state_db, with_github_token, monkeypatch
-    ):
+    def test_spawn_unit_unknown_preserves_prose(self, tmp_state_db, with_github_token, monkeypatch):
         _seed_feature()
         _install_worker(
             monkeypatch,
