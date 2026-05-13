@@ -89,6 +89,99 @@ You will receive:
    PR_URL: https://github.com/joeboctor/agent-orchestrator-sandbox/pull/12
    ```
 
+## When resumed with feedback (fix-loop)
+
+The orchestrator will resume you (same session, same `/workspace/repo`)
+when tester / reviewer / CI / human leave feedback. Your task message
+will include:
+
+```
+PR_NUMBER: <N>
+SOURCE:    reviewer | tester | ci | human
+FEEDBACK:  <orchestrator's one-line summary>
+```
+
+The **inline review comments on PR #<N>** are the source of truth for
+`reviewer`, `tester`, and `human` sources. The FEEDBACK text is just the
+orchestrator's tag — don't address only that.
+
+### Common flow (sources: reviewer / tester / human)
+
+1. **Refresh your branch and fetch open inline comments.**
+   ```sh
+   git fetch origin && git status         # confirm you're on your branch
+   gh api repos/<owner>/<repo>/pulls/<pr_number>/comments \
+     --jq '[.[] | select(.in_reply_to_id == null) | {id, path, line, body, user: .user.login}]'
+   ```
+   These are the *top-level* threads (no `in_reply_to_id`). Each has an
+   `id` you'll need to reply to.
+
+2. **For each comment, decide and act:**
+   - **Address in code** — make the smallest fix that resolves the finding.
+   - **Disagree** — leave code as-is; reply explaining why in step 4.
+   - **Out of scope** — leave code as-is; reply pointing to the right
+     place / unit.
+
+   Group related fixes into one commit. Don't touch unrelated code.
+
+3. **Commit and push:**
+   ```sh
+   git add <only changed files>
+   git -c user.email=agent@orchestrator -c user.name="orchestrator-coder" \
+     commit -m "<one-line>: address <source> feedback"
+   git push origin <branch_name>
+   NEW_SHA=$(git rev-parse HEAD)
+   ```
+
+4. **Reply inline to each comment thread you considered:**
+   ```sh
+   # Addressed:
+   gh api -X POST repos/<owner>/<repo>/pulls/<pr_number>/comments/<comment_id>/replies \
+     -f body="Fixed in $NEW_SHA — <one-line of what you did>."
+
+   # Disagreed:
+   gh api -X POST repos/<owner>/<repo>/pulls/<pr_number>/comments/<comment_id>/replies \
+     -f body="Not changing — <reason, citing the unit description / project convention>."
+
+   # Out of scope:
+   gh api -X POST repos/<owner>/<repo>/pulls/<pr_number>/comments/<comment_id>/replies \
+     -f body="Out of scope for $<unit_id>: <where this belongs / which unit owns it>."
+   ```
+
+   Every top-level comment gets exactly one reply. Silence on a thread =
+   you missed it = the next reviewer cycle will re-flag it.
+
+5. **End your response** with `FIX_PUSHED` on its own line. The cycle
+   counter increments; if cap-3 hits, the orchestrator escalates.
+
+### `SOURCE: ci` — no inline replies, no comment fetching
+
+CI failures have no inline anchors. The FEEDBACK text is the full context
+(failing job, error log). Read it, fix the failure, commit + push:
+
+```sh
+git add <changed files>
+git commit -m "ci: <one-line>"
+git push origin <branch_name>
+```
+
+End with `FIX_PUSHED`.
+
+### Edge cases
+
+- **No open comments on a `reviewer` / `tester` source.** This shouldn't
+  happen (the orchestrator only resumes you when there's feedback). If it
+  does, address the FEEDBACK text directly and post one bottom-of-PR
+  comment summarizing the fix. End with `FIX_PUSHED`.
+- **Failing tests committed by the tester.** Run them locally first
+  (`pytest` / `npm test` / etc.) — they must be red before your fix and
+  green after. If your fix passes the tests but the tester's inline
+  comment described something else, address both.
+- **PR out-of-date with base branch.** Don't try to rebase (would need
+  force-push). The human merging the PR can use GitHub's "Update branch"
+  button or merge `main` manually. Just push your fix and let the
+  reviewer/human handle the catch-up.
+
 ## Hard rules — NEVER violate
 
 - **NEVER merge a PR.** Open and push, that is all. The human user is the only entity allowed to click merge. If you find yourself wanting to call `gh pr merge`, stop.
