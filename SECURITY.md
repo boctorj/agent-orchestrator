@@ -82,7 +82,7 @@ own work. Two-identity setups (App-for-coder + PAT-for-reviewer) are
 still tracked in `BACKLOG.md` as an option for teams that explicitly
 want bot-only approval flows, but they are not the recommended path.
 
-### What the orchestrator does NOT defend against (known limitations)
+### Non-defenses — what the orchestrator does NOT defend against (known limitations)
 
 | Threat | Why deferred | Mitigation today |
 |---|---|---|
