@@ -6,7 +6,7 @@ import contextlib
 import json
 import sqlite3
 
-from orchestrator import github, github_app, repo_verify, state
+from orchestrator import blocked_hints, github, github_app, repo_verify, state
 from orchestrator.agents import ManagedAgentWorker
 from orchestrator.models import ACTIVE_UNIT_STATUSES
 from orchestrator.tools import mcp, need_github_token
@@ -74,7 +74,7 @@ def check_unit_pr(unit_id: str) -> str:
 
 
 @mcp.tool()
-def list_in_flight() -> str:
+def list_in_flight(reason: str = "") -> str:
     """List units in active states across all features.
 
     Use after an MCP server restart (laptop sleep, crash, /quit + relaunch)
@@ -84,36 +84,52 @@ def list_in_flight() -> str:
 
     Returns units with status in: coding, testing, opening_pr, in_ci,
     reviewing, fixing.
+
+    ``reason``: when non-empty (e.g. ``"auth_failure"``,
+    ``"branch_protection_blocked_push"``) the active-status set is
+    widened to also include ``escalated`` and the rows are filtered to
+    those whose most-recent BLOCKED-style event carries a matching
+    structured reason (see :mod:`orchestrator.blocked_hints`). This lets
+    the lead ask "show me everything blocked on auth" in one call. Each
+    matching row gets an extra ``reason`` field so the lead can see
+    which slug matched. Empty string (the default) preserves the
+    original active-only behaviour.
     """
-    active = tuple(ACTIVE_UNIT_STATUSES)
-    placeholders = ",".join("?" * len(active))
+    statuses: tuple[str, ...] = tuple(ACTIVE_UNIT_STATUSES)
+    if reason:
+        statuses = statuses + ("escalated",)
+    placeholders = ",".join("?" * len(statuses))
     with contextlib.closing(sqlite3.connect(state.STATE_DB)) as conn:
         conn.row_factory = sqlite3.Row
-        # `placeholders` is "?,?,?,..." sized to the fixed ACTIVE_UNIT_STATUSES
-        # tuple; the values themselves bind via the `active` parameter.
+        # `placeholders` is "?,?,?,..." sized to the fixed status tuple
+        # above; the values themselves bind via the `statuses` parameter.
         rows = conn.execute(
             f"SELECT * FROM work_units WHERE status IN ({placeholders}) ORDER BY last_activity DESC",  # noqa: S608  # nosec B608
-            active,
+            statuses,
         ).fetchall()
-    return json.dumps(
-        [
-            {
-                "unit_id": r["unit_id"],
-                "feature_id": r["feature_id"],
-                "status": r["status"],
-                "branch": r["branch"],
-                "pr_number": r["pr_number"],
-                "has_coder_session": bool(r["coder_session_id"]),
-                "has_tester_session": bool(r["tester_session_id"]),
-                "has_reviewer_session": bool(r["reviewer_session_id"]),
-                "review_round": r["review_round"],
-                "last_activity": r["last_activity"],
-                "last_error": r["last_error"],
-            }
-            for r in rows
-        ],
-        indent=2,
-    )
+
+    result: list[dict] = []
+    for r in rows:
+        row_reason, _ = blocked_hints.latest_blocked_reason(r["unit_id"])
+        if reason and row_reason != reason:
+            continue
+        entry: dict = {
+            "unit_id": r["unit_id"],
+            "feature_id": r["feature_id"],
+            "status": r["status"],
+            "branch": r["branch"],
+            "pr_number": r["pr_number"],
+            "has_coder_session": bool(r["coder_session_id"]),
+            "has_tester_session": bool(r["tester_session_id"]),
+            "has_reviewer_session": bool(r["reviewer_session_id"]),
+            "review_round": r["review_round"],
+            "last_activity": r["last_activity"],
+            "last_error": r["last_error"],
+        }
+        if reason:
+            entry["reason"] = row_reason
+        result.append(entry)
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()

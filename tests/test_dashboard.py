@@ -103,6 +103,60 @@ class TestDataFetchers:
         assert rows[0]["unit_id"] == "U2"
         assert rows[1]["unit_id"] == "U1"
 
+    def test_escalated_data_truncates_when_reason_unknown(self, tmp_state_db):
+        """Legacy path: no structured reason → keep the 120-char truncation
+        on `last_error` so the panel stays compact for unclassified
+        failures (no regression from pre-F-005-U-2 behaviour)."""
+        import json as _json
+
+        state.save_feature(Feature(id="F", title="t", description=""))
+        long_error = "x" * 500
+        state.upsert_unit_state(
+            WorkUnitState(unit_id="U1", feature_id="F", status="escalated", last_error=long_error)
+        )
+        # An event WITHOUT structured reason should leave the row in legacy mode.
+        state.record_event("U1", "F", "coder_blocked", details="plain prose")
+
+        rows = dashboard._escalated_data()
+        assert len(rows[0]["last_error"]) == 120
+        assert rows[0]["reason"] == "unknown"
+
+        # And conversely: when there's no event at all, still truncated.
+        _ = _json  # keep import grouped; used in companion test below
+
+    def test_escalated_data_full_remediation_when_reason_known(self, tmp_state_db):
+        """F-005-U-2 contract: when the most recent BLOCKED-style event
+        carries a structured reason, the dashboard surfaces the FULL
+        `reason -> hint -> prose` tail with no 120-char truncation."""
+        import json as _json
+
+        state.save_feature(Feature(id="F", title="t", description=""))
+        long_prose = (
+            "remote: error: GH013: Repository rule violations found for refs/heads/"
+            "f-005-u-2. " + ("x" * 400)
+        )
+        state.upsert_unit_state(
+            WorkUnitState(
+                unit_id="U1", feature_id="F", status="escalated", last_error="short header"
+            )
+        )
+        state.record_event(
+            "U1",
+            "F",
+            "coder_blocked",
+            details=_json.dumps({"reason": "branch_protection_blocked_push", "prose": long_prose}),
+        )
+        rows = dashboard._escalated_data()
+        row = rows[0]
+        # The reason and the multi-line hint are present
+        assert row["reason"] == "branch_protection_blocked_push"
+        assert "Reason: branch_protection_blocked_push" in row["last_error"]
+        # Full prose tail preserved — no truncation
+        assert long_prose in row["last_error"]
+        # The full rendering must exceed the legacy 120-char cap to actually
+        # be a regression-free improvement.
+        assert len(row["last_error"]) > 120
+
     def test_events_data_returns_newest_first(self, tmp_state_db):
         import time
 

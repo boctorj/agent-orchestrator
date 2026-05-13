@@ -65,9 +65,25 @@ def push(
         return False
 
 
-def push_escalation(unit_id: str, reason: str, pr_url: str | None = None) -> bool:
-    """Helper for the most common escalation case."""
-    body = f"Unit {unit_id} escalated: {reason}"
+def push_escalation(
+    unit_id: str,
+    reason: str,
+    pr_url: str | None = None,
+    *,
+    reason_slug: str = "unknown",
+) -> bool:
+    """Helper for the most common escalation case.
+
+    ``reason`` is the free-text tail (one-line prose summary). ``reason_slug``
+    is the optional canonical taxonomy slug from F-005's structured BLOCKED
+    parser; when it resolves to a known entry in
+    :data:`orchestrator.blocked_hints.REMEDIATION_HINTS` the push body
+    embeds the slug + multi-line fix-it hint so the user can action from
+    phone. ``"unknown"`` (the default) preserves today's prose-only body.
+    """
+    from orchestrator import blocked_hints  # local: keep ntfy importable standalone
+
+    body = blocked_hints.format_ntfy_body(unit_id, reason_slug, reason)
     if pr_url:
         body += f"\nPR: {pr_url}"
     return push(

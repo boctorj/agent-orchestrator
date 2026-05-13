@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict
 
-from orchestrator import costs, state
+from orchestrator import blocked_hints, costs, state
 from orchestrator.tools import mcp
 
 
@@ -28,11 +28,27 @@ def list_units(feature_id: str) -> str:
 
 
 @mcp.tool()
-def unit_history(unit_id: str) -> str:
-    """Return the full event timeline for a unit (oldest first)."""
+def unit_history(unit_id: str, reason: str = "") -> str:
+    """Return the full event timeline for a unit (oldest first).
+
+    ``reason``: when non-empty, restrict the result to events whose
+    ``details`` JSON carries a matching ``reason`` slug (see
+    :mod:`orchestrator.blocked_hints`). Useful for chat queries like
+    "show me everything blocked on auth for U-1" — the lead passes
+    ``reason="auth_failure"`` and gets only those events. Empty string
+    (the default) preserves the original "all events" behaviour.
+    """
     events = state.list_events(unit_id)
     if not events:
         return f"No events for {unit_id}"
+    if reason:
+        events = [
+            e
+            for e in events
+            if blocked_hints.extract_reason_from_details(e.get("details") or "")[0] == reason
+        ]
+        if not events:
+            return f"No events for {unit_id} matching reason={reason!r}"
     return json.dumps(events, indent=2)
 
 
