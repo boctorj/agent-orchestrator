@@ -68,6 +68,48 @@ The `orchestrator init` wizard prompts for:
 | `orchestrator dashboard` | Live TUI dashboard (~2s refresh, Ctrl+C to quit) |
 | `orchestrator version` | Print installed version |
 
+
+## GitHub PAT
+
+If you chose **PAT** in `orchestrator init`, create a **fine-grained
+personal access token** at
+[github.com/settings/personal-access-tokens](https://github.com/settings/personal-access-tokens).
+
+**Repository access:** select the specific target repo(s) the orchestrator
+will open PRs against. ("All repositories" works but grants broader scope
+than necessary — fine-grained PATs are repo-scoped at creation time and
+re-issuing later requires regenerating the token.)
+
+**Repository permissions:**
+
+| Permission | Access | Used for |
+|---|---|---|
+| Metadata | Read | Required on every fine-grained PAT (auto-included) |
+| Contents | Read & write | Clone, branch, commit, push (coder + tester); CODEOWNERS lookup in `verify_repo` |
+| Pull requests | Read & write | `gh pr create`, `gh pr review --comment / --request-changes`, PR conversation comments, Copilot review requests, PR state polling |
+| Issues | Read & write | PR conversation comments use the issues API (`/issues/<n>/comments`) |
+| Actions | Read | CI-green gate polling — `check_runs` produced by GitHub Actions workflows |
+| Commit statuses | Read | Status-API check results (non-Actions CI) |
+| Administration | Read | `verify_repo` reads branch-protection rules at `/branches/<default>/protection` |
+
+**Do NOT grant `Workflows`.** Its absence is a deliberate defense layer
+preventing agents from modifying `.github/workflows/*` even if the coder
+prompt's hard rule fails — see
+[SECURITY.md](SECURITY.md#what-the-orchestrator-defends-against) and
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+After issuing, paste the token as `GITHUB_TOKEN` when `orchestrator init`
+prompts, or write it directly into `.env`. Fine-grained PATs default to a
+90-day lifetime — rotate before expiry.
+
+**Classic (non-fine-grained) PATs are not recommended:** they grant
+org-wide scopes and can't be repo-restricted. If you must use one, the
+closest equivalent is `repo` (which is broader than what's listed above).
+
+**Alternative — GitHub App** (recommended for teams): bot identity,
+1-hour-lived tokens, easier rotation and audit. Pick this path in
+`orchestrator init` instead of PAT.
+
 ## Smoke test
 
 After `orchestrator run`, paste into chat:
