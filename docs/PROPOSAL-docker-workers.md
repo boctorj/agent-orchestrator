@@ -155,6 +155,47 @@ Path 1 is cleaner — same session semantics as Managed Agents. Requires Claude
 Code's `--resume` flag to exist and accept an arbitrary session ID. Path 2 is
 the fallback if that doesn't work.
 
+### Validation (2026-05-12)
+
+Path 1 confirmed working end-to-end with a round-trip test on the host's
+`claude` CLI (version 2.1.140):
+
+```
+$ claude -p "remember the phrase 'orange octopus 47'. respond ACK." \
+        --output-format json
+→ session_id: e48b5e9d-a9a9-4169-af64-82f8c7c20d2e, response: "ACK"
+
+$ claude --resume e48b5e9d-a9a9-4169-af64-82f8c7c20d2e \
+        -p "what phrase did I tell you?" --output-format json
+→ same session_id returned, response: "orange octopus 47"
+```
+
+`claude --resume <arbitrary-uuid>` accepts any session ID — not just the most
+recent. **Path 2 (orchestrator-managed transcript) is therefore not needed.**
+
+**Bonus discovery.** The CLI also exposes `--session-id <uuid>` to *set* the
+ID upfront. The orchestrator could generate UUIDs on the host and skip
+parsing them out of stdout entirely, retiring the JSON / JSONL / plaintext
+branches in `extract_session_id`. Worth a follow-on optimization (fold into
+U-6 or file as a follow-up).
+
+### Session scope
+
+The orchestrator's session model — which `DockerClaudeCodeWorker` mirrors
+faithfully — is **one session per (role × work-unit)**. Each unit holds up
+to three sessions: `coder_session_id`, `tester_session_id`,
+`reviewer_session_id`. The same session is reused across every interaction
+within that role for that unit (initial spawn + every `address_review` /
+`send_to_unit` resume across fix cycles). Different units never share
+sessions, even for the same role.
+
+**Concurrency implication for Docker workers on claude.ai:** a
+`parallel_units_global(max_concurrent=3)` batch can briefly have up to
+9 sessions live (3 units × 3 roles), peaking at 3–5 simultaneously active.
+Pro plan's ~1–2 concurrent cap will serialize some of this; Team/Max gives
+more headroom. Stress-test this in U-6 before claiming production parity
+with Managed Agents on parallelism.
+
 ## LLM abstraction (beyond Claude)
 
 The existing `Worker` protocol IS the LLM abstraction —
@@ -241,9 +282,10 @@ field, etc.).
 
 ## Open questions
 
-1. **Claude Code's `--resume` semantics**: does it accept an arbitrary session
-   ID, or only the most recent? If only most-recent, Path 2
-   (orchestrator-managed transcript) is the fallback.
+1. ~~**Claude Code's `--resume` semantics**~~ **RESOLVED 2026-05-12.** Tested
+   via round-trip; `claude --resume <arbitrary-uuid>` works on CLI version
+   2.1.140. Path 2 (orchestrator-managed transcript) not needed. See
+   "Validation (2026-05-12)" addendum in the session-continuity section above.
 2. **claude.ai concurrency limit**: what's the actual cap per plan? Need to
    test, then either gate `parallel_units` accordingly or document the limit.
 3. **Image size / pull time**: Claude Code + Node + Python + common test deps
