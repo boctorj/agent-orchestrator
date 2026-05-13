@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import httpx
 import pytest
 
 from orchestrator import repo_verify
@@ -49,15 +50,16 @@ class TestNormalizeRepoUrl:
 class _FakeResponse:
     """Mimics enough of httpx.Response for verify()'s code path."""
 
-    def __init__(self, status_code=200, json_data=None):
+    def __init__(self, status_code=200, json_data=None, headers=None):
         self.status_code = status_code
         self._json = json_data if json_data is not None else {}
+        self.headers = headers if headers is not None else {}
 
     def json(self):
         return self._json
 
 
-def _make_client(responses: dict[str, _FakeResponse]):
+def _make_client(responses: dict[str, _FakeResponse], raise_for=None):
     """Build a fake httpx.Client that returns canned responses by URL-suffix match.
 
     A response key matches if it is a strict suffix of the request URL's path
@@ -65,7 +67,12 @@ def _make_client(responses: dict[str, _FakeResponse]):
     `/repos/o/r/branches/main/protection` or `/repos/o/r/contents/CODEOWNERS` —
     the test must explicitly mock those longer URLs (or leave them to fall
     through to the default 404).
+
+    `raise_for` is an optional mapping of URL-suffix -> Exception instance to
+    raise from .get() when that suffix matches; lets tests exercise the
+    transport-error path of pre-flight probes without needing a real socket.
     """
+    raise_map = raise_for or {}
 
     class FakeClient:
         def __init__(self, *args, **kwargs):
@@ -79,6 +86,9 @@ def _make_client(responses: dict[str, _FakeResponse]):
 
         def get(self, url, params=None, **kw):
             path = url.split("?", 1)[0]
+            for key, exc in raise_map.items():
+                if path.endswith(key):
+                    raise exc
             for key, resp in responses.items():
                 if path.endswith(key):
                     return resp
@@ -971,3 +981,654 @@ class TestFormatResultLines:
         lines = repo_verify.format_result_lines(result)
         assert any("warnings" in line.lower() for line in lines)
         assert any("CODEOWNERS" in line for line in lines)
+
+
+# --------------------------- format_result_lines hint-table tests (F-005-U-3) ---------------------------
+
+
+class TestFormatResultLinesHintTable:
+    """The hint-table renders fix-it copy keyed off slug-prefixed warnings."""
+
+    def test_hint_table_renders_when_tagged_warning_present(self):
+        """A tagged warning triggers a `pre-flight hints` section."""
+        from orchestrator.models import CheckResult, VerificationResult
+
+        tagged = f"[{repo_verify.REASON_AUTH_FAILURE}] PAT scopes missing"
+        result = VerificationResult(
+            repo_url="https://github.com/o/r",
+            checks=[CheckResult("read access", True)],
+            warnings=[tagged],
+        )
+        lines = repo_verify.format_result_lines(result)
+        joined = "\n".join(lines)
+        assert "pre-flight hints" in joined.lower()
+        assert repo_verify.REASON_AUTH_FAILURE in joined
+        # Hint copy from PREFLIGHT_HINTS is rendered too
+        assert any(
+            repo_verify.PREFLIGHT_HINTS[repo_verify.REASON_AUTH_FAILURE][:20] in line
+            for line in lines
+        )
+
+    def test_hint_table_skipped_for_untagged_warnings(self):
+        """Legacy warnings (no slug prefix) don't trigger the hint table."""
+        from orchestrator.models import CheckResult, VerificationResult
+
+        result = VerificationResult(
+            repo_url="https://github.com/o/r",
+            checks=[CheckResult("read access", True)],
+            warnings=["required_signatures is on — agent commits aren't signed"],
+        )
+        lines = repo_verify.format_result_lines(result)
+        joined = "\n".join(lines).lower()
+        assert "pre-flight hints" not in joined
+
+    def test_hint_table_dedupes_repeated_slugs(self):
+        """Two warnings with the same slug -> hint table renders the slug once."""
+        from orchestrator.models import CheckResult, VerificationResult
+
+        slug = repo_verify.REASON_BRANCH_PROTECTION_BLOCKED_PUSH
+        result = VerificationResult(
+            repo_url="https://github.com/o/r",
+            checks=[CheckResult("read access", True)],
+            warnings=[f"[{slug}] msg one", f"[{slug}] msg two"],
+        )
+        lines = repo_verify.format_result_lines(result)
+        # Count rows in the hint section that start with `• <slug>:`
+        slug_rows = [line for line in lines if line.lstrip().startswith(f"• {slug}:")]
+        assert len(slug_rows) == 1
+
+
+# --------------------------- pre-flight probes (F-005-U-3) ---------------------------
+
+
+class TestPreflightProbes:
+    """WARN-only probes for the planning-time-catchable BLOCKED reasons.
+
+    Each probe emits a slug-tagged WARN; none of them should ever flip a
+    pass/fail check or block verification. The slugs match the reason
+    taxonomy used by escalation summaries / ntfy bodies.
+    """
+
+    def test_feature_branch_pr_rule_warns_with_slug(self, monkeypatch):
+        """`pull_request` rule on a feature-branch ruleset -> WARN, not FAIL."""
+        rule_payload = [
+            {"type": "pull_request", "ruleset_id": 42, "ruleset_source": "ORG"},
+        ]
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(200, _good_protection()),
+            "/user": _FakeResponse(200, {"login": "owner"}),
+            "/rules/branches/agent-orchestrator-preflight": _FakeResponse(200, rule_payload),
+        }
+        monkeypatch.setattr("httpx.Client", _make_client(responses))
+
+        result = verify("github.com/owner/repo", token="ghp_fake")
+
+        # Probe is WARN-only; the underlying repo still passes.
+        assert result.passed
+        slugs = [repo_verify.extract_warning_slug(w) for w in result.warnings]
+        assert repo_verify.REASON_BRANCH_PROTECTION_BLOCKED_PUSH in slugs
+        # Warning message names the offending API surface so the lead can
+        # diagnose without running the coder.
+        bp_warn = next(
+            w
+            for w in result.warnings
+            if repo_verify.extract_warning_slug(w)
+            == repo_verify.REASON_BRANCH_PROTECTION_BLOCKED_PUSH
+        )
+        assert "pull request" in bp_warn.lower()
+
+    def test_feature_branch_no_pr_rule_no_warning(self, monkeypatch):
+        """Empty / unrelated rule list -> no branch-protection WARN."""
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(200, _good_protection()),
+            "/user": _FakeResponse(200, {"login": "owner"}),
+            "/rules/branches/agent-orchestrator-preflight": _FakeResponse(
+                200, [{"type": "non_fast_forward"}]
+            ),
+        }
+        monkeypatch.setattr("httpx.Client", _make_client(responses))
+
+        result = verify("github.com/owner/repo", token="ghp_fake")
+        assert result.passed
+        slugs = [repo_verify.extract_warning_slug(w) for w in result.warnings]
+        assert repo_verify.REASON_BRANCH_PROTECTION_BLOCKED_PUSH not in slugs
+
+    def test_feature_branch_endpoint_unsupported_no_warning(self, monkeypatch):
+        """Non-200 from the Rules API is not a probe failure — skip silently."""
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(200, _good_protection()),
+            "/user": _FakeResponse(200, {"login": "owner"}),
+            # Rules endpoint returns 404 (default in _make_client) — probe
+            # must NOT warn.
+        }
+        monkeypatch.setattr("httpx.Client", _make_client(responses))
+
+        result = verify("github.com/owner/repo", token="ghp_fake")
+        assert result.passed
+        slugs = [repo_verify.extract_warning_slug(w) for w in result.warnings]
+        assert repo_verify.REASON_BRANCH_PROTECTION_BLOCKED_PUSH not in slugs
+
+    def test_pat_missing_repo_scope_warns_auth_failure(self, monkeypatch):
+        """Classic PAT with `read:org` only -> auth_failure WARN, not FAIL."""
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(200, _good_protection()),
+            "/user": _FakeResponse(
+                200,
+                {"login": "owner"},
+                headers={"X-OAuth-Scopes": "read:org, gist"},
+            ),
+        }
+        monkeypatch.setattr("httpx.Client", _make_client(responses))
+
+        result = verify("github.com/owner/repo", token="ghp_fake")
+        assert result.passed  # WARN only
+        slugs = [repo_verify.extract_warning_slug(w) for w in result.warnings]
+        assert repo_verify.REASON_AUTH_FAILURE in slugs
+
+    def test_pat_with_repo_scope_no_warning(self, monkeypatch):
+        """`repo` scope present -> no auth_failure WARN."""
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(200, _good_protection()),
+            "/user": _FakeResponse(
+                200,
+                {"login": "owner"},
+                headers={"X-OAuth-Scopes": "repo, workflow"},
+            ),
+        }
+        monkeypatch.setattr("httpx.Client", _make_client(responses))
+
+        result = verify("github.com/owner/repo", token="ghp_fake")
+        assert result.passed
+        slugs = [repo_verify.extract_warning_slug(w) for w in result.warnings]
+        assert repo_verify.REASON_AUTH_FAILURE not in slugs
+
+    def test_pat_with_public_repo_scope_no_warning(self, monkeypatch):
+        """`public_repo` is sufficient for public-only repos -> no WARN."""
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(200, _good_protection()),
+            "/user": _FakeResponse(
+                200,
+                {"login": "owner"},
+                headers={"X-OAuth-Scopes": "public_repo"},
+            ),
+        }
+        monkeypatch.setattr("httpx.Client", _make_client(responses))
+
+        result = verify("github.com/owner/repo", token="ghp_fake")
+        assert result.passed
+        slugs = [repo_verify.extract_warning_slug(w) for w in result.warnings]
+        assert repo_verify.REASON_AUTH_FAILURE not in slugs
+
+    def test_fine_grained_pat_empty_scopes_no_warning(self, monkeypatch):
+        """Fine-grained PATs return empty X-OAuth-Scopes — probe must skip."""
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(200, _good_protection()),
+            "/user": _FakeResponse(
+                200,
+                {"login": "owner"},
+                headers={"X-OAuth-Scopes": ""},
+            ),
+        }
+        monkeypatch.setattr("httpx.Client", _make_client(responses))
+
+        result = verify("github.com/owner/repo", token="ghp_fake")
+        assert result.passed
+        slugs = [repo_verify.extract_warning_slug(w) for w in result.warnings]
+        assert repo_verify.REASON_AUTH_FAILURE not in slugs
+
+    def test_app_auth_skips_scope_probe(self, monkeypatch):
+        """App tokens don't expose OAuth scopes — probe must not warn."""
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(200, _good_protection()),
+            "/installation/repositories": _FakeResponse(
+                200, {"repositories": [{"full_name": "owner/repo"}]}
+            ),
+        }
+        monkeypatch.setattr("httpx.Client", _make_client(responses))
+        monkeypatch.setenv("GITHUB_APP_INSTALLATION_ID", "123")
+
+        result = verify("github.com/owner/repo", token="ghs_fake", auth_mode="app")
+        assert result.passed
+        slugs = [repo_verify.extract_warning_slug(w) for w in result.warnings]
+        assert repo_verify.REASON_AUTH_FAILURE not in slugs
+
+    def test_default_branch_network_error_warns(self, monkeypatch):
+        """Transport error on /branches/<default> -> network_error WARN, not FAIL.
+
+        The verify() main flow still completes — branch-protection check
+        happens on a separate URL — so this exercises the probe in isolation.
+        """
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(200, _good_protection()),
+            "/user": _FakeResponse(200, {"login": "owner"}),
+        }
+        # Raise on the reachability probe's GET, but let the protection
+        # call (a longer URL ending in /protection) succeed.
+        boom = httpx.ConnectError("DNS resolution failed for api.github.com")
+        client_cls = _make_client(responses, raise_for={"/repos/owner/repo/branches/main": boom})
+        monkeypatch.setattr("httpx.Client", client_cls)
+
+        result = verify("github.com/owner/repo", token="ghp_fake")
+        assert result.passed  # WARN only
+        slugs = [repo_verify.extract_warning_slug(w) for w in result.warnings]
+        assert repo_verify.REASON_NETWORK_ERROR in slugs
+
+    def test_default_branch_reachable_no_warning(self, monkeypatch):
+        """Successful reachability probe -> no network_error WARN."""
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main": _FakeResponse(200, {"name": "main"}),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(200, _good_protection()),
+            "/user": _FakeResponse(200, {"login": "owner"}),
+        }
+        monkeypatch.setattr("httpx.Client", _make_client(responses))
+
+        result = verify("github.com/owner/repo", token="ghp_fake")
+        assert result.passed
+        slugs = [repo_verify.extract_warning_slug(w) for w in result.warnings]
+        assert repo_verify.REASON_NETWORK_ERROR not in slugs
+
+    def test_probes_are_never_blocking(self, monkeypatch):
+        """All three probes firing simultaneously must NOT flip passed=False."""
+        rule_payload = [{"type": "pull_request"}]
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(200, _good_protection()),
+            "/user": _FakeResponse(
+                200,
+                {"login": "owner"},
+                headers={"X-OAuth-Scopes": "gist"},  # missing repo
+            ),
+            "/rules/branches/agent-orchestrator-preflight": _FakeResponse(200, rule_payload),
+        }
+        boom = httpx.ConnectTimeout("timeout")
+        client_cls = _make_client(responses, raise_for={"/repos/owner/repo/branches/main": boom})
+        monkeypatch.setattr("httpx.Client", client_cls)
+
+        result = verify("github.com/owner/repo", token="ghp_fake")
+        assert result.passed  # all probes are WARN-only
+        slugs = {repo_verify.extract_warning_slug(w) for w in result.warnings}
+        assert repo_verify.REASON_BRANCH_PROTECTION_BLOCKED_PUSH in slugs
+        assert repo_verify.REASON_AUTH_FAILURE in slugs
+        assert repo_verify.REASON_NETWORK_ERROR in slugs
+
+
+class TestSlugHelpers:
+    """Tag/extract round-trip for slug-prefixed warnings."""
+
+    def test_extract_known_slug(self):
+        warn = f"[{repo_verify.REASON_AUTH_FAILURE}] PAT scopes [gist] do not include..."
+        assert repo_verify.extract_warning_slug(warn) == repo_verify.REASON_AUTH_FAILURE
+
+    def test_extract_unknown_slug_returns_none(self):
+        """Bare bracketed text must not be classified as a slug."""
+        assert repo_verify.extract_warning_slug("[unknown_thing] msg") is None
+
+    def test_extract_no_brackets_returns_none(self):
+        assert repo_verify.extract_warning_slug("plain warning text") is None
+
+    def test_extract_malformed_returns_none(self):
+        assert repo_verify.extract_warning_slug("[") is None
+        assert repo_verify.extract_warning_slug("[]") is None
+
+    def test_known_slugs_have_hints(self):
+        """Every reason slug must have a fix-it hint."""
+        for slug in repo_verify.PREFLIGHT_REASON_SLUGS:
+            assert slug in repo_verify.PREFLIGHT_HINTS
+            assert repo_verify.PREFLIGHT_HINTS[slug]  # non-empty
+
+
+# --------------------------- F-005-U-3 intended-behavior coverage ---------------------------
+#
+# The coder's TestPreflightProbes class covers the happy-path firing of each
+# probe. This class adds tests for behaviors that follow from the unit
+# description (F-005-U-3) but aren't yet pinned down: non-pre-flightable
+# reasons explicitly excluded, exact taxonomy slug values, probe URL targeting
+# a feature-branch (not default-branch) name, defensive handling of API
+# anomalies, short-circuit safety, and public API surface stability.
+
+
+class TestPreflightTaxonomyContract:
+    """The slug taxonomy is shared with escalation summaries + ntfy bodies.
+
+    These tests pin the contract so a future rename / drift in repo_verify
+    doesn't silently desync the other surfaces that import from it.
+    """
+
+    def test_non_preflightable_reasons_are_not_in_slug_set(self):
+        """Spec: probes do NOT cover disk_full or rate_limited.
+
+        These reasons exist in the BLOCKED-reason taxonomy but are
+        deliberately non-pre-flightable — verify_repo can't predict
+        runtime disk pressure or future API rate state.
+        """
+        assert "disk_full" not in repo_verify.PREFLIGHT_REASON_SLUGS
+        assert "rate_limited" not in repo_verify.PREFLIGHT_REASON_SLUGS
+        # And no hint for them either — symmetric absence.
+        assert "disk_full" not in repo_verify.PREFLIGHT_HINTS
+        assert "rate_limited" not in repo_verify.PREFLIGHT_HINTS
+
+    def test_slug_constants_match_exact_taxonomy_strings(self):
+        """Cross-surface contract: the slug string is the canonical reason name.
+
+        Escalation summaries and ntfy bodies match on these strings; if
+        they change, the dashboard hint table desyncs.
+        """
+        assert repo_verify.REASON_BRANCH_PROTECTION_BLOCKED_PUSH == "branch_protection_blocked_push"
+        assert repo_verify.REASON_AUTH_FAILURE == "auth_failure"
+        assert repo_verify.REASON_NETWORK_ERROR == "network_error"
+
+    def test_preflight_slug_set_is_immutable(self):
+        """Frozenset, so a caller can't accidentally mutate the shared registry."""
+        assert isinstance(repo_verify.PREFLIGHT_REASON_SLUGS, frozenset)
+
+    def test_preflight_slug_set_has_exactly_three_entries(self):
+        """The pre-flightable subset is a closed list of three (per the unit)."""
+        assert len(repo_verify.PREFLIGHT_REASON_SLUGS) == 3
+
+    def test_preflight_hints_has_no_orphan_keys(self):
+        """Every key in PREFLIGHT_HINTS must be a known slug.
+
+        Reverses the existing `test_known_slugs_have_hints` check — together
+        they assert PREFLIGHT_HINTS.keys() == PREFLIGHT_REASON_SLUGS.
+        """
+        for k in repo_verify.PREFLIGHT_HINTS:
+            assert k in repo_verify.PREFLIGHT_REASON_SLUGS, (
+                f"PREFLIGHT_HINTS has a key {k!r} that isn't in PREFLIGHT_REASON_SLUGS"
+            )
+
+    def test_public_api_exports_preflight_symbols(self):
+        """Pre-flight surface must be importable from `repo_verify` directly.
+
+        Escalation/ntfy code paths will `from orchestrator.repo_verify import
+        PREFLIGHT_HINTS, REASON_*`; pinning __all__ guards that import.
+        """
+        all_names = set(repo_verify.__all__)
+        assert "PREFLIGHT_HINTS" in all_names
+        assert "PREFLIGHT_REASON_SLUGS" in all_names
+        assert "REASON_BRANCH_PROTECTION_BLOCKED_PUSH" in all_names
+        assert "REASON_AUTH_FAILURE" in all_names
+        assert "REASON_NETWORK_ERROR" in all_names
+        assert "extract_warning_slug" in all_names
+
+
+class TestPreflightProbeBehaviorEdges:
+    """Edge-case behavior of each probe that goes beyond the happy path."""
+
+    def test_branch_protection_probe_targets_non_default_branch(self, monkeypatch):
+        """Spec: probe is for *feature*-branch push permissions on non-main branches.
+
+        Must hit a synthetic ref name (not the default branch). Probing the
+        default branch wouldn't catch a wildcard feature-branch ruleset.
+        """
+        seen_urls: list[str] = []
+
+        class CapturingClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def get(self, url, params=None, **kw):
+                seen_urls.append(url)
+                path = url.split("?", 1)[0]
+                routes = {
+                    "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+                    "/repos/owner/repo/branches/main/protection": _FakeResponse(
+                        200, _good_protection()
+                    ),
+                    "/user": _FakeResponse(200, {"login": "owner"}),
+                }
+                for key, resp in routes.items():
+                    if path.endswith(key):
+                        return resp
+                return _FakeResponse(404)
+
+        monkeypatch.setattr("httpx.Client", CapturingClient)
+
+        verify("github.com/owner/repo", token="ghp_fake")
+
+        # At least one Rules API call must have happened.
+        rules_calls = [u for u in seen_urls if "/rules/branches/" in u]
+        assert rules_calls, (
+            "branch-protection probe must hit /rules/branches/<name>; saw URLs: " + str(seen_urls)
+        )
+        # The branch-protection probe (distinct from the ruleset-eval call
+        # that legitimately targets the default branch) must hit a synthetic,
+        # non-default ref. Filter out the eval call on the default branch
+        # and assert at least one probe call targets a non-default branch.
+        probe_calls = [
+            u for u in rules_calls if u.rsplit("/rules/branches/", 1)[1].split("?", 1)[0] != "main"
+        ]
+        assert probe_calls, (
+            "branch-protection probe must target a non-default branch; "
+            f"saw only default-branch calls in rules_calls={rules_calls}"
+        )
+        for u in probe_calls:
+            tail = u.rsplit("/rules/branches/", 1)[1].split("?", 1)[0]
+            assert tail, "branch-protection probe target ref must be non-empty"
+
+    def test_branch_protection_probe_dedupes_multiple_pr_rules(self, monkeypatch):
+        """Multiple `pull_request` rules in one payload -> one WARN, not N."""
+        rule_payload = [
+            {"type": "pull_request", "ruleset_id": 1, "ruleset_source": "ORG"},
+            {"type": "pull_request", "ruleset_id": 2, "ruleset_source": "REPO"},
+            {"type": "pull_request", "ruleset_id": 3, "ruleset_source": "ORG"},
+        ]
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(200, _good_protection()),
+            "/user": _FakeResponse(200, {"login": "owner"}),
+            "/rules/branches/agent-orchestrator-preflight": _FakeResponse(200, rule_payload),
+        }
+        monkeypatch.setattr("httpx.Client", _make_client(responses))
+
+        result = verify("github.com/owner/repo", token="ghp_fake")
+        bp_warns = [
+            w
+            for w in result.warnings
+            if repo_verify.extract_warning_slug(w)
+            == repo_verify.REASON_BRANCH_PROTECTION_BLOCKED_PUSH
+        ]
+        assert len(bp_warns) == 1, (
+            f"expected exactly one branch_protection_blocked_push WARN, got {len(bp_warns)}: "
+            f"{bp_warns}"
+        )
+
+    def test_branch_protection_probe_empty_list_no_warning(self, monkeypatch):
+        """No feature-branch rulesets configured at all -> no WARN."""
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(200, _good_protection()),
+            "/user": _FakeResponse(200, {"login": "owner"}),
+            "/rules/branches/agent-orchestrator-preflight": _FakeResponse(200, []),
+        }
+        monkeypatch.setattr("httpx.Client", _make_client(responses))
+
+        result = verify("github.com/owner/repo", token="ghp_fake")
+        slugs = [repo_verify.extract_warning_slug(w) for w in result.warnings]
+        assert repo_verify.REASON_BRANCH_PROTECTION_BLOCKED_PUSH not in slugs
+
+    def test_branch_protection_probe_403_silently_skips(self, monkeypatch):
+        """A 403 from the Rules API (token can't read rulesets) -> probe skips silently.
+
+        Defensive: missing scope on the Rules endpoint shouldn't itself
+        manifest as a misleading branch_protection_blocked_push WARN.
+        """
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(200, _good_protection()),
+            "/user": _FakeResponse(200, {"login": "owner"}),
+            "/rules/branches/agent-orchestrator-preflight": _FakeResponse(403),
+        }
+        monkeypatch.setattr("httpx.Client", _make_client(responses))
+
+        result = verify("github.com/owner/repo", token="ghp_fake")
+        slugs = [repo_verify.extract_warning_slug(w) for w in result.warnings]
+        assert repo_verify.REASON_BRANCH_PROTECTION_BLOCKED_PUSH not in slugs
+
+    def test_network_probe_ignores_http_5xx(self, monkeypatch):
+        """A 5xx HTTP response on /branches/<default> is NOT a transport error.
+
+        Spec: network_error covers *transport-layer* failure (DNS / refused /
+        TLS / timeout) — HTTP error codes are surfaced through the pass/fail
+        checks already.
+        """
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main": _FakeResponse(500, {"message": "ise"}),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(200, _good_protection()),
+            "/user": _FakeResponse(200, {"login": "owner"}),
+        }
+        monkeypatch.setattr("httpx.Client", _make_client(responses))
+
+        result = verify("github.com/owner/repo", token="ghp_fake")
+        slugs = [repo_verify.extract_warning_slug(w) for w in result.warnings]
+        assert repo_verify.REASON_NETWORK_ERROR not in slugs
+
+    def test_network_probe_handles_read_timeout(self, monkeypatch):
+        """Any httpx.RequestError subclass triggers network_error WARN.
+
+        ReadTimeout is a transport-layer failure (slow / unreachable host)
+        distinct from a slow-but-eventual HTTP response.
+        """
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(200, _good_protection()),
+            "/user": _FakeResponse(200, {"login": "owner"}),
+        }
+        boom = httpx.ReadTimeout("timed out reading from api.github.com")
+        client_cls = _make_client(responses, raise_for={"/repos/owner/repo/branches/main": boom})
+        monkeypatch.setattr("httpx.Client", client_cls)
+
+        result = verify("github.com/owner/repo", token="ghp_fake")
+        assert result.passed  # WARN-only
+        slugs = [repo_verify.extract_warning_slug(w) for w in result.warnings]
+        assert repo_verify.REASON_NETWORK_ERROR in slugs
+
+    def test_auth_failure_warn_names_missing_scope_and_present_scopes(self, monkeypatch):
+        """auth_failure WARN must be actionable: name which scopes are present.
+
+        Without that, the lead can't tell which PAT got loaded.
+        """
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(200, _good_protection()),
+            "/user": _FakeResponse(
+                200,
+                {"login": "owner"},
+                headers={"X-OAuth-Scopes": "gist, read:user"},
+            ),
+        }
+        monkeypatch.setattr("httpx.Client", _make_client(responses))
+
+        result = verify("github.com/owner/repo", token="ghp_fake")
+        auth_warns = [
+            w
+            for w in result.warnings
+            if repo_verify.extract_warning_slug(w) == repo_verify.REASON_AUTH_FAILURE
+        ]
+        assert len(auth_warns) == 1
+        # WARN mentions the missing required scope name.
+        assert "repo" in auth_warns[0]
+        # WARN includes one of the present scopes so the user knows what
+        # PAT is loaded (don't ship a probe whose output is just "broken").
+        assert "gist" in auth_warns[0] or "read:user" in auth_warns[0]
+
+
+class TestPreflightShortCircuit:
+    """When verify() short-circuits early, probes that come after must not fire."""
+
+    def test_probes_skipped_when_repo_not_found(self, monkeypatch):
+        """A 404 on /repos/<o>/<r> short-circuits — no probes ran, no slug WARNs.
+
+        Spec: WARN does not block, but neither should it appear when there's
+        nothing to probe yet (the token couldn't even see the repo). Bare
+        probe output in that case is noise, not signal.
+        """
+        responses = {
+            "/repos/owner/repo": _FakeResponse(404),
+        }
+        monkeypatch.setattr("httpx.Client", _make_client(responses))
+
+        result = verify("github.com/owner/repo", token="ghp_fake")
+        assert not result.passed
+        slugs = [repo_verify.extract_warning_slug(w) for w in result.warnings]
+        # None of the slugs fired — verify() returned before the probes ran.
+        for s in repo_verify.PREFLIGHT_REASON_SLUGS:
+            assert s not in slugs, f"probe slug {s} fired despite repo-404 short-circuit"
+
+
+class TestPreflightDoesNotBlockSpawnGating:
+    """WARN must not affect `result.passed` or `result.checks` membership.
+
+    Spec: "WARN does not block (planning continues; spawns are still gated
+    only on the existing pass/fail checks)."
+    """
+
+    def test_warn_does_not_add_failing_check(self, monkeypatch):
+        """A firing probe must only touch `warnings`, never `checks`."""
+        rule_payload = [{"type": "pull_request"}]
+        responses = {
+            "/repos/owner/repo": _FakeResponse(200, _good_repo_meta()),
+            "/repos/owner/repo/branches/main/protection": _FakeResponse(200, _good_protection()),
+            "/user": _FakeResponse(
+                200,
+                {"login": "owner"},
+                headers={"X-OAuth-Scopes": "gist"},
+            ),
+            "/rules/branches/agent-orchestrator-preflight": _FakeResponse(200, rule_payload),
+        }
+        monkeypatch.setattr("httpx.Client", _make_client(responses))
+
+        result = verify("github.com/owner/repo", token="ghp_fake")
+
+        # All probes fired into warnings, none of them registered as a check.
+        all_check_names = [c.name for c in result.checks]
+        for slug in repo_verify.PREFLIGHT_REASON_SLUGS:
+            assert slug not in all_check_names, (
+                f"probe slug {slug} leaked into result.checks: {all_check_names}"
+            )
+        # And `passed` is still True because every check passed.
+        assert result.passed
+        assert all(c.passed for c in result.checks)
+
+
+class TestFormatHintRendersConcreteCopy:
+    """Spec: the report's hint table renders the PREFLIGHT_HINTS copy directly.
+
+    Other surfaces (escalation summary, ntfy body) will import the same dict
+    and produce identical copy. If the formatter ever stops sourcing from
+    PREFLIGHT_HINTS (e.g., hardcodes its own strings), this test catches it.
+    """
+
+    def test_each_slugs_hint_copy_appears_when_that_slug_fires(self):
+        from orchestrator.models import CheckResult, VerificationResult
+
+        for slug in repo_verify.PREFLIGHT_REASON_SLUGS:
+            result = VerificationResult(
+                repo_url="https://github.com/o/r",
+                checks=[CheckResult("read access", True)],
+                warnings=[f"[{slug}] sample probe message"],
+            )
+            lines = repo_verify.format_result_lines(result)
+            joined = "\n".join(lines)
+            hint = repo_verify.PREFLIGHT_HINTS[slug]
+            # A non-trivial substring of the hint must appear in the output;
+            # asserts the formatter renders the shared copy rather than its own.
+            assert hint[:30] in joined, (
+                f"hint copy for {slug!r} missing from format_result_lines output"
+            )

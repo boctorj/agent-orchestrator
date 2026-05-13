@@ -179,6 +179,32 @@ blocked at GitHub layer:
 - **required status checks**: CI must pass before the PR can merge
   (informational — usually fine).
 
+### Verification shows a `pre-flight hints` table
+
+Tagged-slug warnings cover the planning-time-catchable subset of the
+BLOCKED-reason taxonomy. They're non-blocking — the repo is still
+verified and spawns will proceed — but they predict a class of failure
+the lead might otherwise discover only after burning a coder session:
+
+- **`branch_protection_blocked_push`** — a feature-branch ruleset
+  (separate from default-branch protection) requires PR review, so the
+  coder's `git push origin <branch>` will be rejected with 403
+  (`Changes must be made through a pull request`). Fix by scoping the
+  ruleset to `main` only, adding the orchestrator identity as a bypass
+  actor on the feature-branch ruleset, or issuing a bypass-capable PAT
+  for the spawn surface.
+- **`auth_failure`** — the classic PAT lacks `repo` (or `public_repo`)
+  scope. Spawn-time pushes and PR creation will 401/403. Re-issue the
+  PAT with the right scope; for App auth, grant Contents: write and
+  Pull requests: write on the installation.
+- **`network_error`** — a transport-layer failure reaching
+  `api.github.com` during the reachability probe. Check connectivity
+  (firewall, proxy, DNS); transient failures may resolve on retry,
+  persistent ones will block every spawn.
+
+`disk_full` / `rate_limited` and other runtime-only reasons aren't
+probed here — verify_repo can't see the future runtime environment.
+
 ---
 
 ## Agent execution
