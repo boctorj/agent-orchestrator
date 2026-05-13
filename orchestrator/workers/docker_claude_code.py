@@ -31,6 +31,13 @@ runtime invariants — every one of which has a regression test:
     JSON output; subsequent resumes pass `claude --resume <id>`.
     Persisting the session id in `state.db` is the caller's job; this
     module just surfaces it via the `Worker.spawn` return value.
+  * DNS allowlist (F-001-U-3). Every container launches with
+    `--dns=127.0.0.1 --dns-search=.`, pinning name resolution to the
+    dnsmasq sidecar (`scripts/run-worker-dns.sh`). Allowlist lives in
+    `orchestrator/network/allowlist.dnsmasq.conf`. The orch-net bridge
+    network is checked by the 4th doctor probe so a missing network
+    fails fast pre-flight instead of mid-spawn. SOFT BOUNDARY — raw-IP
+    egress is still possible; see SECURITY.md "Non-defenses".
 """
 
 from __future__ import annotations
@@ -56,11 +63,24 @@ LogFn = Callable[[str], None]
 # `ORCH_DOCKER_WORKER_IMAGE` if you ship custom images per environment.
 DEFAULT_IMAGE = "orchestrator/worker:latest"
 
-# Custom bridge network the worker containers attach to. Created out-of-band
-# (Phase 3 of the proposal wires up the dnsmasq sidecar); for the MVP we
-# just attach to a named network so a future allowlist resolver can sit
-# in front of every worker without code changes here.
+# Custom bridge network the worker containers attach to. F-001-U-3 wires
+# the dnsmasq sidecar in front of this network; `scripts/run-worker-dns.sh`
+# is the idempotent creator.
 DEFAULT_NETWORK = "orch-net"
+
+# Loopback resolver every worker container is pinned to. The dnsmasq
+# sidecar (scripts/run-worker-dns.sh) binds 127.0.0.1:5353 and answers
+# only for hosts on the allowlist (orchestrator/network/allowlist.dnsmasq.conf);
+# anything else resolves to 0.0.0.0 → outbound connect fails.
+#
+# SOFT BOUNDARY: this is name-level filtering. Raw-IP egress is still
+# possible — a compromised worker that hardcodes 8.8.8.8 can still
+# reach it. See SECURITY.md "Non-defenses".
+DEFAULT_DNS = "127.0.0.1"
+# Empty DNS search domain — stops glibc from appending `~/.local` or
+# the host's search-path entries to bare names. Forces every query
+# through dnsmasq verbatim.
+DEFAULT_DNS_SEARCH = "."
 
 # Host UID/GID the container runs as. Matches the `agent` user baked into
 # the Dockerfile.
@@ -328,13 +348,19 @@ class DoctorProbeResult:
 def run_doctor_probes(
     *,
     image: str = DEFAULT_IMAGE,
+    network: str = DEFAULT_NETWORK,
     run: SubprocessRunner | None = None,
 ) -> list[DoctorProbeResult]:
-    """Verify Docker daemon reachable, image present, claude CLI works.
+    """Verify Docker daemon, image, claude CLI, and the orch-net bridge.
 
     `run` is an injectable `subprocess.run`-shaped callable so tests can
     avoid invoking the real Docker daemon. Production code uses the
     real `subprocess.run`.
+
+    The 4th probe (orch-net network exists) is folded from PR #11
+    reviewer feedback: without it `audit.render()` would print
+    "Network: orch-net" like a fact but the actual spawn would error
+    with "network orch-net not found". Plug that gap pre-flight.
     """
     runner: SubprocessRunner = run if run is not None else subprocess.run
     results: list[DoctorProbeResult] = []
@@ -431,6 +457,36 @@ def run_doctor_probes(
             )
     except Exception as exc:  # noqa: BLE001
         results.append(DoctorProbeResult("claude --version inside container", False, str(exc)))
+
+    # 4) orch-net bridge network exists. Folded from PR #11 reviewer
+    # SUGGESTION 2: a missing network is the most-common spawn-time
+    # failure mode for users who skipped `scripts/run-worker-dns.sh`,
+    # and the audit's "Network: orch-net" line reads like a guarantee.
+    # Probe surfaces the gap pre-flight with a fix-it hint.
+    probe_name = f"network {network} exists"
+    try:
+        proc = runner(
+            ["docker", "network", "inspect", network, "--format", "{{.Name}}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if proc.returncode == 0:
+            results.append(DoctorProbeResult(probe_name, True, proc.stdout.strip() or network))
+        else:
+            results.append(
+                DoctorProbeResult(
+                    probe_name,
+                    False,
+                    (
+                        f"create with: docker network create {network} --driver bridge "
+                        f"(or run: scripts/run-worker-dns.sh)"
+                    ),
+                )
+            )
+    except Exception as exc:  # noqa: BLE001
+        results.append(DoctorProbeResult(probe_name, False, str(exc)))
     return results
 
 
@@ -453,6 +509,8 @@ class DockerClaudeCodeWorker:
     home_dir: Path = field(default_factory=Path.home)
     image: str = DEFAULT_IMAGE
     network: str = DEFAULT_NETWORK
+    dns: str = DEFAULT_DNS
+    dns_search: str = DEFAULT_DNS_SEARCH
     memory: str = DEFAULT_MEMORY
     cpus: str = DEFAULT_CPUS
     pids_limit: str = DEFAULT_PIDS_LIMIT
@@ -515,6 +573,12 @@ class DockerClaudeCodeWorker:
             f"--cpus={self.cpus}",
             f"--pids-limit={self.pids_limit}",
             f"--network={self.network}",
+            # ----- DNS allowlist (F-001-U-3) -----
+            # Pin every name resolution to the dnsmasq sidecar that
+            # enforces the worker allowlist. Raw-IP egress is still
+            # possible; see DEFAULT_DNS doc + SECURITY.md.
+            f"--dns={self.dns}",
+            f"--dns-search={self.dns_search}",
         ]
         if container_name:
             argv += ["--name", container_name]
@@ -691,6 +755,8 @@ __all__ = [
     "AGENT_GID",
     "AGENT_UID",
     "DEFAULT_CPUS",
+    "DEFAULT_DNS",
+    "DEFAULT_DNS_SEARCH",
     "DEFAULT_IMAGE",
     "DEFAULT_MEMORY",
     "DEFAULT_NETWORK",
