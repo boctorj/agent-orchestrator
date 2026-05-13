@@ -1,9 +1,10 @@
 """Tests for the `make_worker(role)` factory in orchestrator/workers.
 
-These cover the four cases called out in F-001-U-1:
+These cover the four cases called out in F-001-U-1 (with case (c)
+updated by F-001-U-2 once the docker backend landed):
   (a) `ORCH_WORKER_BACKEND` unset      → `ManagedAgentWorker`
   (b) `ORCH_WORKER_BACKEND=managed_agents` → `ManagedAgentWorker`
-  (c) `ORCH_WORKER_BACKEND=docker`     → `NotImplementedError`
+  (c) `ORCH_WORKER_BACKEND=docker`     → `DockerClaudeCodeWorker`
   (d) unknown backend value            → clear `ValueError`
 
 `ManagedAgentWorker.__init__` constructs an `Anthropic` client which would
@@ -16,7 +17,7 @@ from __future__ import annotations
 import pytest
 
 from orchestrator import workers
-from orchestrator.workers import ManagedAgentWorker, make_worker
+from orchestrator.workers import DockerClaudeCodeWorker, ManagedAgentWorker, make_worker
 
 
 @pytest.fixture
@@ -56,18 +57,15 @@ def test_managed_agents_backend_returns_managed_agent_worker(monkeypatch, _stub_
     assert worker.role == "tester"
 
 
-def test_docker_backend_raises_not_implemented(monkeypatch):
-    """(c) The `docker` backend is planned in F-001-U-2; until then the
-    factory raises `NotImplementedError` with a pointer to the unit."""
+def test_docker_backend_returns_docker_worker(monkeypatch):
+    """(c) After F-001-U-2, `ORCH_WORKER_BACKEND=docker` returns the
+    `DockerClaudeCodeWorker` implementation; it no longer raises."""
     monkeypatch.setenv("ORCH_WORKER_BACKEND", "docker")
 
-    with pytest.raises(NotImplementedError) as excinfo:
-        make_worker("coder")
+    worker = make_worker("coder")
 
-    # Error message should name the unit / next step rather than be cryptic.
-    msg = str(excinfo.value)
-    assert "docker" in msg.lower()
-    assert "F-001-U-2" in msg
+    assert isinstance(worker, DockerClaudeCodeWorker)
+    assert worker.role == "coder"
 
 
 def test_unknown_backend_raises_clear_value_error(monkeypatch):
