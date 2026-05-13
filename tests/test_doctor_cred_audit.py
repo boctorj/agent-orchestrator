@@ -271,9 +271,12 @@ def test_doctor_warns_when_repo_needs_registry_passthrough(
 
     monkeypatch.setenv("ORCH_WORKER_BACKEND", "docker")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake")
-    # Force a clean HOME so no ~/.npmrc silences the warning.
+    # Force a clean home so no real ~/.npmrc / .docker/config.json silences
+    # the warning. Patch Path.home() directly — setting $HOME alone isn't
+    # enough on Windows, where Path.home() reads $USERPROFILE.
     clean_home = tmp_path / "clean-home"
     clean_home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: clean_home)
     monkeypatch.setenv("HOME", str(clean_home))
     monkeypatch.delenv("ORCH_WORKER_EXTRA_MOUNTS", raising=False)
 
