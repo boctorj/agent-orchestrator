@@ -303,7 +303,7 @@ def doctor() -> None:
 
         console.print()
         console.print("[bold]Docker worker probes[/bold]")
-        for probe in run_doctor_probes(image=audit.image):
+        for probe in run_doctor_probes(image=audit.image, network=audit.network):
             report(probe.name, probe.ok, probe.detail)
     else:
         report(

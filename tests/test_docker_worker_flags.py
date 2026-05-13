@@ -26,6 +26,8 @@ from orchestrator.workers.docker_claude_code import (
     AGENT_GID,
     AGENT_UID,
     DEFAULT_CPUS,
+    DEFAULT_DNS,
+    DEFAULT_DNS_SEARCH,
     DEFAULT_MEMORY,
     DEFAULT_NETWORK,
     DEFAULT_PIDS_LIMIT,
@@ -76,6 +78,9 @@ def _flag_in_argv(argv: list[str], flag: str) -> bool:
         f"--cpus={DEFAULT_CPUS}",
         f"--pids-limit={DEFAULT_PIDS_LIMIT}",
         f"--network={DEFAULT_NETWORK}",
+        # F-001-U-3 — DNS allowlist sidecar
+        f"--dns={DEFAULT_DNS}",
+        f"--dns-search={DEFAULT_DNS_SEARCH}",
     ],
 )
 def test_hardening_flag_present(request, argv_fixture, flag):
