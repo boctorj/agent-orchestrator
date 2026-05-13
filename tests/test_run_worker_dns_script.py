@@ -100,7 +100,7 @@ def test_script_runs_dnsmasq_in_foreground(script_text: str):
 
 
 # ---------------------------------------------------------------------------
-# Network bridge — the idempotent guard (folded from PR #11 reviewer).
+# Network bridge — the idempotent guard.
 # ---------------------------------------------------------------------------
 
 

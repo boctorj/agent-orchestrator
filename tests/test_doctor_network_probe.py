@@ -1,8 +1,7 @@
 """Doctor's fourth probe: the orch-net Docker network exists (F-001-U-3).
 
-Folded from PR #11 reviewer SUGGESTION 2: `audit.render()` prints
-'Network: orch-net' like a fact, but if the user skipped
-`scripts/run-worker-dns.sh` the spawn errors with
+`audit.render()` prints 'Network: orch-net' like a fact, but if the user
+skipped `scripts/run-worker-dns.sh` the spawn errors with
 'network orch-net not found'. The probe surfaces the gap pre-flight.
 
 The probe runs `docker network inspect <name>` and reports pass/fail

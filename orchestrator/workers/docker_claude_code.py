@@ -357,10 +357,10 @@ def run_doctor_probes(
     avoid invoking the real Docker daemon. Production code uses the
     real `subprocess.run`.
 
-    The 4th probe (orch-net network exists) is folded from PR #11
-    reviewer feedback: without it `audit.render()` would print
-    "Network: orch-net" like a fact but the actual spawn would error
-    with "network orch-net not found". Plug that gap pre-flight.
+    The 4th probe (orch-net network exists) plugs a pre-flight gap:
+    without it `audit.render()` would print "Network: orch-net" like a
+    fact but the actual spawn would error with
+    "network orch-net not found".
     """
     runner: SubprocessRunner = run if run is not None else subprocess.run
     results: list[DoctorProbeResult] = []
@@ -458,11 +458,11 @@ def run_doctor_probes(
     except Exception as exc:  # noqa: BLE001
         results.append(DoctorProbeResult("claude --version inside container", False, str(exc)))
 
-    # 4) orch-net bridge network exists. Folded from PR #11 reviewer
-    # SUGGESTION 2: a missing network is the most-common spawn-time
-    # failure mode for users who skipped `scripts/run-worker-dns.sh`,
-    # and the audit's "Network: orch-net" line reads like a guarantee.
-    # Probe surfaces the gap pre-flight with a fix-it hint.
+    # 4) orch-net bridge network exists. A missing network is the
+    # most-common spawn-time failure mode for users who skipped
+    # `scripts/run-worker-dns.sh`, and the audit's "Network: orch-net"
+    # line reads like a guarantee. Probe surfaces the gap pre-flight
+    # with a fix-it hint.
     probe_name = f"network {network} exists"
     try:
         proc = runner(
