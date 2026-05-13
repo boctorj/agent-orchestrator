@@ -19,16 +19,17 @@ import pytest
 from click.testing import CliRunner
 
 from orchestrator.cli import cli
-from orchestrator.workers.docker_claude_code import (
-    NEVER_MOUNTED_HOST_PATHS,
-    build_cred_audit,
-)
+from orchestrator.workers.docker_claude_code import build_cred_audit
 
 # ---------------------------------------------------------------------------
 # Common fixture inputs — render against fixed values so snapshots are stable.
 # ---------------------------------------------------------------------------
 
 
+# Intentional non-existent home path: with the F-001-U-4 receipt fix
+# (PR #11 review SUGGESTION 3) the audit only lists NEVER-MOUNTED paths
+# that actually exist on the host. /home/lead doesn't exist on the test
+# machine, so the NEVER list correctly renders as "(none present on host)".
 HOME = Path("/home/lead")
 WORKDIR = Path("/repo")
 IMAGE = "orchestrator/worker:latest"
@@ -91,7 +92,8 @@ def test_audit_api_key_mode_snapshot():
             "  + tmpfs -> /home/agent/.cache (rw, 512M)",
             "",
             "Paths NEVER mounted (host has them, worker will NOT see them):",
-            *[f"  - {p}" for p in NEVER_MOUNTED_HOST_PATHS],
+            # F-001-U-4: filtered by existence — HOME=/home/lead has none.
+            "  (none present on host)",
         ]
     )
     assert rendered == expected, (
@@ -143,7 +145,8 @@ def test_audit_oauth_mode_snapshot():
             "  + tmpfs -> /home/agent/.cache (rw, 512M)",
             "",
             "Paths NEVER mounted (host has them, worker will NOT see them):",
-            *[f"  - {p}" for p in NEVER_MOUNTED_HOST_PATHS],
+            # F-001-U-4: filtered by existence — HOME=/home/lead has none.
+            "  (none present on host)",
         ]
     )
     assert rendered == expected, (
@@ -245,6 +248,39 @@ def test_doctor_renders_cred_audit_under_docker_backend(
     assert "docker daemon reachable" in result.output
     assert "image " in result.output  # "image orchestrator/worker:latest built"
     assert "claude --version inside container" in result.output
+
+
+def test_doctor_warns_when_repo_needs_registry_passthrough(
+    monkeypatch, tmp_path, fake_httpx_get, stub_docker_subprocess
+):
+    """F-001-U-4: a repo whose `package.json` declares an internal
+    registry but has no passthrough wired surfaces a yellow warning
+    in the doctor output."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=sk-ant-fake\nGITHUB_TOKEN=github_pat_fake\n")
+    (tmp_path / ".mcp.json").write_text('{"mcpServers": {}}')
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "agent-orchestrator"\n')
+    (tmp_path / "package.json").write_text(
+        '{"name": "test", "registry": "https://artifactory.internal/repo/"}'
+    )
+    db_file = tmp_path / "state.db"
+    monkeypatch.setattr("orchestrator.state.STATE_DB", db_file)
+    from orchestrator import state
+
+    state.init_db()
+
+    monkeypatch.setenv("ORCH_WORKER_BACKEND", "docker")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake")
+    # Force a clean HOME so no ~/.npmrc silences the warning.
+    clean_home = tmp_path / "clean-home"
+    clean_home.mkdir()
+    monkeypatch.setenv("HOME", str(clean_home))
+    monkeypatch.delenv("ORCH_WORKER_EXTRA_MOUNTS", raising=False)
+
+    result = CliRunner().invoke(cli, ["doctor"])
+    assert "Internal-registry passthrough" in result.output
+    assert "package.json" in result.output
+    assert "artifactory.internal" in result.output
 
 
 def test_doctor_skips_audit_under_managed_agents_backend(monkeypatch, tmp_path, fake_httpx_get):

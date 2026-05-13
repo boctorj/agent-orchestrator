@@ -33,15 +33,14 @@ from orchestrator.workers.docker_claude_code import (
     DEFAULT_PIDS_LIMIT,
     DockerClaudeCodeWorker,
 )
+from tests.conftest import _make_worker  # _FakeProc not used here, just _make_worker
 
 
 @pytest.fixture
 def worker(tmp_path: Path) -> DockerClaudeCodeWorker:
-    fake_home = tmp_path / "home"
-    (fake_home / ".claude" / "sessions").mkdir(parents=True)
-    workdir = tmp_path / "work"
-    workdir.mkdir()
-    return DockerClaudeCodeWorker(role="coder", workdir=workdir, home_dir=fake_home)
+    # Thin alias for the shared `_make_worker` helper so existing
+    # `argv_oauth` / `argv_api_key` fixtures keep their names.
+    return _make_worker(tmp_path)
 
 
 @pytest.fixture

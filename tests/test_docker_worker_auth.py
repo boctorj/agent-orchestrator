@@ -16,31 +16,14 @@ spawn time per the unit description ("Log chosen mode at spawn").
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
-from orchestrator.workers.docker_claude_code import (
-    DockerClaudeCodeWorker,
-    select_auth_mode,
-)
+from orchestrator.workers.docker_claude_code import select_auth_mode
+from tests.conftest import _FakeProc, _make_worker
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers (worker factory + subprocess stub live in tests/conftest.py).
 # ---------------------------------------------------------------------------
-
-
-def _make_worker(tmp_path: Path) -> DockerClaudeCodeWorker:
-    """Build a worker rooted in a tmp HOME so mount paths are deterministic."""
-    fake_home = tmp_path / "home"
-    (fake_home / ".claude" / "sessions").mkdir(parents=True)
-    workdir = tmp_path / "work"
-    workdir.mkdir()
-    return DockerClaudeCodeWorker(
-        role="coder",
-        workdir=workdir,
-        home_dir=fake_home,
-    )
 
 
 def _argv_contains_mount(argv: list[str], substr: str) -> bool:
@@ -226,12 +209,6 @@ class TestSessionsMount:
 
 
 # ---------------------------------------------------------------------------
-# Fake subprocess result used by the log-line tests above.
+# Fake subprocess result used by the log-line tests above lives in
+# tests/conftest.py (imported as `_FakeProc` at the top of this file).
 # ---------------------------------------------------------------------------
-
-
-class _FakeProc:
-    def __init__(self, *, stdout: str = "", stderr: str = "", returncode: int = 0):
-        self.stdout = stdout
-        self.stderr = stderr
-        self.returncode = returncode
