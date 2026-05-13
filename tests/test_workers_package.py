@@ -11,10 +11,11 @@ the structural promises ("pure refactor, no behavior change"):
     * `orchestrator.agents` keeps re-exporting `Worker` and
       `ManagedAgentWorker` so existing import sites do not break.
 
-  Behavioral (the four cases the unit description spells out):
+  Behavioral (the four cases the unit description spells out;
+  case (c) updated by F-001-U-2 once the docker backend landed):
     (a) `ORCH_WORKER_BACKEND` unset             -> ManagedAgentWorker
     (b) `ORCH_WORKER_BACKEND=managed_agents`    -> ManagedAgentWorker
-    (c) `ORCH_WORKER_BACKEND=docker`            -> NotImplementedError
+    (c) `ORCH_WORKER_BACKEND=docker`            -> DockerClaudeCodeWorker
     (d) any other value                         -> clear error
 
   Edge case:
@@ -153,17 +154,16 @@ class TestMakeWorkerFactory:
 
         assert isinstance(worker, ManagedAgentWorker)
 
-    # (c) docker -> NotImplementedError (until U-2 lands)
-    def test_docker_value_raises_not_implemented(self, monkeypatch):
-        from orchestrator.workers import make_worker
+    # (c) docker -> DockerClaudeCodeWorker (since F-001-U-2)
+    def test_docker_value_returns_docker_worker(self, monkeypatch):
+        from orchestrator.workers import DockerClaudeCodeWorker, make_worker
 
         monkeypatch.setenv("ORCH_WORKER_BACKEND", "docker")
 
-        with pytest.raises(NotImplementedError) as excinfo:
-            make_worker("coder")
+        worker = make_worker("coder")
 
-        # The message should orient the user, not be cryptic.
-        assert "docker" in str(excinfo.value).lower()
+        assert isinstance(worker, DockerClaudeCodeWorker)
+        assert worker.role == "coder"
 
     # (d) unknown -> clear error
     def test_unknown_backend_raises_with_actionable_message(self, monkeypatch):

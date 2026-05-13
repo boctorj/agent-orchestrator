@@ -9,8 +9,10 @@ Supported backends:
 
   - `managed_agents` (default): `ManagedAgentWorker` against Anthropic
     Managed Agents.
-  - `docker`: planned in F-001-U-2. Raises `NotImplementedError` until
-    that unit lands.
+  - `docker`: `DockerClaudeCodeWorker` against a locally-managed
+    `orchestrator/worker:latest` container image. See
+    `orchestrator.workers.docker_claude_code` and
+    `docs/PROPOSAL-docker-workers.md` for the threat model.
 
 Any other value raises a `ValueError` naming the supported options.
 """
@@ -20,6 +22,7 @@ from __future__ import annotations
 import os
 
 from orchestrator.workers.base import Worker
+from orchestrator.workers.docker_claude_code import DockerClaudeCodeWorker
 from orchestrator.workers.managed_agent import ManagedAgentWorker
 
 DEFAULT_BACKEND = "managed_agents"
@@ -28,7 +31,14 @@ DEFAULT_BACKEND = "managed_agents"
 # and `docs/PROPOSAL-docker-workers.md`.
 KNOWN_BACKENDS = frozenset({"managed_agents", "docker"})
 
-__all__ = ["DEFAULT_BACKEND", "KNOWN_BACKENDS", "ManagedAgentWorker", "Worker", "make_worker"]
+__all__ = [
+    "DEFAULT_BACKEND",
+    "KNOWN_BACKENDS",
+    "DockerClaudeCodeWorker",
+    "ManagedAgentWorker",
+    "Worker",
+    "make_worker",
+]
 
 
 def make_worker(role: str) -> Worker:
@@ -36,7 +46,7 @@ def make_worker(role: str) -> Worker:
 
     Backend selection:
       - unset or `managed_agents` → `ManagedAgentWorker` (default).
-      - `docker` → raises `NotImplementedError` (planned in F-001-U-2).
+      - `docker` → `DockerClaudeCodeWorker`.
       - anything else → raises `ValueError` listing supported values.
     """
     backend = os.getenv("ORCH_WORKER_BACKEND", DEFAULT_BACKEND)
@@ -44,10 +54,7 @@ def make_worker(role: str) -> Worker:
     if backend == "managed_agents":
         return ManagedAgentWorker(role=role)
     if backend == "docker":
-        raise NotImplementedError(
-            "ORCH_WORKER_BACKEND='docker' is planned in F-001-U-2; "
-            "use 'managed_agents' (default) until then."
-        )
+        return DockerClaudeCodeWorker(role=role)
     raise ValueError(
         f"Unknown ORCH_WORKER_BACKEND value: {backend!r}. "
         f"Supported values: {sorted(KNOWN_BACKENDS)}."
