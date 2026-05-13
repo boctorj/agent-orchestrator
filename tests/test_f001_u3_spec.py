@@ -165,10 +165,7 @@ def test_package_manager_hosts_constant_matches_spec():
         "pypi.org",
         "files.pythonhosted.org",
         "registry.npmjs.org",
-    }, (
-        "PACKAGE_MANAGER_HOSTS must exactly match the 3 hosts the "
-        "F-001-U-3 unit description names"
-    )
+    }, "PACKAGE_MANAGER_HOSTS must exactly match the 3 hosts the F-001-U-3 unit description names"
 
 
 # =============================================================================
@@ -412,9 +409,7 @@ def test_doctor_runs_network_inspect_subprocess_with_correct_argv(fake_docker_on
     run_doctor_probes(image=DEFAULT_IMAGE, network=DEFAULT_NETWORK, run=_run)
     inspect_calls = [c for c in captured if c[:3] == ["docker", "network", "inspect"]]
     assert inspect_calls, f"probe never invoked `docker network inspect`; calls: {captured!r}"
-    assert "orch-net" in inspect_calls[0], (
-        f"probe inspected wrong network: {inspect_calls[0]!r}"
-    )
+    assert "orch-net" in inspect_calls[0], f"probe inspected wrong network: {inspect_calls[0]!r}"
 
 
 def test_doctor_network_probe_passes_on_returncode_zero(fake_docker_on_path):
@@ -430,9 +425,7 @@ def test_doctor_network_probe_fails_on_nonzero_returncode(fake_docker_on_path):
     """`returncode != 0` (e.g. `Error: No such network: orch-net`) →
     probe MUST report failure. This is the bug the probe was folded
     in to catch (PR #11 reviewer SUGGESTION 2)."""
-    runner = _make_happy_runner(
-        network_returncode=1, stderr="Error: No such network: orch-net"
-    )
+    runner = _make_happy_runner(network_returncode=1, stderr="Error: No such network: orch-net")
     results = run_doctor_probes(image=DEFAULT_IMAGE, network=DEFAULT_NETWORK, run=runner)
     probe = _find_probe(results, "network")
     assert probe.ok is False, f"expected ok=False; got {probe!r}"
@@ -442,9 +435,7 @@ def test_doctor_network_probe_failure_gives_actionable_fix_it(fake_docker_on_pat
     """A failing probe must tell the user how to fix it — either name
     the `docker network create` command or point at the launcher
     script. Without a fix-it the doctor surface is just blame."""
-    runner = _make_happy_runner(
-        network_returncode=1, stderr="Error: No such network: orch-net"
-    )
+    runner = _make_happy_runner(network_returncode=1, stderr="Error: No such network: orch-net")
     results = run_doctor_probes(image=DEFAULT_IMAGE, network=DEFAULT_NETWORK, run=runner)
     probe = _find_probe(results, "network")
     detail = probe.detail.lower()
@@ -464,9 +455,7 @@ def test_doctor_network_probe_runs_after_image_and_claude(fake_docker_on_path):
     # Network probe must come AFTER image + claude.
     image_idx = next(i for i, n in enumerate(names) if "image" in n)
     claude_idx = next(i for i, n in enumerate(names) if "claude" in n)
-    network_idx = next(
-        i for i, n in enumerate(names) if "network" in n and DEFAULT_NETWORK in n
-    )
+    network_idx = next(i for i, n in enumerate(names) if "network" in n and DEFAULT_NETWORK in n)
     assert image_idx < network_idx, f"network probe must come after image: {names!r}"
     assert claude_idx < network_idx, f"network probe must come after claude: {names!r}"
 
