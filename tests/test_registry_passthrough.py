@@ -208,6 +208,93 @@ class TestExtraMounts:
 
 
 # ---------------------------------------------------------------------------
+# (c2) ORCH_WORKER_EXTRA_MOUNTS NEVER_MOUNT guard (PR #14 review C4).
+# A user-supplied path that resolves into a NEVER_MOUNTED_HOST_PATHS entry
+# must be rejected with a clear error rather than silently bind-mounted.
+# ---------------------------------------------------------------------------
+
+
+class TestExtraMountsNeverMountGuard:
+    @pytest.mark.parametrize(
+        ("never_spec", "never_kind", "rel_payload"),
+        [
+            (".ssh", "dir", ".ssh"),  # exact match — `~/.ssh`
+            (".ssh", "dir", ".ssh/id_rsa"),  # under `~/.ssh`
+            (".aws", "dir", ".aws"),
+            (".aws", "dir", ".aws/credentials"),
+            (".config/gcloud", "dir", ".config/gcloud"),
+            (".kube", "dir", ".kube/config"),
+            (".gitconfig", "file", ".gitconfig"),
+            (".git-credentials", "file", ".git-credentials"),
+        ],
+    )
+    def test_rejects_path_at_or_under_never_entry(
+        self,
+        tmp_path: Path,
+        never_spec: str,
+        never_kind: str,
+        rel_payload: str,
+    ) -> None:
+        worker = _make_worker(tmp_path)
+        # Materialize the NEVER path on the host using the declared
+        # kind so resolve() has something to point at.
+        never_path = worker.home_dir / never_spec
+        if never_kind == "file":
+            never_path.parent.mkdir(parents=True, exist_ok=True)
+            never_path.write_text("# never")
+        else:
+            never_path.mkdir(parents=True, exist_ok=True)
+
+        payload = worker.home_dir / rel_payload
+        if not payload.exists():
+            payload.parent.mkdir(parents=True, exist_ok=True)
+            payload.write_text("# bait")
+
+        with pytest.raises(ValueError, match=r"never-mounted"):
+            worker.build_docker_argv(
+                ["claude", "-p", "x"],
+                host_env={
+                    "GITHUB_TOKEN": "ghp_x",
+                    "ORCH_WORKER_EXTRA_MOUNTS": str(payload),
+                },
+            )
+
+    def test_safe_extra_mount_alongside_never_path_still_accepted(
+        self, tmp_path: Path
+    ) -> None:
+        """Sanity: a benign mount sibling to a NEVER path must still
+        work. Guard rejects only entries that resolve INTO a NEVER path."""
+        worker = _make_worker(tmp_path)
+        (worker.home_dir / ".ssh").mkdir()  # NEVER path materialized
+        safe = worker.home_dir / ".gemrc"
+        safe.write_text("# fake")
+
+        argv = worker.build_docker_argv(
+            ["claude", "-p", "x"],
+            host_env={
+                "GITHUB_TOKEN": "ghp_x",
+                "ORCH_WORKER_EXTRA_MOUNTS": str(safe),
+            },
+        )
+        assert _has_ro_mount(argv, safe)
+
+    def test_rejects_tilde_form_pointing_at_never_path(self, tmp_path: Path) -> None:
+        """`~/.ssh` (the tilde form) must be rejected just like the
+        fully-resolved absolute path — the validator runs after `~`
+        expansion."""
+        worker = _make_worker(tmp_path)
+        (worker.home_dir / ".ssh").mkdir()
+        with pytest.raises(ValueError, match=r"never-mounted"):
+            worker.build_docker_argv(
+                ["claude", "-p", "x"],
+                host_env={
+                    "GITHUB_TOKEN": "ghp_x",
+                    "ORCH_WORKER_EXTRA_MOUNTS": "~/.ssh",
+                },
+            )
+
+
+# ---------------------------------------------------------------------------
 # (d) Repo with package.json `"registry"` but no passthrough -> doctor warn.
 # ---------------------------------------------------------------------------
 
