@@ -2,6 +2,19 @@
 
 Reads-only — none of these fixtures touch the real `state.db` in the
 project root. Every test runs against a temporary SQLite file.
+
+This module also exposes the docker-worker test helpers shared across
+`tests/test_docker_worker_{auth,session,cred_boundary,flags,tester}.py`
+and `tests/test_registry_passthrough.py`:
+
+  * `_FakeProc` — minimal `CompletedProcess` look-alike used to stub
+    `subprocess.run` without invoking real Docker.
+  * `_make_worker(tmp_path)` — builds a `DockerClaudeCodeWorker` rooted
+    in a deterministic tmp HOME so mount paths are reproducible.
+
+Originally each docker-worker test file defined its own copies (per PR
+#11 review SUGGESTION 4); hoisted here so a future tweak to the helper
+shape lands in one place.
 """
 
 from __future__ import annotations
@@ -9,6 +22,8 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+
+from orchestrator.workers.docker_claude_code import DockerClaudeCodeWorker
 
 
 @pytest.fixture
@@ -103,3 +118,45 @@ def no_ntfy_topic(monkeypatch):
 def with_ntfy_topic(monkeypatch):
     """Set a fake NTFY_TOPIC."""
     monkeypatch.setenv("NTFY_TOPIC", "test-topic-do-not-use")
+
+
+# ---------------------------------------------------------------------------
+# Docker-worker test helpers — shared by every tests/test_docker_worker_*.py
+# file and by tests/test_registry_passthrough.py. Kept here rather than
+# duplicated per file (PR #11 review SUGGESTION 4, folded into F-001-U-4).
+# ---------------------------------------------------------------------------
+
+
+class _FakeProc:
+    """Minimal `subprocess.CompletedProcess`-shaped stub for runner injection.
+
+    Accepts every field as a keyword argument (matches every previously-
+    duplicated `_FakeProc` definition's call sites). All fields default
+    to a benign success: empty stdout/stderr, returncode 0.
+    """
+
+    def __init__(
+        self,
+        *,
+        stdout: str = "",
+        stderr: str = "",
+        returncode: int = 0,
+    ) -> None:
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+
+
+def _make_worker(tmp_path: Path) -> DockerClaudeCodeWorker:
+    """Build a `DockerClaudeCodeWorker` rooted in a tmp HOME.
+
+    Creates a fake ``home/.claude/sessions`` directory (the writable
+    session bind-mount source the worker assumes exists) and a fresh
+    ``work`` directory used as the worker's workdir. Role defaults to
+    ``coder`` since the role string is irrelevant to argv assertions.
+    """
+    fake_home = tmp_path / "home"
+    (fake_home / ".claude" / "sessions").mkdir(parents=True)
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    return DockerClaudeCodeWorker(role="coder", workdir=workdir, home_dir=fake_home)

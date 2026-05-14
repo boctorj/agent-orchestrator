@@ -40,25 +40,11 @@ from orchestrator.workers.docker_claude_code import (
     build_cred_audit,
     select_auth_mode,
 )
+from tests.conftest import _FakeProc, _make_worker
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers (worker factory + subprocess stub live in tests/conftest.py).
 # ---------------------------------------------------------------------------
-
-
-def _make_worker(tmp_path: Path) -> DockerClaudeCodeWorker:
-    fake_home = tmp_path / "home"
-    (fake_home / ".claude" / "sessions").mkdir(parents=True)
-    workdir = tmp_path / "work"
-    workdir.mkdir()
-    return DockerClaudeCodeWorker(role="coder", workdir=workdir, home_dir=fake_home)
-
-
-class _FakeProc:
-    def __init__(self, *, stdout: str = "", stderr: str = "", returncode: int = 0):
-        self.stdout = stdout
-        self.stderr = stderr
-        self.returncode = returncode
 
 
 def _mount_values(argv: list[str]) -> list[str]:

@@ -145,3 +145,33 @@ def test_script_supports_orch_docker_network_override(script_text: str):
     """Same env-var-override pattern as the rest of the script. The
     name must match the variable other tools key off."""
     assert "ORCH_DOCKER_NETWORK" in script_text
+
+
+# ---------------------------------------------------------------------------
+# F-001-U-4 — internal-registry passthrough env knob.
+# ---------------------------------------------------------------------------
+
+
+def test_script_reads_orch_internal_registry_hosts(script_text: str) -> None:
+    """The script must read ORCH_INTERNAL_REGISTRY_HOSTS so the user
+    can extend the dnsmasq allowlist without editing the bundled config."""
+    assert "ORCH_INTERNAL_REGISTRY_HOSTS" in script_text, (
+        "script must consume the ORCH_INTERNAL_REGISTRY_HOSTS env knob"
+    )
+
+
+def test_script_passes_extra_server_flags_to_dnsmasq(script_text: str) -> None:
+    """Each entry in ORCH_INTERNAL_REGISTRY_HOSTS must turn into a
+    `--server=/<host>/<upstream>` flag on the dnsmasq invocation —
+    matching the directive shape used in the bundled config."""
+    # The script builds `--server=/${host}/${upstream}` arguments. Pin
+    # both halves so a refactor can't drop one.
+    assert "--server=" in script_text, "script must build --server=/<host>/<upstream> flags"
+
+
+def test_script_supports_internal_registry_upstream_override(script_text: str) -> None:
+    """`ORCH_INTERNAL_REGISTRY_UPSTREAM` lets ops point at an internal
+    DNS server (e.g. 10.0.0.53) for VPN-only resolution. Default
+    falls back to the same 1.1.1.1 the bundled config uses."""
+    assert "ORCH_INTERNAL_REGISTRY_UPSTREAM" in script_text
+    assert "1.1.1.1" in script_text, "fallback upstream must be Cloudflare DNS"

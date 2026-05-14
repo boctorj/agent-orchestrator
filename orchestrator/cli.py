@@ -292,6 +292,7 @@ def doctor() -> None:
     backend = os.environ.get("ORCH_WORKER_BACKEND", "managed_agents")
     if backend == "docker":
         from orchestrator.workers.docker_claude_code import (
+            audit_registry_passthrough_for_repo,
             build_cred_audit,
             run_doctor_probes,
         )
@@ -305,6 +306,19 @@ def doctor() -> None:
         console.print("[bold]Docker worker probes[/bold]")
         for probe in run_doctor_probes(image=audit.image, network=audit.network):
             report(probe.name, probe.ok, probe.detail)
+
+        # F-001-U-4: warn if the CWD looks like a repo that needs
+        # internal-registry passthrough but no passthrough is wired.
+        # Heuristic: package.json with `"registry"` field OR requirements.txt
+        # with `--index-url <private-host>`. The doctor command runs in
+        # the user's working directory, so the CWD doubles as "the repo
+        # they probably want to spawn against".
+        passthrough_warnings = audit_registry_passthrough_for_repo(Path.cwd())
+        if passthrough_warnings:
+            console.print()
+            console.print("[bold yellow]Internal-registry passthrough[/bold yellow]")
+            for warning in passthrough_warnings:
+                console.print(f"  [yellow]![/yellow] {warning}")
     else:
         report(
             f"Worker backend: {backend}",

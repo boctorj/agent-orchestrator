@@ -23,6 +23,7 @@ from orchestrator.workers.docker_claude_code import (
     DockerClaudeCodeWorker,
     extract_session_id,
 )
+from tests.conftest import _FakeProc, _make_worker
 
 # ---------------------------------------------------------------------------
 # extract_session_id — formats it must handle.
@@ -80,18 +81,9 @@ class TestExtractSessionId:
 
 @pytest.fixture
 def worker(tmp_path: Path) -> DockerClaudeCodeWorker:
-    fake_home = tmp_path / "home"
-    (fake_home / ".claude" / "sessions").mkdir(parents=True)
-    workdir = tmp_path / "work"
-    workdir.mkdir()
-    return DockerClaudeCodeWorker(role="coder", workdir=workdir, home_dir=fake_home)
-
-
-class _FakeProc:
-    def __init__(self, stdout: str = "", returncode: int = 0, stderr: str = ""):
-        self.stdout = stdout
-        self.stderr = stderr
-        self.returncode = returncode
+    # Thin wrapper around the shared `_make_worker` helper so the existing
+    # fixture name (`worker`) keeps working in the parameterized tests below.
+    return _make_worker(tmp_path)
 
 
 class TestResumeRenders:

@@ -128,8 +128,18 @@ SENSITIVE_ENV_NAMES = (
     "PATH",
 )
 
-# Host paths the worker NEVER mounts into the container. Surfaced verbatim
-# by `doctor` so the user can audit the boundary at a glance.
+# Host paths the worker NEVER mounts into the container. Surfaced by
+# `doctor` so the user can audit the boundary at a glance.
+#
+# CRED AUDIT RECEIPT FIX (F-001-U-4, folded from PR #11 review
+# SUGGESTION 3): the audit only lists paths from this tuple that
+# actually exist on the host, so the "host has them" qualifier in the
+# rendered heading is accurate.
+#
+# Note: ~/.npmrc and ~/.docker — previously listed here in U-2 — moved
+# to AUTO_MOUNT_REGISTRY_PATHS below in U-4. They are now mounted
+# read-only when present so internal-registry passthrough works
+# out-of-the-box. See AUTO_MOUNT_REGISTRY_PATHS for the rationale.
 NEVER_MOUNTED_HOST_PATHS = (
     "~/.ssh",
     "~/.aws",
@@ -137,9 +147,53 @@ NEVER_MOUNTED_HOST_PATHS = (
     "~/.kube",
     "~/.gitconfig",
     "~/.git-credentials",
-    "~/.npmrc",
-    "~/.docker",
 )
+
+# Internal-registry config files auto-mounted (read-only) into the
+# worker container WHEN they exist on the host. No flag needed — the
+# default-on behavior makes `npm install`, `pip install`, and
+# `docker pull` against an internal artifactory / private PyPI /
+# private container registry "just work" from inside the worker.
+#
+# Read-only: workers never need to mutate these files. Read-write
+# would also broaden the blast radius if a worker is compromised
+# (it could rewrite the user's auth config and have it persist
+# across sessions).
+#
+# Runtime bind-mount semantics (PR #14 review C2): at container start,
+# the host file is bind-mounted verbatim — the container sees an exact
+# read-only view of whatever's on the host at that path, evaluated
+# fresh on every spawn. There's no build-time copy; the worker image
+# itself ships no registry credentials. If the host file is missing,
+# the mount is silently skipped (see `_auto_mounted_registry_paths`).
+# Container-side mount target mirrors the same relative path under
+# /home/agent/, since the agent UID matches the in-container HOME.
+#
+# Blast radius (PR #14 review C1): these files commonly hold bearer
+# tokens — `_authToken=…` in .npmrc, `auths.<host>.auth` base64-creds
+# in .docker/config.json, and pip `extra-index-url=https://user:pass@…`
+# in pip.conf. The worker container can READ them — necessary for
+# `npm install` against an internal registry to authenticate — and
+# can therefore exfiltrate them within the limits of the dnsmasq DNS
+# allowlist (raw-IP egress remains possible; see SECURITY.md). Trust
+# model: the agent runs at the same trust level as the user invoking
+# the orchestrator. Mounting these files into the worker is no broader
+# than the user running `npm install` themselves; it just removes the
+# need for the user to paste credentials into a worker-specific config.
+# Read-only enforcement plus the cred-audit receipts (see CredAudit.
+# render — it enumerates every mounted path so the user can see what
+# crossed the boundary on each spawn) are the layered defenses here.
+AUTO_MOUNT_REGISTRY_PATHS: tuple[str, ...] = (
+    "~/.npmrc",
+    "~/.pip/pip.conf",
+    "~/.docker/config.json",
+)
+
+# Env var names that the worker consults for additional passthrough.
+# Both are comma-separated lists of values, parsed at argv-build time.
+# See `_parse_extra_mounts` / `_parse_internal_registry_hosts`.
+EXTRA_MOUNTS_ENV = "ORCH_WORKER_EXTRA_MOUNTS"
+INTERNAL_REGISTRY_HOSTS_ENV = "ORCH_INTERNAL_REGISTRY_HOSTS"
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +210,134 @@ def select_auth_mode(host_env: dict[str, str] | None = None) -> AuthMode:
     """
     env = host_env if host_env is not None else os.environ
     return "api_key" if env.get("ANTHROPIC_API_KEY") else "oauth"
+
+
+def _expand_with_home(path_str: str, home: Path) -> Path:
+    """Expand a `~/...` path against the supplied `home` (NOT $HOME).
+
+    Tests rely on a tmp home_dir, so we can't use `Path.expanduser()`
+    which reads the process's $HOME. Falls through to a plain `Path`
+    for absolute / non-tilde inputs.
+
+    Portability (PR #14 review C3): the expansion itself is OS-agnostic
+    — `Path` normalizes separators on every platform. What's NOT
+    OS-agnostic is the *content* of `AUTO_MOUNT_REGISTRY_PATHS`, which
+    encodes Unix conventions: `~/.npmrc`, `~/.pip/pip.conf`, and
+    `~/.docker/config.json` exist by default on macOS/Linux but live
+    under `%APPDATA%` on Windows (e.g. `%APPDATA%\\npm\\etc\\npmrc`).
+    On Windows the auto-mount tuple typically yields zero matches; the
+    user wires passthrough explicitly via `ORCH_WORKER_EXTRA_MOUNTS`
+    pointing at the actual Windows config paths. Docker Desktop on
+    Windows then bind-mounts those into the Linux container at the
+    `/home/agent/...` target like any other extra mount.
+    """
+    if path_str.startswith("~/"):
+        return home / path_str[2:]
+    if path_str == "~":
+        return home
+    return Path(path_str)
+
+
+def _auto_mounted_registry_paths(home: Path) -> list[tuple[Path, str]]:
+    """Return the (host_path, container_path) pairs for every registry
+    config file that exists on the host.
+
+    The container target mirrors the relative path under the agent's
+    HOME (/home/agent/) since the user IDs match.
+    """
+    pairs: list[tuple[Path, str]] = []
+    for spec in AUTO_MOUNT_REGISTRY_PATHS:
+        # spec is always "~/<rel>" — the canonical form.
+        if not spec.startswith("~/"):
+            continue
+        rel = spec[2:]
+        host_path = home / rel
+        if host_path.is_file():
+            container_path = f"/home/agent/{rel}"
+            pairs.append((host_path, container_path))
+    return pairs
+
+
+def _violates_never_mount(candidate: Path, home: Path) -> str | None:
+    """Return the NEVER_MOUNT entry the candidate matches, or None.
+
+    A candidate "matches" if it resolves to, or sits under, the resolved
+    path of a NEVER_MOUNTED_HOST_PATHS entry. Symlinks are resolved on
+    both sides so a symlink that points into ~/.ssh can't slip past the
+    check. Non-existent NEVER paths can't match (they're not on this
+    host, so there's nothing to protect).
+    """
+    try:
+        candidate_abs = candidate.resolve()
+    except (OSError, RuntimeError):
+        candidate_abs = candidate.absolute()
+    for spec in NEVER_MOUNTED_HOST_PATHS:
+        never = _expand_with_home(spec, home)
+        try:
+            never_abs = never.resolve()
+        except (OSError, RuntimeError):
+            never_abs = never.absolute()
+        if candidate_abs == never_abs:
+            return spec
+        # `is_relative_to` is the prefix-containment check that handles
+        # `~/.ssh/id_rsa` matching `~/.ssh`. Python 3.9+ has it on Path.
+        try:
+            if candidate_abs.is_relative_to(never_abs):
+                return spec
+        except AttributeError:  # pragma: no cover — < 3.9 not supported
+            if str(candidate_abs).startswith(str(never_abs) + "/"):
+                return spec
+    return None
+
+
+def _parse_extra_mounts(env: Mapping[str, str], home: Path) -> list[Path]:
+    """Parse ORCH_WORKER_EXTRA_MOUNTS into a list of existing host paths.
+
+    Comma-separated; whitespace-trimmed; `~/` expanded against `home`.
+    Non-existent entries are silently dropped — docker would refuse to
+    bind-mount them and they'd just produce noise. The cred-audit
+    surface is responsible for telling the user what landed.
+
+    Safety check (PR #14 review C4): every entry is validated against
+    NEVER_MOUNTED_HOST_PATHS. A candidate that resolves to or under a
+    NEVER entry (`~/.ssh`, `~/.aws`, …) is REJECTED with `ValueError`
+    rather than silently dropped — a NEVER-list violation is a security
+    failure, not a typo, so the worker refuses to spawn until the env
+    var is fixed.
+    """
+    raw = env.get(EXTRA_MOUNTS_ENV, "")
+    if not raw:
+        return []
+    out: list[Path] = []
+    for chunk in raw.split(","):
+        item = chunk.strip()
+        if not item:
+            continue
+        candidate = _expand_with_home(item, home)
+        violated = _violates_never_mount(candidate, home)
+        if violated is not None:
+            raise ValueError(
+                f"{EXTRA_MOUNTS_ENV} entry {item!r} resolves to or under "
+                f"the never-mounted path {violated!r} — refusing to bind-"
+                f"mount this into the worker. Remove the entry from "
+                f"{EXTRA_MOUNTS_ENV} or pick a path outside the never-list."
+            )
+        if candidate.exists():
+            out.append(candidate)
+    return out
+
+
+def _parse_internal_registry_hosts(env: Mapping[str, str]) -> tuple[str, ...]:
+    """Parse ORCH_INTERNAL_REGISTRY_HOSTS into a tuple of hostnames.
+
+    Comma-separated; whitespace-trimmed; empty entries dropped. Sorted
+    so the rendered audit is stable across runs.
+    """
+    raw = env.get(INTERNAL_REGISTRY_HOSTS_ENV, "")
+    if not raw:
+        return ()
+    hosts = [chunk.strip() for chunk in raw.split(",") if chunk.strip()]
+    return tuple(sorted(set(hosts)))
 
 
 def extract_session_id(stdout: str) -> str | None:
@@ -223,6 +405,15 @@ class CredAudit:
 
     Rendered as a fixed-format text block by `render()` so the doctor
     command shows the same receipts the snapshot test asserts on.
+
+    Field additions in F-001-U-4:
+
+      * ``mounts_never`` is filtered by host-side existence — the
+        rendered "host has them, worker will NOT see them" heading is
+        now accurate (PR #11 review SUGGESTION 3).
+      * ``internal_registry_hosts`` lists every hostname forwarded
+        through the dnsmasq allowlist via ORCH_INTERNAL_REGISTRY_HOSTS
+        so the user sees what crossed the named-host boundary.
     """
 
     backend: str
@@ -233,6 +424,10 @@ class CredAudit:
     env_vars_dropped: tuple[str, ...]
     mounts_passed: tuple[str, ...]
     mounts_never: tuple[str, ...]
+    # F-001-U-4 additions — kept at the end for backwards-compat with
+    # existing tests that construct CredAudit positionally via dataclass
+    # default ordering. New code should pass by keyword.
+    internal_registry_hosts: tuple[str, ...] = ()
 
     def render(self) -> str:
         lines: list[str] = []
@@ -261,6 +456,16 @@ class CredAudit:
         lines.append("Paths NEVER mounted (host has them, worker will NOT see them):")
         for entry in self.mounts_never:
             lines.append(f"  - {entry}")
+        if not self.mounts_never:
+            lines.append("  (none present on host)")
+        # F-001-U-4: internal-registry DNS allowlist additions. Section
+        # is OMITTED entirely when the env var is unset (no misleading
+        # "(none)" line that reads like a positive statement).
+        if self.internal_registry_hosts:
+            lines.append("")
+            lines.append("Internal registry hosts (added to DNS allowlist):")
+            for host in self.internal_registry_hosts:
+                lines.append(f"  + {host}")
         return "\n".join(lines)
 
 
@@ -319,6 +524,25 @@ def build_cred_audit(
             f"{home / '.claude'} -> /home/agent/.claude (ro)",
         )
 
+    # F-001-U-4: surface every auto-mounted registry config file so the
+    # cred-audit accurately reflects what crossed the boundary.
+    for host_path, container_path in _auto_mounted_registry_paths(home):
+        mounts_passed.append(f"{host_path} -> {container_path} (ro, auto)")
+    for extra in _parse_extra_mounts(env, home):
+        # User-approved opt-in via ORCH_WORKER_EXTRA_MOUNTS. Mirrors the
+        # mount target naming we use in argv (homed under /home/agent).
+        target = _container_target_for_extra(extra, home)
+        mounts_passed.append(f"{extra} -> {target} (ro, extra)")
+
+    # F-001-U-4 (PR #11 SUGGESTION 3): only list NEVER paths that
+    # actually exist on the host so the "host has them" heading is
+    # accurate. Same predicate as `_classify_dropped_env`.
+    mounts_never = tuple(
+        spec for spec in NEVER_MOUNTED_HOST_PATHS if _expand_with_home(spec, home).exists()
+    )
+
+    internal_registry_hosts = _parse_internal_registry_hosts(env)
+
     return CredAudit(
         backend="docker",
         auth_mode=mode,
@@ -327,8 +551,216 @@ def build_cred_audit(
         env_vars_passed=tuple(passed_env),
         env_vars_dropped=_classify_dropped_env(env, tuple(passed_env)),
         mounts_passed=tuple(mounts_passed),
-        mounts_never=NEVER_MOUNTED_HOST_PATHS,
+        mounts_never=mounts_never,
+        internal_registry_hosts=internal_registry_hosts,
     )
+
+
+def _container_target_for_extra(host_path: Path, home: Path) -> str:
+    """Compute the container-side path for an extra-mount host file.
+
+    If the host path lives under `home`, mirror the relative path under
+    `/home/agent/`. Otherwise mount at `/mnt/extra/<basename>` to keep
+    the user-approved opt-in confined to a predictable target.
+    """
+    try:
+        rel = host_path.relative_to(home)
+    except ValueError:
+        return f"/mnt/extra/{host_path.name}"
+    return f"/home/agent/{rel}"
+
+
+# ---------------------------------------------------------------------------
+# Registry-passthrough doctor probe (F-001-U-4).
+# ---------------------------------------------------------------------------
+
+
+# Hosts that count as "public" — repos pointing at them don't need an
+# internal-registry passthrough. Kept narrow on purpose: anything not
+# on this list is treated as private and warned about.
+_PUBLIC_REGISTRY_HOSTS = frozenset(
+    {
+        "pypi.org",
+        "files.pythonhosted.org",
+        "registry.npmjs.org",
+        "registry.yarnpkg.com",
+    }
+)
+
+
+def _passthrough_appears_wired(home: Path, extra_mounts_env: str) -> bool:
+    """True iff the worker is configured to forward an internal-registry
+    config file into the container.
+
+    Either:
+      * one of the AUTO_MOUNT_REGISTRY_PATHS exists on the host, OR
+      * ORCH_WORKER_EXTRA_MOUNTS names at least one existing path.
+    """
+    for host_path, _container in _auto_mounted_registry_paths(home):
+        if host_path.is_file():
+            return True
+    return bool(_parse_extra_mounts({EXTRA_MOUNTS_ENV: extra_mounts_env}, home))
+
+
+def _registry_field_from_package_json(repo: Path) -> str | None:
+    """Pull the `"registry"` field out of `<repo>/package.json` if any.
+
+    Returns the URL string (truthy) or None (falsy) so callers can use
+    it directly in a conditional. Malformed JSON, missing file, missing
+    field — all return None without raising.
+    """
+    pkg = repo / "package.json"
+    if not pkg.is_file():
+        return None
+    try:
+        data = json.loads(pkg.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    val = data.get("registry")
+    if isinstance(val, str) and val.strip():
+        return val.strip()
+    return None
+
+
+def _index_url_from_requirements_txt(repo: Path) -> str | None:
+    """Return the first `--index-url <url>` value in requirements.txt, if any.
+
+    Skips the file when missing or unreadable. Public pypi URLs are
+    handled by the caller (they don't constitute a passthrough need).
+    """
+    req = repo / "requirements.txt"
+    if not req.is_file():
+        return None
+    try:
+        text = req.read_text()
+    except OSError:
+        return None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Match both `--index-url <url>` and `--index-url=<url>`.
+        for prefix in ("--index-url=", "-i "):
+            if line.startswith(prefix):
+                return line[len(prefix) :].strip().split()[0]
+        if line.startswith("--index-url "):
+            return line.split(None, 1)[1].strip().split()[0]
+    return None
+
+
+def _is_private_registry_url(url: str) -> bool:
+    """True iff `url`'s host is NOT in the small public-registry allowlist.
+
+    A bare hostname (no scheme) is treated as private — internal artifactory
+    URLs often look like `artifactory.internal/path` without https://.
+    """
+    # Extract the host between the scheme and the first /. urlparse would
+    # work too, but a lightweight regex keeps stdlib usage shallow.
+    match = re.match(r"^[a-zA-Z][\w+.\-]*://([^/]+)", url)
+    if match:
+        netloc = match.group(1)
+    else:
+        netloc = url.split("/", 1)[0]
+    host = netloc.split("@")[-1].split(":")[0].lower()
+    return host not in _PUBLIC_REGISTRY_HOSTS
+
+
+def audit_registry_passthrough_for_repo(
+    repo: Path,
+    *,
+    home_dir: Path | None = None,
+    extra_mounts_env: str | None = None,
+) -> list[str]:
+    """Return warnings if a repo needs internal-registry access but none is wired.
+
+    Heuristics — both run independently so a repo using BOTH npm and pip
+    against internal hosts surfaces both warnings:
+
+      * `package.json` carries a `"registry"` field pointing at a non-
+        public host.
+      * `requirements.txt` carries a `--index-url <url>` pointing at a
+        non-public host.
+
+    Returns an empty list when no passthrough is needed OR when a
+    passthrough already appears to be wired (`_passthrough_appears_wired`).
+
+    End-to-end user experience (PR #14 review C5) — what happens when a
+    repo needs internal-registry access:
+
+      1. **Detection.** This function reads `package.json` and
+         `requirements.txt` from the cloned repo. Either a `registry`
+         field or a `--index-url` pointing at a non-allowlisted host
+         (not in `_PUBLIC_REGISTRY_HOSTS`) is treated as "needs
+         passthrough".
+
+      2. **Wiring check.** `_passthrough_appears_wired(home, env)`
+         returns True if any of `AUTO_MOUNT_REGISTRY_PATHS` exists on
+         the host OR `ORCH_WORKER_EXTRA_MOUNTS` names an existing path.
+         When True, this function returns `[]` — no warning fires.
+
+      3. **Green path (passthrough wired).** No output here. At spawn
+         time the cred-audit (`build_cred_audit().render()`) enumerates
+         every auto-mounted file under "Mounts into worker" so the user
+         sees what landed inside the container.
+
+      4. **Yellow path (passthrough not wired).** Returns one warning
+         per detected need, each naming the exact file to populate:
+         "Place ~/.npmrc on the host or set ORCH_WORKER_EXTRA_MOUNTS=
+         <path-to-npmrc>." The doctor command surfaces these warnings
+         before the user runs into the failure mid-spawn.
+
+      5. **Red path (passthrough wired but install still fails inside
+         the container).** Two likely causes:
+
+           a. The bind-mounted credentials are stale / lack permissions
+              for the requested package. Inspect `~/.npmrc` etc. on the
+              host directly — the container sees a verbatim copy.
+
+           b. The registry's hostname isn't on the dnsmasq DNS allowlist
+              (orchestrator/network/allowlist.dnsmasq.conf), so DNS
+              resolves to 0.0.0.0 and the connect fails. Mitigation:
+              add the host to `ORCH_INTERNAL_REGISTRY_HOSTS` (comma-
+              separated). The cred-audit surfaces every host added this
+              way under "Internal registry hosts (added to DNS
+              allowlist)" so you can verify the env var landed.
+
+         Worker stdout/stderr from the failed `npm install` / `pip
+         install` ends up in the unit's event timeline
+         (`unit_history(unit_id)`) — that's the single place to read
+         the install error message.
+    """
+    home = home_dir if home_dir is not None else Path.home()
+    extras = (
+        extra_mounts_env if extra_mounts_env is not None else os.environ.get(EXTRA_MOUNTS_ENV, "")
+    )
+
+    npm_registry = _registry_field_from_package_json(repo)
+    pip_index = _index_url_from_requirements_txt(repo)
+
+    needs_npm = bool(npm_registry and _is_private_registry_url(npm_registry))
+    needs_pip = bool(pip_index and _is_private_registry_url(pip_index))
+
+    if not (needs_npm or needs_pip):
+        return []
+    if _passthrough_appears_wired(home, extras):
+        return []
+
+    warnings: list[str] = []
+    if needs_npm:
+        warnings.append(
+            f"package.json declares registry={npm_registry!r} but no internal-"
+            "registry passthrough is wired. Place ~/.npmrc on the host or set "
+            "ORCH_WORKER_EXTRA_MOUNTS=<path-to-npmrc>."
+        )
+    if needs_pip:
+        warnings.append(
+            f"requirements.txt has --index-url={pip_index!r} but no internal-"
+            "registry passthrough is wired. Place ~/.pip/pip.conf on the host "
+            "or set ORCH_WORKER_EXTRA_MOUNTS=<path-to-pip.conf>."
+        )
+    return warnings
 
 
 # ---------------------------------------------------------------------------
@@ -601,6 +1033,26 @@ class DockerClaudeCodeWorker:
                 "--mount",
                 (f"type=bind,source={claude_dir},target=/home/agent/.claude,readonly"),
             ]
+
+        # ----- F-001-U-4: internal-registry passthrough (default-on) -----
+        # Auto-mount registry config files when present on the host. The
+        # cred-audit lists every path so the user sees what crossed.
+        for host_path, container_path in _auto_mounted_registry_paths(self.home_dir):
+            argv += [
+                "--mount",
+                f"type=bind,source={host_path},target={container_path},readonly",
+            ]
+        # Opt-in extra mounts via ORCH_WORKER_EXTRA_MOUNTS in the host
+        # env. Filtered to paths that actually exist; missing entries
+        # are silently dropped (docker would error otherwise).
+        env_for_extras: Mapping[str, str] = host_env if host_env is not None else dict(os.environ)
+        for extra in _parse_extra_mounts(env_for_extras, self.home_dir):
+            target = _container_target_for_extra(extra, self.home_dir)
+            argv += [
+                "--mount",
+                f"type=bind,source={extra},target={target},readonly",
+            ]
+
         # Strict whitelist for env passthrough. We use the value-less
         # `--env NAME` form (docker reads it from the curated subprocess
         # env we hand it via `build_subprocess_env`). This keeps the
@@ -754,6 +1206,7 @@ def _extract_response_text(stdout: str) -> str:
 __all__ = [
     "AGENT_GID",
     "AGENT_UID",
+    "AUTO_MOUNT_REGISTRY_PATHS",
     "DEFAULT_CPUS",
     "DEFAULT_DNS",
     "DEFAULT_DNS_SEARCH",
@@ -761,6 +1214,8 @@ __all__ = [
     "DEFAULT_MEMORY",
     "DEFAULT_NETWORK",
     "DEFAULT_PIDS_LIMIT",
+    "EXTRA_MOUNTS_ENV",
+    "INTERNAL_REGISTRY_HOSTS_ENV",
     "NEVER_MOUNTED_HOST_PATHS",
     "SENSITIVE_ENV_NAMES",
     "SENSITIVE_ENV_PREFIXES",
@@ -768,6 +1223,7 @@ __all__ = [
     "CredAudit",
     "DockerClaudeCodeWorker",
     "DoctorProbeResult",
+    "audit_registry_passthrough_for_repo",
     "build_cred_audit",
     "extract_session_id",
     "run_doctor_probes",

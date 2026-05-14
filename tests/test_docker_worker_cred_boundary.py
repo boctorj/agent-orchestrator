@@ -12,11 +12,9 @@ also be a curated subset of the host env — verified separately.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
-from orchestrator.workers.docker_claude_code import DockerClaudeCodeWorker
+from tests.conftest import _make_worker
 
 # A representative "hostile" host environment: a mix of cloud SDK creds,
 # SSH agent sockets, kube config pointers, generic API tokens, and random
@@ -60,12 +58,7 @@ def _build_hostile_host_env(extra: dict[str, str] | None = None) -> dict[str, st
     return env
 
 
-def _make_worker(tmp_path: Path) -> DockerClaudeCodeWorker:
-    fake_home = tmp_path / "home"
-    (fake_home / ".claude" / "sessions").mkdir(parents=True)
-    workdir = tmp_path / "work"
-    workdir.mkdir()
-    return DockerClaudeCodeWorker(role="coder", workdir=workdir, home_dir=fake_home)
+# `_make_worker` is imported from `tests/conftest.py` — see top of this file.
 
 
 # ---------------------------------------------------------------------------

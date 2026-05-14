@@ -50,6 +50,34 @@ else
   echo "warning: docker CLI not on PATH; skipping ${NETWORK_NAME} bridge check" >&2
 fi
 
+# Internal-registry passthrough (F-001-U-4). When the user sets
+# ORCH_INTERNAL_REGISTRY_HOSTS=host1,host2,... in .env, expand each
+# host into an additional `--server=/<host>/<upstream>` dnsmasq flag
+# so containers can resolve internal artifactory / private PyPI /
+# internal-pypi.corp / etc. The default upstream (1.1.1.1) matches the
+# pattern in allowlist.dnsmasq.conf — override per-deployment with
+# ORCH_INTERNAL_REGISTRY_UPSTREAM if you need to point at an internal
+# DNS server (e.g. 10.0.0.53 for VPN-only resolution).
+#
+# Comma-separated; whitespace-trimmed; empty entries dropped. The
+# .env loader is the user's responsibility — `set -a; source .env;
+# set +a` before invoking the script is the documented pattern.
+INTERNAL_REGISTRY_HOSTS="${ORCH_INTERNAL_REGISTRY_HOSTS:-}"
+INTERNAL_REGISTRY_UPSTREAM="${ORCH_INTERNAL_REGISTRY_UPSTREAM:-1.1.1.1}"
+
+EXTRA_SERVER_ARGS=()
+if [ -n "${INTERNAL_REGISTRY_HOSTS}" ]; then
+  # Split on commas without invoking `cut` / `tr` (POSIX-portable shell).
+  IFS=',' read -ra _hosts <<< "${INTERNAL_REGISTRY_HOSTS}"
+  for host in "${_hosts[@]}"; do
+    # Trim leading/trailing whitespace; skip empties.
+    trimmed="$(echo "${host}" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+    if [ -n "${trimmed}" ]; then
+      EXTRA_SERVER_ARGS+=("--server=/${trimmed}/${INTERNAL_REGISTRY_UPSTREAM}")
+    fi
+  done
+fi
+
 # Exec into dnsmasq in the foreground so process supervisors (systemd,
 # launchd, tmux) can see it. --conf-file pins the source of truth and
 # stops dnsmasq from picking up /etc/dnsmasq.conf.
@@ -57,4 +85,5 @@ exec dnsmasq \
   --keep-in-foreground \
   --no-daemon \
   --conf-file="${CONFIG_PATH}" \
-  --listen-address="${BIND_ADDR}"
+  --listen-address="${BIND_ADDR}" \
+  "${EXTRA_SERVER_ARGS[@]}"
