@@ -28,6 +28,7 @@ so a missing dependency causes a `pytest.skip` rather than a hard error.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess  # nosec B404 — invoking `docker` is the whole point
 import time
@@ -70,15 +71,34 @@ def _docker_daemon_reachable(timeout: float = 5.0) -> bool:
     return proc.returncode == 0 and bool(proc.stdout.strip())
 
 
+E2E_OPT_IN_ENV = "ORCH_RUN_E2E"
+
+
 @pytest.fixture(autouse=True)
 def docker_available() -> None:
-    """Skip every E2E test when Docker isn't reachable.
+    """Skip every E2E test unless explicitly opted into.
 
-    Autouse keeps the gate consistent across the suite — individual
-    tests don't need to remember the marker. The check is fast (one
-    `docker version` call with a 5s timeout) so the no-Docker path
-    stays cheap on cold runs.
+    Two-gate predicate, both must hold for the suite to run:
+
+      (a) ``ORCH_RUN_E2E=1`` on the host. The main CI matrix doesn't set
+          this, so the heavy E2E suite stays out of every Ubuntu / macOS
+          / Windows runner the per-PR matrix spawns (Ubuntu runners DO
+          ship a working Docker daemon, so the daemon-only check isn't
+          sufficient to keep them out). The opt-in ``e2e-docker`` workflow
+          sets the env var explicitly.
+
+      (b) Docker daemon reachable on the host (``docker version`` returns
+          a server version within 5s). Even with the opt-in flag set,
+          a missing daemon skips cleanly rather than failing every test
+          at the fixture level.
+
+    Autouse keeps the gate consistent across the suite so individual
+    tests don't need to remember the marker.
     """
+    if os.environ.get(E2E_OPT_IN_ENV) != "1":
+        pytest.skip(
+            f"E2E suite is opt-in (set {E2E_OPT_IN_ENV}=1); main CI matrix runs the unit suite only"
+        )
     if not _docker_daemon_reachable():
         pytest.skip("docker daemon not reachable — E2E suite skipped")
 
