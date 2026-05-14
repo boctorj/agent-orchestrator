@@ -109,7 +109,9 @@ boundaries.
 │   ntfy.py     — phone push notifications                               │
 │   costs.py    — session-hour cost estimates from event timestamps      │
 │   dashboard.py — rich (TUI) + markdown (in-chat) renderers             │
-│   agents.py   — Worker protocol + ManagedAgentWorker impl              │
+│   workers/   — Worker protocol (base.py) + ManagedAgentWorker          │
+│                (managed_agent.py) + DockerClaudeCodeWorker             │
+│                (docker_claude_code.py) — F-001                         │
 └────────────────────────────────────────────────────────────────────────┘
        │ Anthropic SDK            │ GitHub REST          │ ntfy.sh
        │ (mints sessions)         │ (PRs, checks,        │ (POST topic)
@@ -196,7 +198,21 @@ orchestrator/
 ├── mcp_launcher.py              env-minimization wrapper (strips secrets
 │                                from parent shell before exec'ing server)
 ├── mcp_server.py                imports all tools/, runs FastMCP stdio
-├── agents.py                    Worker protocol + ManagedAgentWorker
+├── agents.py                    Backwards-compat shim re-exporting from
+│                                workers/ (the real code lives there since
+│                                F-001-U-1 split the Worker abstraction)
+├── workers/                     Worker abstraction subpackage
+│   ├── __init__.py              make_worker(role) factory keyed by
+│   │                            ORCH_WORKER_BACKEND (managed_agents | docker)
+│   ├── base.py                  Worker protocol (spawn/resume/archive)
+│   ├── managed_agent.py         ManagedAgentWorker (Anthropic Managed Agents)
+│   └── docker_claude_code.py    DockerClaudeCodeWorker — F-001:
+│                                hybrid OAuth/API-key auth, hardened
+│                                docker run, cred audit, doctor probes,
+│                                internal-registry passthrough
+├── network/                     DNS allowlist for Docker workers (F-001-U-3)
+│   ├── __init__.py              allowlist_config_path(), package-manager hosts
+│   └── allowlist.dnsmasq.conf   dnsmasq config served by run-worker-dns.sh
 ├── state.py                     SQLite layer: features, plans, work_units,
 │                                unit_events, cached_resources
 ├── models.py                    Feature, Plan, WorkUnit, WorkUnitState
@@ -614,7 +630,7 @@ repos without GitHub Actions still complete a cycle.
 
 | What | Where | Why |
 |---|---|---|
-| Worker abstraction | `agents.py` `Worker` Protocol + `ManagedAgentWorker` | Allows future swap to local executor / Modal / Bedrock without touching orchestrator logic |
+| Worker abstraction | `workers/base.py` `Worker` Protocol + `workers/managed_agent.py` `ManagedAgentWorker` | Allows swapping backends without touching orchestrator logic; second impl `workers/docker_claude_code.py` shipped via F-001 |
 | Session lifecycle | Anthropic-managed gVisor containers, 1-hour TTL | Avoids us running a sandbox. Sessions resumable by ID. |
 | Tool surface inside agent | `agent_toolset_20260401` (Bash, file ops, web fetch) | Standard Anthropic preset; agents bring `gh` via the container's pre-installed apt packages |
 | Network policy | `limited` mode with `ALLOWED_NETWORK_HOSTS` allowlist | Blocks data exfiltration to non-allowlisted hosts |
@@ -646,7 +662,7 @@ repos without GitHub Actions still complete a cycle.
 1. orchestrator/mcp_launcher.py spawns mcp_server with minimum env
    (ANTHROPIC_API_KEY NOT in the parent env)
 2. mcp_server.py: load_dotenv() reads .env → puts ANTHROPIC_API_KEY in os.environ
-3. agents.py: Anthropic() client picks up ANTHROPIC_API_KEY from os.environ
+3. workers/managed_agent.py: Anthropic() client picks up ANTHROPIC_API_KEY from os.environ
 4. Worker.spawn() calls client.beta.agents.create + sessions.create
 ```
 
@@ -779,13 +795,18 @@ See `SECURITY.md` for the full threat model + reporting policy.
 | `github.py` | 71% | REST helpers (polling loop + some error paths uncovered) |
 | `tools/__init__.py` | 80% | shared infra |
 | `github_app.py` | **100%** | JWT mint + token cache + fallback |
-| `agents.py` | 25% | `_resource_signature` pure-fn tested; `ManagedAgentWorker` SDK calls intentionally not mocked |
+| `workers/managed_agent.py` | 25% | `_resource_signature` pure-fn tested; `ManagedAgentWorker` SDK calls intentionally not mocked |
+| `workers/docker_claude_code.py` | 86% | Argv construction, cred audit, doctor probes, internal-registry passthrough all unit-tested; E2E suite (`tests/e2e/`) gated on `ORCH_RUN_E2E=1` covers real Docker daemon path |
+| `workers/base.py`, `workers/__init__.py` | 100% / 100% | Protocol shape + factory branching |
 
-**`agents.py` is the deliberate gap.** Fully mocking the Anthropic SDK is
-substantial; would need to inject a fake `Anthropic` client and stub
-`beta.agents.create`, `beta.sessions.create`, `beta.sessions.events.stream`,
-etc. Tracked in BACKLOG; we're at 86% overall coverage and the gate is 80%,
-so this is below the urgency threshold.
+**`workers/managed_agent.py` is the deliberate gap.** Fully mocking the
+Anthropic SDK is substantial; would need to inject a fake `Anthropic`
+client and stub `beta.agents.create`, `beta.sessions.create`,
+`beta.sessions.events.stream`, etc. Tracked in BACKLOG; we're at 86%
+overall coverage and the gate is 80%, so this is below the urgency
+threshold. The Docker backend (`workers/docker_claude_code.py`) does
+not have this gap — subprocess is dependency-injectable and every
+hardening flag is asserted on in unit tests.
 
 ### Lint / type / security gates
 
@@ -810,24 +831,29 @@ so this is below the urgency threshold.
 
 ### 11b. Adding a new Worker backend (e.g. Bedrock, Modal, local)
 
-1. Implement the `Worker` Protocol in `agents.py`:
+1. Add a new module `orchestrator/workers/<your_backend>.py` implementing
+   the `Worker` Protocol from `workers/base.py`:
    ```python
    class MyWorker:
        role: str
        def spawn(self, task: str, *, title: str | None) -> tuple[str, str]: ...
        def resume(self, session_id: str, msg: str) -> str: ...
        def archive(self, session_id: str) -> None: ...
-       def spawn_async(self, task, *, title=None) -> str: ...   # optional
-       def wait_idle(self, session_id, *, timeout_seconds=1800) -> str: ...
    ```
-2. Add a config flag (e.g. `WORKER_BACKEND=bedrock` env var)
-3. In `tools/execution.py` etc., swap `ManagedAgentWorker(role=...)` for the
-   configured backend's factory
+2. Register the backend in `workers/__init__.py`'s `make_worker(role)`
+   factory under a new value of `ORCH_WORKER_BACKEND`. The factory is the
+   single switchboard; nothing in `tools/` or the lead persona changes.
+3. Add the backend to `KNOWN_BACKENDS` so the factory rejects typos clearly.
+4. Add tests under `tests/test_<your_backend>_worker_*.py` — patterns to
+   reuse from F-001: argv construction (`build_*_argv`), credential
+   boundary (`build_cred_audit().render()` snapshot), doctor probes.
 
 The orchestrator's tool layer never assumes the worker is Anthropic-specific.
 The biggest practical gotcha is the agent's tool surface (`agent_toolset_20260401`
 gives Anthropic agents Bash/file ops/etc. for free; other backends need their
-own way to provide that — Modal/E2B sandboxes, OS-level subprocess, etc.).
+own way to provide that — `DockerClaudeCodeWorker` does this via a baked-in
+container image with `git`, `gh`, `claude`, Python, and Node; Modal/E2B
+sandboxes work similarly).
 
 ### 11b-bis. Choosing a worker backend (Managed Agents vs Docker)
 
