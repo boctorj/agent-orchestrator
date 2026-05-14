@@ -207,20 +207,28 @@ export SHA   # so the python heredoc below can read it via os.environ
 python3 - <<'PY'
 import json, os
 sha = os.environ["SHA"]
+
+# Inline findings — one entry per 🔴 / 🟠 / 🟡. Build this list first so
+# `event` below can be derived from it (any 🔴 or 🟠 ⇒ REQUEST_CHANGES per
+# the Terminal-marker decision rule).
+findings = [
+  {"tier": "🔴", "path": "<file>", "line": <n>, "side": "RIGHT",
+   "body": "### 🔴 C1 — <name the bug pattern>\n<evidence with file:line>\n**Fix:** <concrete action>"},
+  # ... more findings
+]
+has_blocking = any(f["tier"] in ("🔴", "🟠") for f in findings)
+event = "REQUEST_CHANGES" if has_blocking else "COMMENT"
+
 payload = {
   "commit_id": sha,
-  "event": "COMMENT",   # see "Terminal marker" section for when to use REQUEST_CHANGES
+  "event": event,
   "body": """<top-level summary markdown:
 - 1-line verdict
 - severity legend / counts (N critical / N high / N medium / N low)
 - 🔵 observations (in body, not inline)
 - ✅ what's good (only if genuine, only after criticism above)
 - Note on Copilot review if present>""",
-  "comments": [
-    {"path": "<file>", "line": <n>, "side": "RIGHT",
-     "body": "### 🔴 C1 — <name the bug pattern>\n<evidence with file:line>\n**Fix:** <concrete action>"},
-    # one entry per 🔴 / 🟠 / 🟡 finding
-  ],
+  "comments": [{k: v for k, v in f.items() if k != "tier"} for f in findings],
 }
 json.dump(payload, open("/tmp/review.json", "w"), indent=2)
 PY

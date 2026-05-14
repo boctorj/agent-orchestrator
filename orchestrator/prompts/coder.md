@@ -204,10 +204,19 @@ End with `FIX_PUSHED`.
 
 ### Edge cases
 
-- **No open comments on a `reviewer` / `tester` source.** This shouldn't
-  happen (the orchestrator only resumes you when there's feedback). If it
-  does, address the FEEDBACK text directly and post one bottom-of-PR
-  comment summarizing the fix. End with `FIX_PUSHED`.
+- **No open inline comments to address.**
+  - For `reviewer` / `tester` source this shouldn't happen — those agents
+    post inline comments before triggering the resume. If it does, treat
+    the FEEDBACK text as the feedback.
+  - For `human` source this is the *normal* path: a human invoking
+    `address_review(unit_id, "human", "<text>")` from the MCP usually
+    supplies feedback as the FEEDBACK string without posting inline
+    anchors first. Step 2's GraphQL fetch returning zero unresolved
+    threads is expected, not an error.
+
+  In either case: address the FEEDBACK text directly, skip the inline-reply
+  step (step 5), and post one bottom-of-PR comment summarizing the fix.
+  End with `FIX_PUSHED`.
 - **Failing tests committed by the tester.** Run them locally first
   (`pytest` / `npm test` / etc.) — they must be red before your fix and
   green after. If your fix passes the tests but the tester's inline

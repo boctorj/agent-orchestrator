@@ -375,14 +375,19 @@ class TestSpawnReviewer:
         msg = execution.spawn_reviewer("F-001", "F-001-U-1")
         assert "already exists" in msg
 
-    def test_review_approved(self, tmp_state_db, with_github_token, monkeypatch):
+    def test_review_approved_escalates_as_prompt_drift(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """REVIEW_APPROVED is deprecated. A reviewer that emits it (prompt
+        drift / regression) should fall through to no-marker escalation,
+        not be silently treated as a passing outcome."""
         _seed_coded_unit()
         _install_fake_worker(monkeypatch, spawn_response="looks great\nREVIEW_APPROVED")
         _stub_github(monkeypatch)
 
         out = execution.spawn_reviewer("F-001", "F-001-U-1")
-        parsed = json.loads(out)
-        assert parsed["outcome"] == "REVIEW_APPROVED"
+        assert "ESCALATED" in out
+        assert "no marker" in out
 
     def test_review_recommend_merge(self, tmp_state_db, with_github_token, monkeypatch):
         _seed_coded_unit()
@@ -603,7 +608,7 @@ class TestCycleReview:
             execution,
             "spawn_reviewer",
             lambda f, u: json.dumps(
-                {"unit_id": u, "outcome": "REVIEW_APPROVED", "session_id": "r"}
+                {"unit_id": u, "outcome": "REVIEW_RECOMMEND_MERGE", "session_id": "r"}
             ),
         )
         _stub_github(monkeypatch)
@@ -657,7 +662,7 @@ class TestCycleReview:
         monkeypatch.setattr(
             execution,
             "spawn_reviewer",
-            lambda f, u: json.dumps({"unit_id": u, "outcome": "REVIEW_APPROVED"}),
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "REVIEW_RECOMMEND_MERGE"}),
         )
         _stub_github(monkeypatch)
         monkeypatch.setattr(
@@ -709,7 +714,7 @@ class TestCycleReview:
                 json.dumps(
                     {"unit_id": "U", "outcome": "REVIEW_REQUEST_CHANGES", "issue": "rename x"}
                 ),
-                json.dumps({"unit_id": "U", "outcome": "REVIEW_APPROVED"}),
+                json.dumps({"unit_id": "U", "outcome": "REVIEW_RECOMMEND_MERGE"}),
             ]
         )
         monkeypatch.setattr(
@@ -742,7 +747,7 @@ class TestCycleReview:
         monkeypatch.setattr(
             execution,
             "spawn_reviewer",
-            lambda f, u: json.dumps({"unit_id": u, "outcome": "REVIEW_APPROVED"}),
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "REVIEW_RECOMMEND_MERGE"}),
         )
         copilot_review = {
             "state": "COMMENTED",
@@ -773,7 +778,7 @@ class TestCycleReview:
         monkeypatch.setattr(
             execution,
             "spawn_reviewer",
-            lambda f, u: json.dumps({"unit_id": u, "outcome": "REVIEW_APPROVED"}),
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "REVIEW_RECOMMEND_MERGE"}),
         )
         _stub_github(monkeypatch, copilot_review=None)  # timeout
         monkeypatch.setattr(
@@ -1154,7 +1159,7 @@ class TestCycleReviewCIGate:
             spawn_response = {
                 "coder": "PR_URL: https://github.com/o/r/pull/42",
                 "tester": "TESTS_PASS",
-                "reviewer": "REVIEW_APPROVED",
+                "reviewer": "REVIEW_RECOMMEND_MERGE: clean",
             }.get(role, "")
             return FakeWorker(role, spawn_response, "FIX_PUSHED")
 
@@ -1240,18 +1245,18 @@ class TestCycleReviewCIGate:
         _install_fake_worker(
             monkeypatch,
             spawn_response="TESTS_PASS",
-            resume_response="REVIEW_APPROVED",
+            resume_response="REVIEW_RECOMMEND_MERGE: clean",
         )
         _stub_github(monkeypatch)
 
-        # spawn_tester returns TESTS_PASS; spawn_reviewer returns REVIEW_APPROVED.
+        # spawn_tester returns TESTS_PASS; spawn_reviewer returns REVIEW_RECOMMEND_MERGE.
         # The FakeWorker's spawn() returns the canned response for EVERY spawn
         # though — so reviewer would also return TESTS_PASS. Override per-role.
         def two_role_factory(role: str):
             spawn_response = {
                 "coder": "PR_URL: https://github.com/o/r/pull/42",
                 "tester": "TESTS_PASS",
-                "reviewer": "REVIEW_APPROVED",
+                "reviewer": "REVIEW_RECOMMEND_MERGE: clean",
             }.get(role, "")
             return FakeWorker(role, spawn_response, "FIX_PUSHED")
 

@@ -5,7 +5,7 @@ implemented and pushed to a feature branch. Run them. Report results.
 ## Environment
 
 - Working dir: `/workspace`
-- Bash, file ops, git, gh, curl available
+- Bash, file ops, git, gh, curl, python3 available
 - Network: unrestricted outbound
 
 ## Your task (sent in the user message)
@@ -76,68 +76,75 @@ You will receive:
    git push origin <branch_name>
    ```
 
-   **b. Post all bugs as a single inline review** (one API call, atomic).
-   Anchor each comment to the **implementation line** where the bug lives
-   — NOT to your test file. The coder will reply in each thread when fixing.
+   **b. Post all bugs as a single inline review** — see
+   [Posting the BUG_FOUND review](#posting-the-bug_found-review) below for
+   the exact API call. Anchor each comment to the **implementation line**
+   where the bug lives, NOT to your test file.
 
-   ```sh
-   SHA=$(gh pr view <pr_number> --json headRefOid --jq .headRefOid)
-   export SHA   # so the python heredoc below can read it via os.environ
-
-   python3 - <<'PY'
-   import json, os
-   payload = {
-     "commit_id": os.environ["SHA"],
-     "event": "REQUEST_CHANGES",
-     "body": "🤖 **Tester:** found <N> bug(s) — see inline comments. Failing tests committed in this branch.",
-     "comments": [
-       # one entry per bug; line/path point at the IMPL source, not the test file
-       {
-         "path": "<impl_file>",
-         "line": <line_in_impl>,
-         "side": "RIGHT",
-         "body": (
-           "🤖 **Bug** — <one-line summary>\n\n"
-           "**Failing test:** `<path/to/test_file>::<test_name>`\n\n"
-           "**Expected:** `<value>` · **Actual:** `<value>`\n\n"
-           "_Reply to this thread when fixed._"
-         ),
-       },
-       # ... more bug entries
-     ],
-   }
-   json.dump(payload, open("/tmp/bug-review.json", "w"))
-   PY
-
-   gh api -X POST repos/<owner>/<repo>/pulls/<pr_number>/reviews \
-     --input /tmp/bug-review.json > /tmp/post-response.json
-   ```
-
-   Anchoring rules:
-   - `path` + `line` must reference a line in the **PR's diff** (added or
-     immediately-surrounding context). If the bug is in untouched code the
-     PR exercises, anchor to the closest PR-diff line that demonstrates the
-     routing and explain the linkage in the body.
-   - `side: "RIGHT"` for new/modified code, `"LEFT"` for deleted code.
-   - One comment per bug. Don't pile multiple bugs into one comment.
-
-   **c. Capture the inline comment URLs.** `POST /pulls/N/reviews` returns
-   the review object (id, body, state) but NOT the per-comment URLs. To get
-   them, fetch the review's comments by id after posting:
-   ```sh
-   REVIEW_ID=$(jq -r .id < /tmp/post-response.json)   # save POST response when calling gh api
-   # — or pipe the gh api output: gh api ... > /tmp/post-response.json
-   gh api repos/<owner>/<repo>/pulls/<pr_number>/reviews/$REVIEW_ID/comments \
-     --jq '[.[] | {path, line, url: .html_url}]'
-   ```
-
-   **d. End your response** with — on the last line — exactly:
+   **c. End your response** with — on the last line — exactly:
    ```
    BUG_FOUND: <one-line summary covering all bugs>
    ```
-   Above that line, list each bug with its `html_url` from step c. The
-   orchestrator will resume the coder, who fetches your review comments
-   and replies in-thread.
+   Above that line, list each bug with its `html_url` from the
+   review-comments fetch. The orchestrator will resume the coder, who
+   fetches your review comments and replies in-thread.
+
+## Posting the BUG_FOUND review
+
+One API call, atomic. The block below sits at top-level (not inside a
+numbered list) so the `python3` heredoc and its `PY` terminator are at
+column 0 — copy and run as-is.
+
+```sh
+SHA=$(gh pr view <pr_number> --json headRefOid --jq .headRefOid)
+export SHA   # so the python heredoc below can read it via os.environ
+
+python3 - <<'PY'
+import json, os
+payload = {
+  "commit_id": os.environ["SHA"],
+  "event": "REQUEST_CHANGES",
+  "body": "🤖 **Tester:** found <N> bug(s) — see inline comments. Failing tests committed in this branch.",
+  "comments": [
+    # one entry per bug; line/path point at the IMPL source, not the test file
+    {
+      "path": "<impl_file>",
+      "line": <line_in_impl>,
+      "side": "RIGHT",
+      "body": (
+        "🤖 **Bug** — <one-line summary>\n\n"
+        "**Failing test:** `<path/to/test_file>::<test_name>`\n\n"
+        "**Expected:** `<value>` · **Actual:** `<value>`\n\n"
+        "_Reply to this thread when fixed._"
+      ),
+    },
+    # ... more bug entries
+  ],
+}
+json.dump(payload, open("/tmp/bug-review.json", "w"))
+PY
+
+gh api -X POST repos/<owner>/<repo>/pulls/<pr_number>/reviews \
+  --input /tmp/bug-review.json > /tmp/post-response.json
+```
+
+**Anchoring rules:**
+- `path` + `line` must reference a line in the **PR's diff** (added or
+  immediately-surrounding context). If the bug is in untouched code the
+  PR exercises, anchor to the closest PR-diff line that demonstrates the
+  routing and explain the linkage in the body.
+- `side: "RIGHT"` for new/modified code, `"LEFT"` for deleted code.
+- One comment per bug. Don't pile multiple bugs into one comment.
+
+**Capturing the inline comment URLs.** `POST /pulls/N/reviews` returns
+the review object (id, body, state) but NOT the per-comment URLs. Fetch
+them by review id after posting:
+
+```sh
+REVIEW_ID=$(jq -r .id < /tmp/post-response.json)
+gh api repos/<owner>/<repo>/pulls/<pr_number>/reviews/$REVIEW_ID/comments \
+  --jq '[.[] | {path, line, url: .html_url}]'
+```
 
 ## Hard rules — NEVER violate
 
