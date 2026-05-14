@@ -14,8 +14,11 @@ without the lead's chat context bloating into hallucination territory:
    markdown summary of what each unit shipped: final PR description +
    findings + fixes + spec deviations. Loaded by downstream units.
 3. **Headless daemon** — background Python process that drives
-   `cycle_review` autonomously, no LLM in the loop. Removes ~80% of
-   today's chat-resident tool-call traffic.
+   `cycle_review` autonomously without the lead's chat in the loop.
+   Worker agents (coder/tester/reviewer) still run as LLM-backed Managed
+   Agents — what changes is that the lead session no longer absorbs
+   their JSON returns. Removes ~80% of today's chat-resident tool-call
+   traffic.
 
 Together: the lead's role collapses to **plan + approve + escalate +
 merge**. State.db + spec.md + cycle logs are the durable substrate; the
@@ -67,11 +70,14 @@ state.db                      ← plans, units, events, costs
 GitHub PRs                    ← canonical PR convo; mirrored into cycle
                                 logs on terminal state
 
-Execution layer (background, no LLM)
+Execution layer (background, no lead chat)
 ─────────────────────────────────────────────
 orchestrator daemon           ← poll state.db, atomic-claim ready units,
                                 drive cycle_review, write cycle log,
                                 push ntfy on escalation / ready-to-merge
+                                (worker agents — coder/tester/reviewer —
+                                 are still LLM-backed; only the daemon
+                                 process itself is plain Python)
 
 LLM layer (lead chat)
 ─────────────────────────────────────────────
@@ -136,7 +142,9 @@ Path: `features/F-XXX/U-N.md`. Schema:
 
 ## PR
 #42 · https://github.com/owner/repo/pull/42
-Status: merged (2026-05-15 14:32 UTC) · Final SHA: <sha>
+Status: merged (2026-05-15 14:32 UTC)
+PR head SHA: <headRefOid at terminal state>
+Merge commit SHA: <mergeCommit.oid, captured when check_unit_pr confirms merged>
 
 ## Coder's PR description (verbatim, as of merge)
 [full PR body text captured at terminal state]
@@ -169,12 +177,20 @@ None.  (or: "see spec.md commit <sha> — Fernet scope clarified")
   Workers and the lead don't write cycle logs.
 - Appended per-cycle, finalized at terminal state. **Immutable on the
   normal path** — the lead and workers never overwrite a finalized log.
-  Recovery exceptions (orphaned log from a mid-write crash, or a PR
-  description edited on GitHub after capture) go through
-  `regenerate_cycle_log(unit_id)`; see Risks §4–5.
+  Two narrow exceptions: (a) post-merge SHA backfill (see below); (b)
+  recovery via `regenerate_cycle_log(unit_id)` for orphaned logs or
+  user-edited PR descriptions on GitHub — see Risks §4–5.
 - Mirrored from GitHub at write time: `gh pr view --json title,body,headRefOid`
-  for description and final SHA; GraphQL `reviewThreads` for findings;
+  for description and PR head SHA; GraphQL `reviewThreads` for findings;
   comment URLs preserved as deep links.
+- **Two SHAs captured at different points:**
+  - `headRefOid` (PR head at terminal state) — captured when the cycle
+    log is first finalized (`REVIEW_RECOMMEND_MERGE` / `REVIEW_COMMENT` /
+    escalation).
+  - `mergeCommit.oid` (the actual commit on main) — captured later when
+    `check_unit_pr` confirms the PR has been merged. Diverges from
+    `headRefOid` for squash and rebase merges. The cycle log is amended
+    once to add this field; that's the only post-finalization edit.
 
 **Storage decision:** markdown files, NOT state.db. PR descriptions can
 be 5–10KB; markdown is human-readable; git history of the file is a
@@ -186,26 +202,73 @@ spec was updated mid-cycle (cycle log links the commit) or the
 deviation is undocumented (reviewer flags as 🔴 per scope rules). Cycle
 log captures the finding regardless.
 
+**Persistence and commit strategy** (applies to both `spec.md` and cycle
+logs in `features/`):
+
+- The orchestrator workdir is a git repo. spec.md and cycle logs live
+  inside it at `features/F-XXX/`. **Files are committed locally by the
+  orchestrator/lead, never left as uncommitted working-tree state.**
+  Uncommitted markdown in `features/` is a bug.
+- **Who commits what:**
+  - **spec.md** — committed by the **lead** with a `Why:` message it
+    composes from the surrounding conversation. The lead's CLAUDE.md
+    rule requires a commit per non-obvious decision.
+  - **Cycle logs** — committed by the **orchestrator** automatically on
+    each write (per-cycle append + terminal-state finalize + post-merge
+    SHA backfill). Commit identity:
+    `user.email=agent@orchestrator user.name=orchestrator-bot`,
+    matching the per-command pattern workers already use.
+- **Push policy:** auto-commit is **local only**; push is manual or via
+  a periodic operator-run sweep. This keeps history without spamming the
+  remote on every cycle. (`orchestrator daemon` does not push.)
+- **Partial-write protection:** standard write-to-tmp-then-rename. The
+  orchestrator writes to `features/F-XXX/U-N.md.tmp` then `mv`s to the
+  final name before staging. A crash during write leaves the prior
+  finalized version intact (or no file, for first-time writes).
+- **Conflicts:** filenames don't collide (each unit owns its own file
+  path; spec.md is per-feature). Concurrent writers on the same file
+  are not expected. If the daemon and the lead ever race on `spec.md`,
+  the loser observes the file changed and re-reads before retrying its
+  commit (standard `git add` + `commit` flow handles this).
+- **Branches:** all commits go to whatever branch the orchestrator
+  workdir is currently on. Recommended operator practice: run the
+  orchestrator on a long-lived `main` checkout; treat the auto-commits
+  like a project journal that gets pushed at session end.
+
 ### 3. Atomic ready-unit claim
+
+**Schema change required.** Today, `next_ready_units` returns units that
+have no row in `work_units` yet — the "row exists" sentinel marks
+spawned units. That model doesn't support atomic claiming because there's
+nothing to UPDATE.
+
+The fix is to **pre-create `work_units` rows at `approve_plan` time**
+with a new `pending` status. After this change:
+
+- `approve_plan(feature_id)` inserts one row per planned unit with
+  `status='pending'`.
+- `next_ready_units` returns `pending` rows whose deps are all `done`.
+- `claimed` joins the status enum as a brief transitional state.
+
+Atomic claim (uses Python-generated timestamp to match the existing
+`orchestrator/state.py:_now()` convention):
 
 ```sql
 UPDATE work_units
-SET status = 'claimed', claimed_by = ?, claimed_at = NOW()
-WHERE unit_id = ? AND status = 'ready'
+SET status = 'claimed', claimed_by = ?, claimed_at = ?
+WHERE unit_id = ? AND status = 'pending'
 RETURNING unit_id;
 ```
 
 If the UPDATE returns a row, caller owns the unit. Otherwise someone
-else claimed it; caller moves on. `atomic_claim()` is a primitive
-callable by either the daemon or the lead (via `spawn_unit`). On the
-daemon path, the daemon claims first then orchestrates spawn + cycle.
-On the lead path, `spawn_unit`'s entry performs the claim. Either way,
-a claimed unit moves to `coding`/`in_ci`/etc. via the existing
-state-machine transitions; the `claimed` status is a brief transitional
-state only.
+else already claimed it; caller moves on. `atomic_claim()` is a
+primitive callable by either the daemon or the lead (via `spawn_unit`).
+On the daemon path, the daemon claims first then orchestrates spawn +
+cycle. On the lead path, `spawn_unit`'s entry performs the claim.
+Either way, a claimed unit transitions to `coding` / `in_ci` / etc. via
+the existing state machine; `claimed` is a brief transitional state only.
 
-Adds `claimed` to the unit-status enum (small migration). SQLite WAL
-mode handles concurrent readers/writers fine at this scale.
+SQLite WAL mode handles concurrent readers/writers fine at this scale.
 
 ### 4. Headless daemon
 
