@@ -259,24 +259,93 @@ dependencies. Examples that often work even at large enterprises:
 When you hit a repo with internal deps, that's the signal to either
 vendor the deps, swap the repo for the pilot, or revisit this entry.
 
-### Bedrock / Vertex AI Worker (managed Claude on AWS/GCP)
-Same Claude, different infra. Cheaper at volume; compliance-friendly.
-**Effort:** ~1 day each (most code reuses).
+### DockerAiderWorker (multi-model aider inside the Docker worker)
+Implement the `Worker` protocol against `aider` instead of `claude` —
+multi-model support out of the box (Claude, GPT, Gemini, Llama). The
+Docker worker abstraction shipped in F-001-U-1 is the seam: a new
+`orchestrator/workers/docker_aider.py` module mirrors the shape of
+`docker_claude_code.py`, plus an aider invocation in
+`docker/aider.Dockerfile` (or extend `worker.Dockerfile` behind a build
+arg) and a factory branch in `orchestrator/workers/__init__.py` keyed
+on `ORCH_WORKER_BACKEND=docker_aider`.
+
+Reuses verbatim: the cred-boundary plumbing (whitelist env, never-mount
+list, registry passthrough), the DNS allowlist (`network/allowlist.
+dnsmasq.conf`), the `doctor` audit shape, the timeout handling.
+
+New work: aider CLI argv builder (different flag set), output parsing
+for aider's session/result formats, prompt re-tuning (the agent prompts
+in `orchestrator/prompts/` reference Claude's terminal markers — aider
+needs a parallel set or a model-agnostic emit convention), provider-key
+forwarding (`OPENAI_API_KEY`, `GEMINI_API_KEY`, etc. added to the env
+whitelist only when the user explicitly opts in via
+`ORCH_AIDER_PROVIDERS=openai,gemini`).
+
+**Effort:** ~150 LOC + tests on top of F-001-U-1's abstraction. Add the
+provider-key forwarding to the cred-audit so the doctor command shows
+exactly which keys cross the boundary, mirroring the
+`ANTHROPIC_API_KEY` flag already there.
+
+### DockerOpenAICodexWorker (GPT-5 / Codex via OpenAI Assistants)
+Implement the `Worker` protocol against the OpenAI Assistants API. Same
+container-isolation story as `DockerClaudeCodeWorker` — read-only
+rootfs, `--cap-drop=ALL`, dnsmasq allowlist — but the in-container
+binary is the openai CLI (or a thin Python wrapper around the
+Assistants SDK) rather than `claude`. Factory keys on
+`ORCH_WORKER_BACKEND=docker_openai_codex`.
+
+Reuses: container hardening, mounts, network allowlist, timeouts,
+cred-audit receipts.
+
+New work: Assistants thread/run lifecycle (different shape than
+`claude --resume <uuid>` — `thread_id` is the equivalent), tool-call
+forwarding (Assistants doesn't bundle a Bash tool by default; either
+mount `bash` as a function tool or use the Code Interpreter feature),
+prompt re-tuning for GPT-5's calibration. `OPENAI_API_KEY` gets a
+container-side `--env` entry in API-key mode (no OAuth equivalent on
+the OpenAI side today).
+
+**Effort:** ~150 LOC + tests on top of F-001-U-1's abstraction. The
+prompt re-tuning is the largest single unknown — Claude's terminal
+markers (`PR_URL:`, `TESTS_PASS`) need to survive a model swap.
+
+### BedrockClaudeWorker (managed Claude on AWS Bedrock)
+Same Claude as `ManagedAgentWorker`, hosted in AWS Bedrock instead of
+Anthropic's Managed Agents. Compliance-friendly for shops that need
+their Claude calls inside an AWS account; cheaper at volume on
+committed-throughput contracts. Factory keys on
+`ORCH_WORKER_BACKEND=bedrock`.
+
+Reuses: the Worker protocol surface, the agent prompts (verbatim —
+Bedrock serves the same Claude model family), the `_resource_signature`
+caching scheme (Bedrock model IDs slot into the signature).
+
+New work: AWS auth (IAM role / `AWS_PROFILE` / SSO via boto3), region
+selection (`AWS_REGION` env), Bedrock's request/response shape
+(different from `client.beta.agents` — uses `bedrock-runtime.InvokeModel`
+or the Converse API), session continuity (Bedrock has no first-class
+session object today — fall back to "Path 2" from the PROPOSAL doc:
+orchestrator-managed transcript prepended on each invocation). Bedrock
+doesn't give us a gVisor sandbox — the orchestrator-side guarantees
+shift to "AWS account boundary" instead.
+
+**Effort:** ~150 LOC + tests on top of F-001-U-1's abstraction. The
+session-continuity fallback is the biggest implementation departure
+from the Claude Code worker; estimate could grow if Bedrock ships
+first-class sessions in the meantime.
 
 ### LocalWorker (self-driven loop on user infra)
 No Managed Agents dependency.
 **Effort:** ~2 days.
 
 The naïve "Claude Code subprocess on the host" version. Better isolated
-variant — Docker containers + claude.ai OAuth + DNS allowlist — is spec'd
-in [`docs/PROPOSAL-docker-workers.md`](docs/PROPOSAL-docker-workers.md).
-That proposal supersedes this entry once anyone picks it up; ~5 days
-total for a polished v1 including the network allowlist + internal-
-registry support.
-
-### OpenAI Assistants Worker
-Different model family; real behavior-parity work.
-**Effort:** ~3 days.
+variant — Docker containers + claude.ai OAuth + DNS allowlist — shipped
+in F-001 (see
+[`docs/PROPOSAL-docker-workers.md`](docs/PROPOSAL-docker-workers.md) for
+the proposal that drove the design, and `orchestrator/workers/docker_claude_code.py`
+for the implementation). This entry stays as the unisolated-subprocess
+variant for hosts where Docker isn't available; revisit only if a real
+demand surfaces.
 
 ---
 

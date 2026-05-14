@@ -248,6 +248,123 @@ the threat model, build instructions, and credential-boundary audit.
 `orchestrator doctor` prints which backend is currently selected and, on
 docker, audits the env vars / mounts / probes for the container.
 
+`orchestrator init` asks **"Managed Agents or Docker workers?"** during
+setup and writes `ORCH_WORKER_BACKEND` into `.env` accordingly. Picking
+docker also runs a one-shot `docker version` probe; if the daemon
+isn't reachable yet, the wizard prints a one-line warning and continues
+— you can start Docker later and `orchestrator doctor` will re-check.
+
+## Choosing a worker backend
+
+The two-backend choice is the most consequential decision at install
+time. Trade-offs, distilled from
+[`docs/PROPOSAL-docker-workers.md`](docs/PROPOSAL-docker-workers.md):
+
+| Axis | Managed Agents (default) | Docker workers (opt-in) |
+|---|---|---|
+| **Auth** | `sk-ant-` API key (`ANTHROPIC_API_KEY`) | claude.ai OAuth (your subscription, mounted from `~/.claude`); API key still usable if you set `ANTHROPIC_API_KEY` |
+| **Sandbox** | gVisor by default (Anthropic-managed) | Docker `--cap-drop=ALL --security-opt=no-new-privileges --read-only --user 1000:1000`, optionally `--runtime=runsc` for gVisor parity |
+| **Network** | Kernel-side allowlist (`ALLOWED_NETWORK_HOSTS`) on the Managed Agents host | dnsmasq DNS allowlist on `127.0.0.1:5353` (slightly weaker — raw-IP egress remains possible) |
+| **Concurrency** | High (Anthropic's quotas) | Bounded by your claude.ai plan's concurrent-session cap (~1–2 on Pro, more on Team/Max) |
+| **Cost** | `$/session-hour` + token costs against your API key | Flat — your existing claude.ai subscription |
+| **Internal package registries** | No (not reachable from Managed Agents sandbox) | Yes — auto-mounts `~/.npmrc`, `~/.pip/pip.conf`, `~/.docker/config.json` read-only into the worker |
+| **Cost telemetry** | Per-session billing data | None (flat subscription) |
+| **Setup** | API key in `.env` | Docker daemon, image build, dnsmasq sidecar |
+| **Image distribution** | Anthropic-managed | You maintain `orchestrator/worker:latest` |
+
+### Credential boundary + `doctor` audit (Docker)
+
+The docker backend enforces a **strict credential boundary** wired up
+in [`orchestrator/workers/docker_claude_code.py`](orchestrator/workers/docker_claude_code.py).
+Two invariants the `doctor` command renders as receipts:
+
+1. **Only whitelisted env vars cross into the container.** `GITHUB_TOKEN`
+   always; `ANTHROPIC_API_KEY` only in API-key mode. Random host
+   vars (`AWS_*`, `SSH_*`, `GCP_*`, `KUBE*`, `DOCKER_*`, …) are
+   dropped on the floor — the subprocess env handed to `docker run` is
+   a curated dict, never `os.environ`.
+2. **Only safe host paths get mounted.** `~/.ssh`, `~/.aws`, `~/.gitconfig`,
+   `~/.git-credentials`, `~/.config/gcloud`, `~/.kube` are in the
+   `NEVER_MOUNTED_HOST_PATHS` list and refused even if a user names
+   one via `ORCH_WORKER_EXTRA_MOUNTS`. Workspace, claude.ai sessions
+   dir (rw), and registry credentials (ro) are the only mounts.
+
+`orchestrator doctor` with `ORCH_WORKER_BACKEND=docker` prints the full
+audit — every env var passed/dropped, every mount, every NEVER path the
+host has but the worker won't see — so you can verify what crossed the
+boundary on each spawn.
+
+### OAuth lifecycle (Docker, claude.ai mode)
+
+When `ANTHROPIC_API_KEY` is unset, the docker worker mounts your
+`~/.claude` directory **read-only** so Claude Code inside the container
+finds the OAuth token issued for your claude.ai subscription. Two
+properties to know:
+
+- **Mid-job refresh.** Claude Code refreshes the OAuth token in-place;
+  the writable `~/.claude/sessions` sub-mount (bound rw separately
+  from the ro creds mount) is where session state lands across
+  `claude --resume` invocations. A worker that's been running for
+  hours stays authenticated.
+- **No fallback identity.** If the user has not logged into claude.ai
+  on the host, there is no claude.ai token to mount; the worker won't
+  fall back to the API key automatically. Set `ANTHROPIC_API_KEY` to
+  switch modes explicitly (auto-selected by
+  `select_auth_mode(host_env)`), or `claude login` on the host first.
+
+The OAuth token is a real bearer credential. A worker that's rogue
+*within its sandbox* can read it (the same threat surface as you
+running `claude` locally yourself). The mitigations are read-only
+mounting + capability drop + the DNS allowlist below.
+
+### DNS allowlist (Docker)
+
+Worker containers launch with `--dns=127.0.0.1 --dns-search=.`,
+pinning name resolution to a local dnsmasq sidecar on
+`127.0.0.1:5353` started by
+[`scripts/run-worker-dns.sh`](scripts/run-worker-dns.sh). The
+config in
+[`orchestrator/network/allowlist.dnsmasq.conf`](orchestrator/network/allowlist.dnsmasq.conf)
+forwards `github.com`, `api.github.com`, `pypi.org`,
+`registry.npmjs.org`, `api.anthropic.com`, etc. to Cloudflare DNS
+(1.1.1.1) and resolves anything else to `0.0.0.0` (non-routable —
+connect fails).
+
+`ORCH_INTERNAL_REGISTRY_HOSTS=a.example,b.example` adds custom hosts
+to the allowlist for internal artifactory / private PyPI deployments;
+the `doctor` audit lists every host added this way under "Internal
+registry hosts (added to DNS allowlist)".
+
+**Soft boundary, not a guarantee.** This is name-level filtering —
+a compromised worker that hardcodes an IP can still reach it. See
+[SECURITY.md](SECURITY.md#non-defenses--what-the-orchestrator-does-not-defend-against-known-limitations)
+for the full non-defense list and
+[`docs/PROPOSAL-docker-workers.md`](docs/PROPOSAL-docker-workers.md)
+for the threat-model rationale.
+
+### Running the E2E suite locally
+
+The end-to-end smoke suite added in F-001-U-6 stitches the Docker
+worker against a real Docker daemon — build worker image, launch
+dnsmasq, spawn a worker against
+[`tests/fixtures/sandbox-repo/`](tests/fixtures/sandbox-repo/), and
+exercise the auth/cred/network invariants the unit tests pin in
+isolation.
+
+```bash
+# Requirements on host: Docker daemon running, ~/.claude with a real
+# claude.ai session for the OAuth-path tests.
+pytest tests/e2e -q                          # most coverage, skips claude itself
+ORCH_E2E_CLAUDE_AUTH=1 pytest tests/e2e -q   # also runs the spawn/resume round-trip
+```
+
+The whole module auto-skips when Docker isn't reachable
+([`tests/e2e/conftest.py`](tests/e2e/conftest.py)'s `docker_available`
+autouse fixture), so you don't have to gate on env vars yourself.
+Tests that need a real claude.ai login are individually gated on
+`ORCH_E2E_CLAUDE_AUTH=1` so contributors without a claude.ai session
+see a clear skip reason.
+
 ## Network allowlist (Managed Agent containers)
 
 Coder/tester/reviewer containers run with **`limited` outbound networking**

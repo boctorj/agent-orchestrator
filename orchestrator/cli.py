@@ -45,6 +45,46 @@ def _version() -> str:
         return "unknown (not installed)"
 
 
+def _docker_daemon_warning() -> str | None:
+    """Return a one-line warning if Docker isn't usable yet, else None.
+
+    Two failure modes the init wizard surfaces to a user who picked the
+    docker backend:
+      1. The `docker` CLI is not on PATH at all.
+      2. The CLI is present but `docker version` fails (daemon not running,
+         socket permissions, etc.).
+
+    Never raises — a successful check or any unexpected error returns the
+    appropriate string (or None). The wizard treats this as advisory; the
+    .env still records `ORCH_WORKER_BACKEND=docker` so a subsequent
+    `orchestrator doctor` can re-check after the user fixes the issue.
+    """
+    if not shutil.which("docker"):
+        return (
+            "`docker` CLI not found on PATH — install Docker Desktop / Engine "
+            "before running `orchestrator run`."
+        )
+    try:
+        # subprocess imported lazily so the import cost only hits the
+        # docker branch of the wizard.
+        import subprocess  # noqa: PLC0415  # nosec B404 — invoking `docker` is the point
+
+        proc = subprocess.run(  # nosec B603 B607 — argv list, no shell; docker on PATH  # noqa: S603, S607
+            ["docker", "version", "--format", "{{.Server.Version}}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"could not probe Docker daemon ({exc.__class__.__name__}): {exc}"
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "non-zero exit").strip().splitlines()
+        first = detail[0] if detail else "non-zero exit"
+        return f"Docker daemon not reachable yet: {first}"
+    return None
+
+
 @click.group(help="Multi-agent SDLC orchestrator.")
 @click.version_option(_version(), prog_name=PKG_NAME)
 def cli() -> None:
@@ -410,10 +450,20 @@ def verify_repo_cmd(repo_url: str) -> None:
 
 @cli.command(help="Interactive setup wizard: writes .env, initializes state.db.")
 @click.option("--force", is_flag=True, help="Overwrite existing .env without asking.")
-def init(force: bool) -> None:
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Run the prompts and print the .env that would be written; touch no files.",
+)
+def init(force: bool, dry_run: bool) -> None:
     _silence_httpx_logging()
     console = Console()
     console.print("\n[bold cyan]Agent orchestrator setup[/bold cyan]\n")
+    if dry_run:
+        console.print(
+            "[yellow]--dry-run:[/yellow] no files will be written; the planned "
+            ".env contents will be printed at the end.\n"
+        )
 
     # Sanity: are we in an orchestrator project directory?
     pyproject = Path("pyproject.toml")
@@ -428,11 +478,14 @@ def init(force: bool) -> None:
         if not click.confirm("Continue anyway?", default=False):
             return
 
-    # Check for existing .env
+    # Check for existing .env. --dry-run never touches disk so the
+    # overwrite prompt is irrelevant; skip it so the snapshot tests can
+    # run against a workspace that already happens to have a .env file.
     env_file = Path(".env")
     if (
         env_file.exists()
         and not force
+        and not dry_run
         and not click.confirm(
             f".env already exists at {env_file.resolve()} — overwrite?", default=False
         )
@@ -546,14 +599,50 @@ def init(force: bool) -> None:
         "For phone push notifications on escalations + ready-to-merge events.\n"
         "Use a hard-to-guess string (treat like a password)."
     )
-    suggested = "agent-orch-" + os.urandom(9).hex()[:12]
+    # Suggested topic must be deterministic under --dry-run so the
+    # snapshot test isn't flaky. The placeholder is intentionally
+    # obvious (`<random>`) so a real user pasting from a dry run sees
+    # they need to substitute it.
+    suggested = "agent-orch-<random>" if dry_run else "agent-orch-" + os.urandom(9).hex()[:12]
     ntfy = click.prompt(
         f"  NTFY_TOPIC (suggested: {suggested}, blank to skip)",
         default="",
         show_default=False,
     )
 
-    # 4. Write .env
+    # 4. Worker backend selection (F-001-U-5).
+    console.print("\n[bold]4. Worker backend[/bold]")
+    console.print(
+        "Where coder / tester / reviewer agents actually run.\n"
+        "  [cyan]m[/cyan]anaged_agents — Anthropic-hosted gVisor sandboxes "
+        "(default; needs ANTHROPIC_API_KEY only)\n"
+        "  [cyan]d[/cyan]ocker         — locally-managed containers + your "
+        "claude.ai OAuth session\n"
+        "                   (internal-registry passthrough; Docker daemon "
+        "required)\n"
+        "See [link]docs/PROPOSAL-docker-workers.md[/link] for the threat model + "
+        "trade-offs."
+    )
+    backend_choice = click.prompt(
+        "  Worker backend (m/d)",
+        type=click.Choice(["m", "d"], case_sensitive=False),
+        default="m",
+    ).lower()
+    worker_backend = "docker" if backend_choice == "d" else "managed_agents"
+
+    # Best-effort daemon reachability check when the user picks docker.
+    # Surfaces a one-line warning if `docker version` fails; never blocks
+    # the wizard (the user may be configuring on a host before installing
+    # Docker, or building the image on a separate machine).
+    if worker_backend == "docker":
+        warning = _docker_daemon_warning()
+        if warning:
+            console.print(f"  [yellow]![/yellow] {warning}")
+            console.print(
+                "  [dim]Run `orchestrator doctor` after starting Docker to re-check.[/dim]"
+            )
+
+    # 5. Assemble .env
     env_lines = [
         "# Anthropic API key for Managed Agents (separate from claude.ai subscription)",
         f"ANTHROPIC_API_KEY={api_key}",
@@ -567,24 +656,41 @@ def init(force: bool) -> None:
         "# Optional ntfy.sh push topic (blank to disable)",
         f"NTFY_TOPIC={ntfy}",
         "",
+        "# Worker backend: managed_agents (default) or docker.",
+        "# See README.md 'Choosing a worker backend' and docs/PROPOSAL-docker-workers.md.",
+        f"ORCH_WORKER_BACKEND={worker_backend}",
+        "",
     ]
+
+    if dry_run:
+        console.print("\n[bold]--dry-run: planned .env contents[/bold]")
+        console.print("[dim]" + "-" * 64 + "[/dim]")
+        for line in env_lines:
+            console.print(line)
+        console.print("[dim]" + "-" * 64 + "[/dim]")
+        console.print(
+            "\n[yellow]No files were written.[/yellow] "
+            "Re-run without [cyan]--dry-run[/cyan] to apply."
+        )
+        return
+
     env_file.write_text("\n".join(env_lines))
     console.print(f"\n[green]✓ wrote {env_file.resolve()}[/green]")
 
-    # 5. Initialize state.db
+    # 6. Initialize state.db
     from orchestrator import state
 
     state.init_db()
     console.print(f"[green]✓ initialized state.db at {state.STATE_DB}[/green]")
 
-    # 6. Subscribe ntfy reminder
+    # 7. Subscribe ntfy reminder
     if ntfy:
         console.print(
             f"\n[bold]Don't forget:[/bold] subscribe to topic [cyan]{ntfy}[/cyan] "
             "in the ntfy mobile app to receive push notifications."
         )
 
-    # 7. Next steps
+    # 8. Next steps
     console.print("\n[bold]Done![/bold] Next:\n")
     console.print("  1. [cyan]orchestrator doctor[/cyan]     — verify everything")
     console.print("  2. [cyan]orchestrator run[/cyan]        — launch Claude Code")

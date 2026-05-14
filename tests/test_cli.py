@@ -158,14 +158,16 @@ def test_init_writes_env_and_state_db(runner, tmp_path, monkeypatch, fake_httpx_
     db_file = tmp_path / "state.db"
     monkeypatch.setattr("orchestrator.state.STATE_DB", db_file)
 
-    # Inputs: API key, auth choice (p=PAT), GH token, ntfy topic (empty)
-    inputs = "sk-ant-fake-key\np\ngithub_pat_fake\n\n"
+    # Inputs: API key, auth choice (p=PAT), GH token, ntfy topic (empty),
+    # worker backend (m=managed_agents default).
+    inputs = "sk-ant-fake-key\np\ngithub_pat_fake\n\nm\n"
     result = runner.invoke(cli, ["init"], input=inputs)
     assert result.exit_code == 0, result.output
     assert (tmp_path / ".env").exists()
     env_text = (tmp_path / ".env").read_text()
     assert "ANTHROPIC_API_KEY=sk-ant-fake-key" in env_text
     assert "GITHUB_TOKEN=github_pat_fake" in env_text
+    assert "ORCH_WORKER_BACKEND=managed_agents" in env_text
     assert db_file.exists()
 
 
@@ -174,8 +176,9 @@ def test_init_rejects_bad_api_key_format(runner, tmp_path, monkeypatch, fake_htt
     (tmp_path / "pyproject.toml").write_text('[project]\nname = "agent-orchestrator"\n')
     monkeypatch.setattr("orchestrator.state.STATE_DB", tmp_path / "state.db")
 
-    # 1st API key bad → re-prompt; good one; auth choice (p); GH token; blank ntfy
-    inputs = "notvalid\nsk-ant-good\np\ngithub_pat_good\n\n"
+    # 1st API key bad → re-prompt; good one; auth choice (p); GH token; blank ntfy;
+    # worker backend (m).
+    inputs = "notvalid\nsk-ant-good\np\ngithub_pat_good\n\nm\n"
     result = runner.invoke(cli, ["init"], input=inputs)
     assert result.exit_code == 0, result.output
     assert "Must start with sk-ant-" in result.output
@@ -200,7 +203,7 @@ def test_init_force_skips_overwrite_prompt(runner, tmp_path, monkeypatch, fake_h
     (tmp_path / "pyproject.toml").write_text('[project]\nname = "agent-orchestrator"\n')
     monkeypatch.setattr("orchestrator.state.STATE_DB", tmp_path / "state.db")
 
-    inputs = "sk-ant-new\np\ngithub_pat_new\n\n"
+    inputs = "sk-ant-new\np\ngithub_pat_new\n\nm\n"
     result = runner.invoke(cli, ["init", "--force"], input=inputs)
     assert result.exit_code == 0, result.output
     assert "sk-ant-new" in (tmp_path / ".env").read_text()
