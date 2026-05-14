@@ -347,3 +347,64 @@ def test_run_doctor_probes_reports_no_docker_cli(monkeypatch):
     assert len(results) == 1
     assert results[0].ok is False
     assert "docker" in results[0].detail.lower()
+
+
+# ---------------------------------------------------------------------------
+# F-001-U-6 (PR #16 review M1): ORCH_DOCKER_WORKER_IMAGE env override is
+# wired into the doctor command so the audit + probes target the tag the
+# user actually built. The DEFAULT_IMAGE docstring in docker_claude_code.py
+# already promises this; this test pins the wiring.
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_honors_orch_docker_worker_image_env_override(monkeypatch, tmp_path, fake_httpx_get):
+    """When ORCH_DOCKER_WORKER_IMAGE is set, both the rendered cred
+    audit's `Image:` line AND the image-probe target use that tag —
+    not the bare `orchestrator/worker:latest` default. Catches the
+    pre-PR-16 silent gap where the env var was documented but
+    never consumed by callers in cli.py."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=sk-ant-fake\nGITHUB_TOKEN=github_pat_fake\n")
+    (tmp_path / ".mcp.json").write_text('{"mcpServers": {}}')
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "agent-orchestrator"\n')
+    db_file = tmp_path / "state.db"
+    monkeypatch.setattr("orchestrator.state.STATE_DB", db_file)
+    from orchestrator import state
+
+    state.init_db()
+
+    monkeypatch.setenv("ORCH_WORKER_BACKEND", "docker")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake")
+    monkeypatch.setenv("ORCH_DOCKER_WORKER_IMAGE", "orchestrator/worker:test")
+
+    captured_image_inspect: dict = {}
+
+    class _Proc:
+        def __init__(self, stdout="ok", returncode=0):
+            self.stdout = stdout
+            self.stderr = ""
+            self.returncode = returncode
+
+    def _run(argv, **kw):
+        if argv[:3] == ["docker", "version", "--format"]:
+            return _Proc(stdout="25.0.0", returncode=0)
+        if argv[:3] == ["docker", "image", "inspect"]:
+            # The image probe's argv[3] is the image tag the doctor
+            # command is asking about. Capture it for assertion.
+            captured_image_inspect["image"] = argv[3]
+            return _Proc(stdout="sha256:abcd", returncode=0)
+        if argv[:2] == ["docker", "run"]:
+            return _Proc(stdout="claude 1.2.3", returncode=0)
+        return _Proc(stdout="", returncode=0)
+
+    monkeypatch.setattr("orchestrator.workers.docker_claude_code.subprocess.run", _run)
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+
+    result = CliRunner().invoke(cli, ["doctor"])
+
+    assert "Image: orchestrator/worker:test" in result.output, (
+        f"audit Image: line did not pick up the env override: {result.output!r}"
+    )
+    assert captured_image_inspect.get("image") == "orchestrator/worker:test", (
+        f"probe did not target the env-override image: {captured_image_inspect!r}"
+    )

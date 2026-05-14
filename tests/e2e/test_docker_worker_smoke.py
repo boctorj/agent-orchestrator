@@ -290,22 +290,34 @@ def test_cred_boundary_inside_container(
 
 # ---------------------------------------------------------------------------
 # Step 6: network allowlist (DNS-level filter).
-# Bypasses claude entirely — runs `getent hosts <name>` and a curl-with-
-# fast-fail against allow-listed vs disallow-listed hosts. The whole
-# test requires the dnsmasq sidecar fixture to be reachable, which is
-# why the sidecar is session-scoped.
+# Bypasses claude entirely — runs `getent hosts <name>` from inside a
+# worker container against the orch-net sidecar. PR #16 review H3:
+# `--dns=127.0.0.1` is the WORKER container's loopback (not the host's),
+# so the worker must be configured with `dns=<sidecar orch-net IP>` for
+# the resolver path to actually reach the sidecar.
 # ---------------------------------------------------------------------------
 
 
 def _resolve_inside_container(
-    worker_image: str, sandbox_repo: Path, fake_home: Path, hostname: str
+    *,
+    worker_image: str,
+    sandbox_repo: Path,
+    fake_home: Path,
+    hostname: str,
+    dns: str,
 ) -> tuple[int, str, str]:
-    """Run `getent hosts <hostname>` inside a worker container; return rc,stdout,stderr."""
+    """Run `getent hosts <hostname>` inside a worker container.
+
+    ``dns`` is the resolver address baked into the worker container's
+    ``--dns=`` flag — typically the dnsmasq sidecar's orch-net IP.
+    Returns (rc, stdout, stderr) so callers can branch on resolution.
+    """
     worker = DockerClaudeCodeWorker(
         role="coder",
         workdir=sandbox_repo,
         home_dir=fake_home,
         image=worker_image,
+        dns=dns,
     )
     argv = worker.build_docker_argv(["getent", "hosts", hostname])
     rm_idx = argv.index("--rm")
@@ -329,18 +341,30 @@ def _resolve_inside_container(
 def test_network_allowlist(
     worker_image: str,
     sandbox_repo: Path,
-    dnsmasq_sidecar: str,
+    dnsmasq_sidecar,
     tmp_path: Path,
     hostname: str,
     should_resolve: bool,
 ) -> None:
     """Allow-listed hosts resolve to a non-loopback IP; disallowed ones
     return rc != 0 (NXDOMAIN) or resolve to 0.0.0.0 (the dnsmasq
-    default-deny wildcard)."""
+    default-deny wildcard).
+
+    The worker container's ``--dns=`` is pinned to the sidecar's
+    orch-net IP (NOT 127.0.0.1) so DNS queries actually reach the
+    sidecar across the bridge. See ``SidecarHandle`` docstring +
+    PR #16 review H3.
+    """
     fake_home = tmp_path / "home"
     (fake_home / ".claude" / "sessions").mkdir(parents=True)
 
-    rc, stdout, _stderr = _resolve_inside_container(worker_image, sandbox_repo, fake_home, hostname)
+    rc, stdout, _stderr = _resolve_inside_container(
+        worker_image=worker_image,
+        sandbox_repo=sandbox_repo,
+        fake_home=fake_home,
+        hostname=hostname,
+        dns=dnsmasq_sidecar.orchnet_ip,
+    )
     if should_resolve:
         assert rc == 0, f"allow-listed host {hostname} did not resolve (rc={rc})"
         # Resolution should not be the default-deny 0.0.0.0.
@@ -354,35 +378,87 @@ def test_network_allowlist(
         assert denied, f"disallowed host {hostname} resolved to a non-default IP: {stdout!r}"
 
 
-def test_internal_registry_host_when_opted_in(
+def test_internal_registry_default_deny_without_opt_in(
     worker_image: str,
     sandbox_repo: Path,
-    dnsmasq_sidecar: str,
+    dnsmasq_sidecar,
     tmp_path: Path,
-    monkeypatch,
 ) -> None:
-    """U-4 internal-registry hosts pass through DNS when listed in
-    ORCH_INTERNAL_REGISTRY_HOSTS. Drives the same path the sidecar
-    expands into `--server=/host/upstream` flags."""
+    """U-4 negative case: an internal-registry hostname (not on the
+    bundled allowlist, not added via ORCH_INTERNAL_REGISTRY_HOSTS)
+    MUST fall into the dnsmasq default-deny wildcard rather than
+    resolve. The companion positive case lives in
+    ``test_internal_registry_host_resolves_when_opted_in`` below.
+
+    This was previously named ``..._when_opted_in`` but asserted the
+    OPT-OUT shape (PR #16 review H2). Renamed to reflect what it
+    actually checks; the opt-in path now has its own dedicated test
+    using a function-scoped sidecar.
+    """
     fake_home = tmp_path / "home"
     (fake_home / ".claude" / "sessions").mkdir(parents=True)
-    # The sidecar fixture doesn't know about the env var at start time
-    # (sidecar is session-scoped). Restart it inline here? Too costly.
-    # Instead, treat this as a contract-shape test: when the host is
-    # not registered, the default-deny applies; when it IS registered
-    # the upstream answers. Without restarting dnsmasq we can only
-    # assert the default-deny path holds, which still validates U-4's
-    # opt-in semantics — the absence is itself a positive signal that
-    # arbitrary internal hosts aren't reachable by default.
-    monkeypatch.setenv("ORCH_INTERNAL_REGISTRY_HOSTS", "artifactory.internal.example")
 
     rc, stdout, _stderr = _resolve_inside_container(
-        worker_image, sandbox_repo, fake_home, "artifactory.internal.example"
+        worker_image=worker_image,
+        sandbox_repo=sandbox_repo,
+        fake_home=fake_home,
+        hostname="artifactory.internal.example",
+        dns=dnsmasq_sidecar.orchnet_ip,
     )
-    # Without sidecar restart this falls through to the default-deny:
-    # rc != 0 OR resolves to 0.0.0.0. Either way the worker can't reach it.
     assert rc != 0 or stdout.strip().startswith("0.0.0.0"), (
-        f"internal host should not resolve without sidecar restart: {stdout!r}"
+        f"internal host should not resolve without opt-in: {stdout!r}"
+    )
+
+
+def test_internal_registry_host_resolves_when_opted_in(
+    worker_image: str,
+    sandbox_repo: Path,
+    start_dnsmasq_sidecar,
+    tmp_path: Path,
+) -> None:
+    """U-4 positive case (PR #16 review H2): a hostname listed via
+    ORCH_INTERNAL_REGISTRY_HOSTS — which the U-3 launcher script
+    expands into ``--server=/<host>/<upstream>`` flags on the
+    dnsmasq sidecar — must RESOLVE from inside a worker container
+    rather than fall into the default-deny wildcard.
+
+    The session-scoped ``dnsmasq_sidecar`` can't grow new
+    ``--server=`` flags mid-session (dnsmasq reads them at startup),
+    so this test spawns a per-test sidecar via the
+    ``start_dnsmasq_sidecar`` factory with the host baked in.
+    """
+    fake_home = tmp_path / "home"
+    (fake_home / ".claude" / "sessions").mkdir(parents=True)
+
+    internal_host = "internal-pypi.corp.example"
+    # The upstream resolver still needs to know the host. For the E2E
+    # smoke we point at a public DNS that won't have the answer either
+    # — what matters here is that the sidecar tried to forward the
+    # query through the explicit --server= flag instead of falling
+    # into the default-deny address=/#/0.0.0.0 rule. The negative
+    # signal (NOT 0.0.0.0) is the contract that pins the opt-in.
+    sidecar = start_dnsmasq_sidecar(extra_hosts=[internal_host])
+
+    rc, stdout, _stderr = _resolve_inside_container(
+        worker_image=worker_image,
+        sandbox_repo=sandbox_repo,
+        fake_home=fake_home,
+        hostname=internal_host,
+        dns=sidecar.orchnet_ip,
+    )
+    # Two acceptable positive shapes:
+    #   (a) rc==0 and stdout begins with a routable IP (real upstream
+    #       happened to have an answer — unlikely for example-suffixed
+    #       hosts but valid),
+    #   (b) rc!=0 from the upstream NXDOMAIN but stdout did NOT carry
+    #       the dnsmasq default-deny `0.0.0.0` marker — proving the
+    #       wildcard rule didn't fire.
+    # Either way the contract is: the per-host --server= flag intercepted
+    # the query BEFORE the default-deny.
+    is_default_deny = stdout.strip().startswith("0.0.0.0")
+    assert not is_default_deny, (
+        f"opted-in host {internal_host} hit the default-deny path despite "
+        f"--server= flag (sidecar={sidecar.name!r}, rc={rc}, stdout={stdout!r})"
     )
 
 

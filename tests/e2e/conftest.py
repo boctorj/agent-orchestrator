@@ -2,13 +2,14 @@
 
 The whole `tests/e2e/` directory is gated on a real Docker daemon being
 reachable from the test machine. CI runs it via the opt-in `e2e-docker`
-job; developer laptops without Docker installed see the module-level
-skip and move on.
+job (workflow file pending — see PR #16 body); developer laptops
+without Docker installed or without ``ORCH_RUN_E2E=1`` see the
+module-level skip and move on.
 
 Fixtures here:
 
   * ``docker_available`` — autouse, module-scoped skip gate. Every E2E
-    test silently skips when the `docker` CLI is missing or the daemon
+    test silently skips when ``ORCH_RUN_E2E`` isn't set OR the daemon
     isn't responding.
   * ``worker_image`` — session-scoped, builds
     `orchestrator/worker:test` from `docker/worker.Dockerfile` once
@@ -16,8 +17,14 @@ Fixtures here:
     budget on a cold cache; reusing across tests keeps the suite under
     the 90s target named in the unit description.
   * ``dnsmasq_sidecar`` — session-scoped, launches the dnsmasq sidecar
-    from U-3 on 127.0.0.1:5353 and ensures the orch-net bridge exists.
-    Returns the URL plus a teardown that stops the container.
+    from U-3 on the orch-net bridge. Returns a `SidecarHandle` with the
+    container's orch-net IP — that IP is what worker containers must
+    pass as `--dns=` (NOT 127.0.0.1, which is the worker container's
+    OWN loopback and never reaches the sibling sidecar).
+  * ``start_dnsmasq_sidecar`` — function-scoped factory; tests that
+    need a sidecar with bespoke ``--server=`` flags (e.g. the
+    internal-registry opt-in case from U-4) call this to spawn a fresh
+    sidecar, then must invoke ``.stop()`` on the returned handle.
   * ``sandbox_repo`` — function-scoped copy of the tiny fixture under
     ``tests/fixtures/sandbox-repo/`` into a tmp_path so writes by the
     container don't pollute the checked-in fixture.
@@ -34,6 +41,7 @@ import subprocess  # nosec B404 — invoking `docker` is the whole point
 import time
 import uuid
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -49,9 +57,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 DOCKERFILE = REPO_ROOT / "docker" / "worker.Dockerfile"
 DNS_SCRIPT = REPO_ROOT / "scripts" / "run-worker-dns.sh"
 FIXTURE_REPO = REPO_ROOT / "tests" / "fixtures" / "sandbox-repo"
+DNSMASQ_CONFIG = REPO_ROOT / "orchestrator" / "network" / "allowlist.dnsmasq.conf"
 TEST_IMAGE_TAG = "orchestrator/worker:test"
 TEST_NETWORK = "orch-net"
 DNSMASQ_CONTAINER_NAME = "orchestrator-e2e-dnsmasq"
+DNSMASQ_IMAGE = "4km3/dnsmasq:2.90-r3"
 
 
 def _docker_daemon_reachable(timeout: float = 5.0) -> bool:
@@ -165,28 +175,77 @@ def orch_net() -> Iterator[str]:
     yield TEST_NETWORK
 
 
-@pytest.fixture(scope="session")
-def dnsmasq_sidecar(orch_net: str) -> Iterator[str]:
-    """Run the U-3 dnsmasq sidecar in a container on the orch-net bridge.
+@dataclass(frozen=True)
+class SidecarHandle:
+    """Reference to a running dnsmasq sidecar container.
 
-    Production deploys this on the host via `scripts/run-worker-dns.sh`,
-    but the E2E suite needs the sidecar reachable from inside the
-    worker container's loopback ($127.0.0.1$). We launch dnsmasq in a
-    sibling container on the same `orch-net` bridge and rely on
-    Docker's per-network DNS plumbing.
+    ``orchnet_ip`` is the address worker containers must pass as
+    ``--dns=`` — it is the sidecar's IP on the ``orch-net`` bridge,
+    NOT ``127.0.0.1``. The 127.0.0.1 default in
+    ``DockerClaudeCodeWorker`` is what a host-side sidecar would use
+    (`scripts/run-worker-dns.sh`); inside a worker container,
+    127.0.0.1 is that container's OWN loopback and never reaches a
+    sibling sidecar (PR #16 review H3).
 
-    Returns the host:port string for any test that needs to verify
-    DNS responses directly. Teardown stops the container.
+    ``host_port`` is the loopback-published host:port (e.g.
+    ``127.0.0.1:5353``) for any host-side probe a test wants to run;
+    it is NOT what worker containers should target.
     """
-    name = f"{DNSMASQ_CONTAINER_NAME}-{uuid.uuid4().hex[:6]}"
-    config_path = REPO_ROOT / "orchestrator" / "network" / "allowlist.dnsmasq.conf"
-    if not config_path.is_file():
-        pytest.skip(f"missing dnsmasq config at {config_path}")
 
-    # Use the worker image to run dnsmasq is overkill; pick a tiny
-    # ready-made image. `4km3/dnsmasq` is a common minimal image; if
-    # it can't be pulled, skip — the suite stays green.
-    cmd = [
+    name: str
+    orchnet_ip: str
+    host_port: str | None = None
+
+    def stop(self) -> None:
+        """Tear down the sidecar container. Idempotent."""
+        subprocess.run(
+            ["docker", "rm", "-f", self.name],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+
+
+def _inspect_container_ip(name: str, network: str) -> str | None:
+    """Return the container's IPv4 address on ``network``, or None."""
+    proc = subprocess.run(
+        [
+            "docker",
+            "inspect",
+            name,
+            "--format",
+            f"{{{{.NetworkSettings.Networks.{network}.IPAddress}}}}",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return None
+    ip = proc.stdout.strip()
+    return ip or None
+
+
+def _start_dnsmasq_container(
+    *,
+    name: str,
+    network: str,
+    publish_host_port: int | None,
+    extra_server_flags: tuple[str, ...] = (),
+) -> tuple[int, str, str]:
+    """Spawn a dnsmasq container; return (rc, stdout, stderr).
+
+    Caller is responsible for tearing the container down via the
+    returned ``name`` (use the ``SidecarHandle.stop`` helper).
+
+    ``extra_server_flags`` is appended verbatim after the standard
+    dnsmasq args so callers can drive bespoke ``--server=`` flags for
+    internal-registry opt-in tests (the same expansion
+    ``scripts/run-worker-dns.sh`` performs from
+    ``ORCH_INTERNAL_REGISTRY_HOSTS``).
+    """
+    argv: list[str] = [
         "docker",
         "run",
         "-d",
@@ -194,41 +253,132 @@ def dnsmasq_sidecar(orch_net: str) -> Iterator[str]:
         "--name",
         name,
         "--network",
-        orch_net,
-        "-p",
-        "127.0.0.1:5353:53/udp",
-        "-p",
-        "127.0.0.1:5353:53/tcp",
+        network,
+    ]
+    if publish_host_port is not None:
+        argv += [
+            "-p",
+            f"127.0.0.1:{publish_host_port}:53/udp",
+            "-p",
+            f"127.0.0.1:{publish_host_port}:53/tcp",
+        ]
+    argv += [
         "--mount",
-        f"type=bind,source={config_path},target=/etc/dnsmasq.conf,readonly",
+        f"type=bind,source={DNSMASQ_CONFIG},target=/etc/dnsmasq.conf,readonly",
         "--cap-add=NET_ADMIN",
-        "4km3/dnsmasq:2.90-r3",
+        DNSMASQ_IMAGE,
         "--conf-file=/etc/dnsmasq.conf",
         "--keep-in-foreground",
         "--no-daemon",
         # Override listen-address so the container binds 0.0.0.0 (the
-        # host-side port-publish handles the loopback restriction).
+        # orch-net peers reach it via the bridge interface).
         "--listen-address=0.0.0.0",
         "--port=53",
+        *extra_server_flags,
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=False)
-    if proc.returncode != 0:
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=60, check=False)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+@pytest.fixture(scope="session")
+def dnsmasq_sidecar(orch_net: str) -> Iterator[SidecarHandle]:
+    """Run the U-3 dnsmasq sidecar in a container on the orch-net bridge.
+
+    Worker containers reach the sidecar via its orch-net IP (NOT
+    127.0.0.1 — see ``SidecarHandle`` docstring + PR #16 review H3).
+    A host-side port publish on 127.0.0.1:5353 lets tests run host-
+    side probes against the same sidecar if needed.
+
+    Yields a ``SidecarHandle`` so tests can read the orch-net IP and
+    pass it to ``DockerClaudeCodeWorker(dns=...)``.
+    """
+    if not DNSMASQ_CONFIG.is_file():
+        pytest.skip(f"missing dnsmasq config at {DNSMASQ_CONFIG}")
+
+    name = f"{DNSMASQ_CONTAINER_NAME}-{uuid.uuid4().hex[:6]}"
+    rc, _stdout, stderr = _start_dnsmasq_container(
+        name=name,
+        network=orch_net,
+        publish_host_port=5353,
+    )
+    if rc != 0:
         pytest.skip(
             f"could not start dnsmasq sidecar (probably no public-image pull): "
-            f"{proc.stderr.strip()[:400]}"
+            f"{stderr.strip()[:400]}"
         )
 
-    # Give dnsmasq a beat to bind.
-    time.sleep(0.5)
+    # Give dnsmasq a beat to bind + Docker a beat to attach the
+    # container to the orch-net bridge (otherwise the IP inspect
+    # races the network plumbing).
+    time.sleep(1.0)
+    ip = _inspect_container_ip(name, orch_net)
+    if not ip:
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=30, check=False)
+        pytest.skip(f"could not resolve {orch_net} IP for sidecar {name!r}")
+
+    handle = SidecarHandle(name=name, orchnet_ip=ip, host_port="127.0.0.1:5353")
     try:
-        yield "127.0.0.1:5353"
+        yield handle
     finally:
-        subprocess.run(
-            ["docker", "rm", "-f", name],
-            capture_output=True,
-            timeout=30,
-            check=False,
+        handle.stop()
+
+
+@pytest.fixture
+def start_dnsmasq_sidecar(orch_net: str) -> Iterator:
+    """Function-scoped factory for a per-test dnsmasq sidecar.
+
+    Used by tests that need ``--server=`` flag injection — e.g. the
+    internal-registry opt-in case from U-4, which validates that
+    ``ORCH_INTERNAL_REGISTRY_HOSTS=internal.example`` actually makes
+    that host resolve from inside a worker container. The session-
+    scoped ``dnsmasq_sidecar`` fixture can't be reconfigured mid-
+    session (dnsmasq reads its server flags at startup, not at
+    runtime), so each opt-in test pays the cost of a fresh sidecar.
+
+    Returns a callable: ``handle = start(extra_hosts=[...],
+    upstream="1.1.1.1")``. Every handle is registered for cleanup at
+    fixture teardown — tests don't have to remember to ``.stop()``
+    explicitly, but may, to free the sidecar before the test ends.
+    """
+    if not DNSMASQ_CONFIG.is_file():
+        pytest.skip(f"missing dnsmasq config at {DNSMASQ_CONFIG}")
+
+    started: list[SidecarHandle] = []
+
+    def _start(
+        *,
+        extra_hosts: list[str] | tuple[str, ...] = (),
+        upstream: str = "1.1.1.1",
+    ) -> SidecarHandle:
+        name = f"{DNSMASQ_CONTAINER_NAME}-fn-{uuid.uuid4().hex[:6]}"
+        flags = tuple(f"--server=/{host}/{upstream}" for host in extra_hosts)
+        rc, _stdout, stderr = _start_dnsmasq_container(
+            name=name,
+            network=orch_net,
+            publish_host_port=None,  # no host publish for per-test sidecars
+            extra_server_flags=flags,
         )
+        if rc != 0:
+            pytest.skip(f"could not start per-test dnsmasq sidecar: {stderr.strip()[:400]}")
+        time.sleep(1.0)
+        ip = _inspect_container_ip(name, orch_net)
+        if not ip:
+            subprocess.run(
+                ["docker", "rm", "-f", name],
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            pytest.skip(f"could not resolve {orch_net} IP for per-test sidecar {name!r}")
+        handle = SidecarHandle(name=name, orchnet_ip=ip)
+        started.append(handle)
+        return handle
+
+    try:
+        yield _start
+    finally:
+        for h in started:
+            h.stop()
 
 
 @pytest.fixture
