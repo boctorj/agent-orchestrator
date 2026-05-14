@@ -301,9 +301,7 @@ def safe_comment_pr(repo_url: str, pr_number: int, body: str) -> str:
         return f"WARN: post PR comment failed: {e}"
 
 
-def safe_submit_pr_review(
-    repo_url: str, pr_number: int, body: str, event: str = "COMMENT"
-) -> str:
+def safe_submit_pr_review(repo_url: str, pr_number: int, body: str, event: str = "COMMENT") -> str:
     try:
         github.submit_pr_review(repo_url, pr_number, body, event=event)
         return ""

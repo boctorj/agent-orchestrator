@@ -69,9 +69,7 @@ def post_pr_comment(repo_url: str, pr_number: int, body: str) -> None:
         r.raise_for_status()
 
 
-def submit_pr_review(
-    repo_url: str, pr_number: int, body: str, event: str = "COMMENT"
-) -> None:
+def submit_pr_review(repo_url: str, pr_number: int, body: str, event: str = "COMMENT") -> None:
     """Submit a review via the Reviews API (top-level review, no inline comments).
 
     Use this to supersede a prior CHANGES_REQUESTED review by the same user
