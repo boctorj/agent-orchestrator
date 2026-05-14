@@ -98,12 +98,37 @@ def test_worker_image_built(worker_image: str) -> None:
     assert proc.stdout.strip(), "image inspect returned empty id"
 
 
-def test_dnsmasq_sidecar_up(dnsmasq_sidecar: str) -> None:
-    """Sidecar fixture must surface a host:port string."""
-    assert ":" in dnsmasq_sidecar
-    host, port = dnsmasq_sidecar.split(":", 1)
-    assert host == "127.0.0.1"
-    assert port == "5353"
+def test_dnsmasq_sidecar_up(dnsmasq_sidecar) -> None:
+    """Sidecar fixture must surface a `SidecarHandle` carrying the
+    container name, the orch-net IP (the address worker containers must
+    target via `--dns=`), and the host-side publish for host probes.
+
+    Cycle-3 H3 fix changed the fixture from yielding a `"host:port"`
+    string to yielding a `SidecarHandle` dataclass; this assertion was
+    updated in cycle-4 review H1 (PR #16) to track the new shape.
+    """
+    from tests.e2e.conftest import SidecarHandle
+
+    assert isinstance(dnsmasq_sidecar, SidecarHandle), (
+        f"dnsmasq_sidecar fixture must yield a SidecarHandle, got {type(dnsmasq_sidecar).__name__}"
+    )
+    # Container name is the U-3 prefix plus a uuid suffix.
+    assert dnsmasq_sidecar.name.startswith("orchestrator-e2e-dnsmasq-"), (
+        f"sidecar name not from the U-3 family: {dnsmasq_sidecar.name!r}"
+    )
+    # orch-net IP must be set and look like an IPv4 dotted-quad. Looking
+    # at the IP exactly would couple this test to docker's bridge
+    # subnet (configurable); the shape check is what matters.
+    parts = dnsmasq_sidecar.orchnet_ip.split(".")
+    assert len(parts) == 4 and all(p.isdigit() for p in parts), (
+        f"orch-net IP not a dotted-quad: {dnsmasq_sidecar.orchnet_ip!r}"
+    )
+    # Host-side publish keeps the pre-H3 contract for any test that
+    # wants to probe the sidecar from the host (not via a worker
+    # container). The session-scoped sidecar always publishes 5353.
+    assert dnsmasq_sidecar.host_port == "127.0.0.1:5353", (
+        f"host_port drifted from the documented 127.0.0.1:5353: {dnsmasq_sidecar.host_port!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -550,22 +575,34 @@ def test_doctor_probes_run_against_real_docker(worker_image: str, orch_net: str)
     """The doctor probes exercise the real docker CLI: daemon, image,
     claude --version inside the container, and the orch-net bridge.
     All four must report OK when the E2E fixtures have set up the
-    image and the network."""
+    image and the network.
+
+    Cycle-4 review M1: the previous version asserted three of the four
+    (daemon, image, network) but the claude probe was checked only
+    implicitly. This now pins all four so a regression in any one of
+    them surfaces here.
+    """
     results = run_doctor_probes(image=worker_image, network=orch_net)
     by_name = {r.name: r for r in results}
+    receipts = [r.__dict__ for r in results]
 
-    # Both fixture setups should have made the daemon + image visible.
     daemon_probe = by_name.get("docker daemon reachable")
-    assert daemon_probe is not None and daemon_probe.ok, (
-        f"doctor daemon probe failed: {[r.__dict__ for r in results]!r}"
-    )
+    assert daemon_probe is not None and daemon_probe.ok, f"doctor daemon probe failed: {receipts!r}"
     image_probe = next(
         (r for r in results if r.name.startswith("image ") and r.name.endswith("built")),
         None,
     )
-    assert image_probe is not None and image_probe.ok, f"doctor image probe failed: {image_probe!r}"
+    assert image_probe is not None and image_probe.ok, (
+        f"doctor image probe failed: {image_probe!r} (all: {receipts!r})"
+    )
+    claude_probe = by_name.get("claude --version inside container")
+    assert claude_probe is not None and claude_probe.ok, (
+        f"doctor claude-cli probe failed: {claude_probe!r} (all: {receipts!r})"
+    )
     network_probe = by_name.get(f"network {orch_net} exists")
-    assert network_probe is not None and network_probe.ok
+    assert network_probe is not None and network_probe.ok, (
+        f"doctor network probe failed: {network_probe!r} (all: {receipts!r})"
+    )
 
 
 def test_orchestrator_doctor_cli_under_docker_backend(
