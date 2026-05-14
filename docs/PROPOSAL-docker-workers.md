@@ -1,9 +1,9 @@
 # Proposal: Docker workers + claude.ai auth + LLM abstraction
 
-**Status:** exploratory — not yet committed to v1 roadmap. Captured here so we
-don't have to re-derive it later.
+**Status:** ✅ **delivered v1 on 2026-05-14** as feature F-001 (units U-1 through U-6, PRs [#1](https://github.com/boctorj/agent-orchestrator/pull/1) · [#11](https://github.com/boctorj/agent-orchestrator/pull/11) · [#13](https://github.com/boctorj/agent-orchestrator/pull/13) · [#14](https://github.com/boctorj/agent-orchestrator/pull/14) · [#16](https://github.com/boctorj/agent-orchestrator/pull/16) · [#18](https://github.com/boctorj/agent-orchestrator/pull/18)). This doc preserves the design narrative; the canonical reference for current state is [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) §11 (Extension points: Worker protocol) and the inline docstrings in `orchestrator/workers/docker_claude_code.py`. Drifts between the original proposal and the shipped implementation are marked **[Δ shipped]** in the relevant sections.
 
-**Last updated:** 2026-05-12
+**Original revision:** 2026-05-12 (pre-Phase 1)
+**Last updated:** 2026-05-14 (post-delivery sweep — arch-drift skill)
 
 ---
 
@@ -17,82 +17,117 @@ uses.
 
 ## The shape of the change
 
-The orchestrator already has the right abstraction: the `Worker` protocol in
-`orchestrator/agents.py`. Today there's one implementation
-(`ManagedAgentWorker`) targeting Anthropic's Managed Agents API. This proposal
-adds a second:
+The orchestrator already had the right abstraction: the `Worker` protocol.
+This proposal added a second implementation alongside `ManagedAgentWorker`
+(Anthropic Managed Agents API) and split the protocol into its own module:
 
 ```
 orchestrator/
   workers/
-    __init__.py            ← `make_worker(role)` factory; picks backend from env
-    base.py                ← Worker protocol (moved from agents.py)
+    __init__.py            ← make_worker(role) factory; picks backend from env
+    base.py                ← Worker protocol (moved from agents.py in U-1)
     managed_agent.py       ← existing ManagedAgentWorker (relocated)
-    docker_claude_code.py  ← NEW
+    docker_claude_code.py  ← Docker-backed Worker
   network/
+    __init__.py            ← allowlist_config_path(), package-manager hosts
     allowlist.dnsmasq.conf ← outbound DNS allowlist for worker containers
 docker/
-  worker.Dockerfile        ← claude + git + gh + standard tooling
+  worker.Dockerfile        ← Python 3.12 + Node + git + gh + claude CLI
 scripts/
-  build-worker-image.sh
-  run-worker-dns.sh        ← starts dnsmasq on 127.0.0.1:5353
+  run-worker-dns.sh        ← starts dnsmasq sidecar on 127.0.0.1:5353,
+                             ensures orch-net bridge exists
+tests/
+  e2e/test_docker_worker_smoke.py  ← 11 E2E tests against real Docker
+  fixtures/sandbox-repo/   ← minimal repo fixture for the workspace mount
+.github/workflows/
+  ci.yml                   ← matrix: ubuntu/macos/windows × Python 3.11+3.12
+  e2e-docker.yml           ← opt-in E2E job, ORCH_RUN_E2E=1 gate
 ```
 
-The factory reads `ORCH_WORKER_BACKEND=managed_agents|docker` from `.env`.
-Everything downstream — `cycle_review`, the gate logic, the prompts, the
-verification cache, the dashboard — sees an opaque `Worker` interface and
-doesn't care which implementation answered.
+**[Δ shipped]** The proposal named the Worker protocol's home as
+`orchestrator/agents.py`. U-1 relocated it to `orchestrator/workers/base.py`;
+`orchestrator/agents.py` survives as a 4-line shim that re-exports
+`ManagedAgentWorker` for backwards-compat callers.
+
+The factory reads `ORCH_WORKER_BACKEND=managed_agents|docker` from `.env`
+(default: `managed_agents`). Everything downstream — `cycle_review`, the gate
+logic, the prompts, the verification cache, the dashboard — sees an opaque
+`Worker` interface and doesn't care which implementation answered.
 
 ## Auth: how claude.ai flows into containers
 
 Claude Code stores OAuth credentials in `~/.claude/credentials.json` (and
-related files). The Docker worker:
+related files). The Docker worker supports **two auth modes**, chosen at
+spawn time by `select_auth_mode()`:
 
-1. Mounts `~/.claude` **read-only** into each container:
-   `-v ~/.claude:/root/.claude:ro`
-2. Launches `claude -p "<task>"` inside the container
-3. Claude Code finds the creds, authenticates as the user, runs on the user's
-   subscription
+- **OAuth mode (default)** — when `ANTHROPIC_API_KEY` is unset on the host:
+  mount `~/.claude` **read-only** into each container at
+  `/home/agent/.claude`. Claude Code finds the creds and authenticates as
+  the user. Writable sub-mount `~/.claude/sessions` is bound separately so
+  `claude --resume` can persist session state without writing through the
+  read-only credentials mount.
+- **API-key mode** — when `ANTHROPIC_API_KEY` is set on the host: forward
+  it via `--env ANTHROPIC_API_KEY` into the container; do **not** mount
+  `~/.claude`. Useful for CI and for users who already have an API key.
 
-No API key needed anywhere. The same identity that runs the lead now also runs
-every worker.
+**[Δ shipped]** The original proposal showed the mount target as
+`/root/.claude`. Containers actually run as the non-root `agent` user
+(UID 1000); the real target is `/home/agent/.claude`. `select_auth_mode()`
+is logged at spawn time as `"Auth: claude.ai OAuth"` or `"Auth: API key"`.
 
-**Threat caveat:** a mounted credentials file means a rogue worker can read and
-exfiltrate the OAuth token. Different threat profile than gVisor + API keys.
-Mitigations below (network allowlist, capability drop, read-only mount).
+**Threat caveat:** a mounted credentials file means a rogue worker can read
+and exfiltrate the OAuth token. Different threat profile than gVisor +
+API keys. Mitigations: read-only mount, capability drop, DNS allowlist,
+NEVER_MOUNTED_HOST_PATHS guard (see "Internal-registry passthrough" below).
 
 **Concurrency caveat:** claude.ai subscriptions limit concurrent sessions
-(typically 1–2 on Pro, more on Team/Max). Parallel workers from `cycle_review`
-will serialize. Real cap depends on plan. Documented as a known limitation;
-mitigated by the cycle being naturally sequential most of the time (one tester
-at a time, one reviewer at a time per unit).
+(typically 1–2 on Pro, more on Team/Max). Parallel workers from
+`cycle_review` will serialize. Real cap depends on plan. Documented as a
+known limitation; mitigated by the cycle being naturally sequential most
+of the time (one tester at a time, one reviewer at a time per unit). Still
+open as a measurement question — see "Open questions" below.
 
 ## Sandbox model: Docker as the isolation boundary
 
-A locked-down `docker run` invocation, applied to every worker container:
+A locked-down `docker run` invocation, applied to every worker container.
+`DockerClaudeCodeWorker.build_docker_argv()` is the deterministic source of
+truth; the unit-test suite asserts on its output. Shipped shape (OAuth mode
+shown; API-key mode swaps the auth lines):
 
 ```bash
 docker run --rm \
-  --name "orch-${role}-${session_id}" \
-  --user 1000:1000 \                          # non-root inside container
-  --cap-drop=ALL \                             # drop every capability
+  --cap-drop=ALL \
   --security-opt=no-new-privileges \
-  --read-only \                                # rootfs is read-only
-  --tmpfs /tmp:size=512M \                     # writable tmpfs for /tmp
-  --tmpfs /home/agent/.cache:size=512M \       # writable for pip/npm caches
-  -v "${WORKDIR}:/workspace" \                 # one writable mount: the workspace
-  -v "${HOME}/.claude:/home/agent/.claude:ro" \   # creds read-only
-  --network=orch-net \                          # custom bridge
-  --dns=127.0.0.1 --dns-search=. \             # forced through allowlist resolver
-  --memory=4g --cpus=2 \                       # resource limits
-  --pids-limit=512 \
+  --read-only \
+  --tmpfs=/tmp:size=512M,mode=1777 \
+  --tmpfs=/home/agent/.cache:size=512M,mode=0700 \
+  --user 1000:1000 \
+  --memory=4g --cpus=2 --pids-limit=512 \
+  --network=orch-net \
+  --dns=127.0.0.1 --dns-search=. \
+  --mount type=bind,source=${WORKDIR},target=/workspace \
+  --mount type=bind,source=${HOME}/.claude/sessions,target=/home/agent/.claude/sessions \
+  --mount type=bind,source=${HOME}/.claude,target=/home/agent/.claude,readonly \
+  # auto-mounted registry config files (read-only) when present on host:
+  --mount type=bind,source=${HOME}/.npmrc,target=/home/agent/.npmrc,readonly \
+  --mount type=bind,source=${HOME}/.pip/pip.conf,target=/home/agent/.pip/pip.conf,readonly \
+  --mount type=bind,source=${HOME}/.docker/config.json,target=/home/agent/.docker/config.json,readonly \
+  # value-less --env form keeps secrets out of argv (docker reads from the
+  # curated subprocess env handed to it by build_subprocess_env):
+  --env GITHUB_TOKEN \
   orchestrator/worker:latest \
-  claude -p "<task>"
+  claude --output-format json -p "<task>"
 ```
 
-Optionally, if the user has `runsc` installed: `--runtime=runsc` adds gVisor's
-userspace-kernel isolation on top of Docker's namespacing — essentially closes
-the gap with Managed Agents.
+**[Δ shipped]** The proposal used `-v` shorthand throughout; the shipped
+argv uses `--mount type=bind,...` with explicit `readonly` keyword. Both
+work, but `--mount` is friendlier to paths with spaces and makes the
+read-only intent unambiguous in argv inspection.
+
+**[Δ shipped]** The proposal also listed `--runtime=runsc` as an optional
+gVisor isolation layer. v1 does **not** expose this as a flag or env knob.
+A user who wants gVisor parity can override Docker's default runtime
+system-wide; surfacing it as an orchestrator-level knob is on the backlog.
 
 This isn't *as good as* Managed Agents' default gVisor (host-kernel exploits
 still apply without `runsc`), but it's much better than a `LocalWorker` running
@@ -100,65 +135,108 @@ unrestricted on the user's filesystem. The capability drop, read-only rootfs,
 and tmpfs scratch space mean a compromised worker can scribble in `/workspace`
 (intended) and `/tmp` (ephemeral) but can't touch the host.
 
+### Credential boundary (the receipts surface)
+
+`build_subprocess_env()` and `build_cred_audit()` enforce a strict whitelist
+boundary. The subprocess env handed to `docker run` is a **curated dict**,
+NOT `os.environ`. Sensitive prefixes (`AWS_`, `SSH_`, `GCP_`, `GOOGLE_`,
+`AZURE_`, `KUBE`, `DOCKER_`) and full names (`OPENAI_API_KEY`,
+`ANTHROPIC_AUTH_TOKEN`, `GITHUB_APP_PRIVATE_KEY*`, `HOME`, `USER`, `PATH`)
+are dropped on the floor; only `GITHUB_TOKEN` (always) and
+`ANTHROPIC_API_KEY` (API-key mode only) cross the boundary.
+
+`CredAudit.render()` is what `orchestrator doctor` prints — five sections:
+env vars passed, env vars dropped (sensitives present on host that did
+**not** receive), mounts passed (labelled `(rw)` / `(ro)` / `(auto)` /
+`(extra)`), paths **never** mounted (only those that actually exist on
+host — receipt-accurate per PR #11 review SUGGESTION 3), and internal
+registry hosts added to the DNS allowlist.
+
 ## Network policy: replicating the allowlist
 
 Today's `ALLOWED_NETWORK_HOSTS` is enforced kernel-side by Anthropic's network
 policy. For Docker workers, the most pragmatic equivalent is **DNS-level
-filtering**:
+filtering** via a dnsmasq sidecar on `127.0.0.1:5353`. Shipped config
+(`orchestrator/network/allowlist.dnsmasq.conf`):
 
-1. The orchestrator launches a local dnsmasq on `127.0.0.1:5353` from
-   `network/allowlist.dnsmasq.conf`:
-   ```
-   address=/github.com/<resolved-ip>
-   address=/api.github.com/<resolved-ip>
-   address=/raw.githubusercontent.com/<resolved-ip>
-   address=/pypi.org/<resolved-ip>
-   address=/files.pythonhosted.org/<resolved-ip>
-   address=/registry.npmjs.org/<resolved-ip>
-   ... (mirror of ALLOWED_NETWORK_HOSTS + package managers)
-   no-resolv
-   server=  # empty upstream — no recursive resolution
-   ```
-2. Worker containers launch with `--dns=127.0.0.1`, `--dns-search=.`
-3. Any DNS query for a non-allowlisted host returns NXDOMAIN → the worker can't
-   reach it
+```
+# forward each allowed host to a real upstream
+server=/github.com/1.1.1.1
+server=/api.github.com/1.1.1.1
+server=/codeload.github.com/1.1.1.1
+server=/objects.githubusercontent.com/1.1.1.1
+server=/raw.githubusercontent.com/1.1.1.1
+server=/api.anthropic.com/1.1.1.1
+server=/pypi.org/1.1.1.1
+server=/files.pythonhosted.org/1.1.1.1
+server=/registry.npmjs.org/1.1.1.1
+# default-deny everything else
+address=/#/0.0.0.0
+```
 
-Bypassable if a worker hits raw IPs, but every standard agent action (`gh`,
-`git clone`, `pip install`) goes through DNS. For real exfiltration attempts
-(which use named C2 servers), this works.
+**[Δ shipped]** The original proposal showed `address=/host/<resolved-ip>`
+with `no-resolv` and an empty `server=`. The shipped model is the inverse:
+forward known-allowed hosts to a real upstream (1.1.1.1 by default), and
+use `address=/#/0.0.0.0` as the default-deny wildcard. Behaviour is
+equivalent at the policy layer (allow named hosts, deny everything else)
+but the dnsmasq mechanics differ.
 
-The killer side-effect: **internal package registries work**. Mount the user's
-`~/.npmrc`, `~/.pip/pip.conf`, `~/.docker/config.json` into the container and
-the worker can pull from internal artifactory, internal PyPI, etc. This is the
-same capability the `SelfHostedWorker` backlog item targeted, but achievable on
-the user's laptop without a Kubernetes cluster.
+Worker containers launch with `--dns=127.0.0.1` and `--dns-search=.`. Any DNS
+query for a non-allowlisted host resolves to `0.0.0.0` → outbound connect fails.
+
+**Soft boundary disclaimer:** bypassable if a worker hits raw IPs. Every
+standard agent action (`gh`, `git clone`, `pip install`, `docker pull`)
+goes through DNS. For real exfiltration attempts (which typically use named
+C2 servers), this works. Documented in `SECURITY.md` "Non-defenses".
+
+### Internal-registry passthrough (the killer side-effect)
+
+**[Δ shipped]** The original proposal framed this as "optional volume
+mounts for `~/.npmrc`, `~/.pip/pip.conf`, etc., configurable via .env."
+The shipped implementation goes further: `AUTO_MOUNT_REGISTRY_PATHS` —
+`~/.npmrc`, `~/.pip/pip.conf`, `~/.docker/config.json` — auto-mounts read-only
+**when present on the host**, no flag needed. For everything else, the
+user opts in via `ORCH_WORKER_EXTRA_MOUNTS=path1,path2,...`.
+
+Two safety guards:
+
+- **NEVER_MOUNT validator** (`_violates_never_mount`, PR #14 review C4):
+  `ORCH_WORKER_EXTRA_MOUNTS` entries are resolved via `Path.resolve()`
+  (handles symlinks) and checked against `NEVER_MOUNTED_HOST_PATHS =
+  ("~/.ssh", "~/.aws", "~/.config/gcloud", "~/.kube", "~/.gitconfig",
+  "~/.git-credentials")`. Equality OR prefix-containment match → `ValueError`
+  with a remediation message. A NEVER-list violation is a security failure,
+  not a typo; silent-drop felt wrong.
+- **Doctor heuristic** (`audit_registry_passthrough_for_repo`): inspects
+  the cloned repo's `package.json` `"registry"` field and `requirements.txt`
+  `--index-url` value. Non-public-registry hosts (anything not in
+  `{pypi.org, files.pythonhosted.org, registry.npmjs.org, registry.yarnpkg.com}`)
+  trigger a yellow warning if no passthrough is wired.
+
+Internal-registry **DNS resolution** is the other half: set
+`ORCH_INTERNAL_REGISTRY_HOSTS=artifactory.internal,internal-pypi.corp` and
+`scripts/run-worker-dns.sh` adds matching `server=/<host>/<upstream>` flags
+to the dnsmasq launch. The cred-audit surfaces every host that crossed under
+"Internal registry hosts (added to DNS allowlist)" — only when the env var
+is set, so an absent section never reads like a misleading "(none)".
 
 ## Claude Code session continuity
 
 Managed Agents have first-class session objects on Anthropic's side;
 `client.beta.sessions.retrieve(sid)` continues a conversation. For Docker
 workers, sessions need to survive container restarts (since each
-`docker run --rm` exits). Two paths:
+`docker run --rm` exits). The shipped solution: a writable
+`~/.claude/sessions` volume mount. Claude Code writes session state on
+exit; the next container reads it on start. Each spawn captures the
+session ID; resume calls pass `claude --resume <session-id> -p "<msg>"`.
 
-1. **Volume-mounted session store.** Mount
-   `~/.claude/sessions:/home/agent/.claude/sessions` (writable, NOT read-only —
-   sessions go in here). Claude Code writes session state on exit; the next
-   container reads it on start. Each spawn captures the session ID; resume
-   calls pass `claude --resume <session-id> -p "<msg>"`.
-
-2. **Orchestrator-managed transcript.** The orchestrator stores conversation
-   history in `state.db`, prepends it to each new container invocation.
-   Simpler in implementation, lossier in semantics (the model doesn't see
-   exactly the same context Claude Code would have remembered).
-
-Path 1 is cleaner — same session semantics as Managed Agents. Requires Claude
-Code's `--resume` flag to exist and accept an arbitrary session ID. Path 2 is
-the fallback if that doesn't work.
+`DockerClaudeCodeWorker.archive()` is a deliberate no-op — the host's
+own retention policy on `~/.claude/sessions` is the right place to prune
+old sessions, not this driver. Defined for `Worker`-protocol completeness.
 
 ### Validation (2026-05-12)
 
-Path 1 confirmed working end-to-end with a round-trip test on the host's
-`claude` CLI (version 2.1.140):
+Round-trip test on the host's `claude` CLI (version 2.1.140):
 
 ```
 $ claude -p "remember the phrase 'orange octopus 47'. respond ACK." \
@@ -176,8 +254,9 @@ recent. **Path 2 (orchestrator-managed transcript) is therefore not needed.**
 **Bonus discovery.** The CLI also exposes `--session-id <uuid>` to *set* the
 ID upfront. The orchestrator could generate UUIDs on the host and skip
 parsing them out of stdout entirely, retiring the JSON / JSONL / plaintext
-branches in `extract_session_id`. Worth a follow-on optimization (fold into
-U-6 or file as a follow-up).
+branches in `extract_session_id`. **[Δ shipped]** Marked in the original
+proposal as "worth a follow-on optimization." v1 did **not** ship this —
+`extract_session_id` still parses all three formats. Tracked as backlog.
 
 ### Session scope
 
@@ -193,8 +272,7 @@ sessions, even for the same role.
 `parallel_units_global(max_concurrent=3)` batch can briefly have up to
 9 sessions live (3 units × 3 roles), peaking at 3–5 simultaneously active.
 Pro plan's ~1–2 concurrent cap will serialize some of this; Team/Max gives
-more headroom. Stress-test this in U-6 before claiming production parity
-with Managed Agents on parallelism.
+more headroom. v1 does not measure or enforce this — see "Open questions" below.
 
 ## LLM abstraction (beyond Claude)
 
@@ -208,15 +286,15 @@ So adding new LLMs is just adding new Worker implementations:
 
 | Worker | LLM | Auth | Container? |
 |---|---|---|---|
-| `ManagedAgentWorker` (exists) | Claude via Anthropic Managed Agents | API key | gVisor (Anthropic-managed) |
-| `DockerClaudeCodeWorker` (this proposal) | Claude via Claude Code CLI | claude.ai OAuth | Docker (user-managed) |
-| `DockerAiderWorker` (future) | Multi-model via aider (Claude, GPT, Gemini, Llama) | per-model API keys or local | Docker |
-| `DockerOpenAICodexWorker` (future) | GPT-5/Codex via OpenAI Assistants | OpenAI key | Docker |
-| `BedrockClaudeWorker` (BACKLOG) | Claude via AWS Bedrock | AWS creds | AWS-managed |
+| `ManagedAgentWorker` (shipped, default) | Claude via Anthropic Managed Agents | API key | gVisor (Anthropic-managed) |
+| `DockerClaudeCodeWorker` (shipped, F-001) | Claude via Claude Code CLI | claude.ai OAuth **or** API key | Docker (user-managed) |
+| `DockerAiderWorker` (backlog) | Multi-model via aider (Claude, GPT, Gemini, Llama) | per-model API keys or local | Docker |
+| `DockerOpenAICodexWorker` (backlog) | GPT-5/Codex via OpenAI Assistants | OpenAI key | Docker |
+| `BedrockClaudeWorker` (backlog) | Claude via AWS Bedrock | AWS creds | AWS-managed |
 
 The factory `make_worker(role)` reads `ORCH_WORKER_BACKEND` and instantiates
 the right one. Adding a new LLM = ~150 lines + tests, no changes anywhere else
-in the orchestrator.
+in the orchestrator. See `BACKLOG.md` entries for sized backlog tasks.
 
 The **agent prompts** (`orchestrator/prompts/coder.md` etc.) are written for
 Claude today. They reference Claude's tool-use conventions (`gh`, `bash`,
@@ -224,95 +302,111 @@ etc.) and Claude's terminal markers (`PR_URL`, `TESTS_PASS`). They'd need
 light re-tuning for a different model family. That's a one-time cost per new
 LLM, not a structural problem.
 
+## Configuration knobs
+
+Shipped env-var surface (see `orchestrator/workers/docker_claude_code.py`
+for current values + docstrings):
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `ORCH_WORKER_BACKEND` | `managed_agents` | Which backend the factory instantiates (`managed_agents` or `docker`). |
+| `ORCH_DOCKER_WORKER_IMAGE` | `orchestrator/worker:latest` | Override the container image tag (CLI passes through to `cli.py` for `init`/`doctor`). |
+| `ORCH_WORKER_EXTRA_MOUNTS` | (unset) | Comma-separated host paths to bind-mount read-only into the container. Rejected if any resolves into `NEVER_MOUNTED_HOST_PATHS`. |
+| `ORCH_INTERNAL_REGISTRY_HOSTS` | (unset) | Comma-separated hostnames to add to the dnsmasq allowlist (e.g. `artifactory.internal,internal-pypi.corp`). |
+| `ORCH_WORKER_TIMEOUT_SECONDS` | `1800` (30 min) | Per-spawn / per-resume subprocess timeout. Added in U-6 review (PR #11 reviewer SUGGESTION 1). |
+| `ORCH_RUN_E2E` | (unset) | Opt-in gate for the E2E smoke suite (`tests/e2e/`). CI workflow sets this; local dev runs require explicit opt-in. |
+| `ORCH_DNSMASQ_BIND` | `127.0.0.1` | Where `scripts/run-worker-dns.sh` binds the sidecar. |
+| `ORCH_DNSMASQ_CONFIG` | bundled allowlist path | Override the dnsmasq config file path. |
+| `ORCH_DOCKER_NETWORK` | `orch-net` | Bridge network name; the script ensures it exists idempotently. |
+| `ANTHROPIC_API_KEY` | (unset) | When set, switches the worker to API-key auth mode (no `~/.claude` mount). |
+| `GITHUB_TOKEN` | required | Forwarded into every worker for `gh` / `git push`. |
+
+**[Δ shipped]** The original proposal only named `ORCH_WORKER_BACKEND` and
+hinted at an unspecified pip.conf override. The shipped config surface is
+materially larger; this table is the authoritative list.
+
 ## Trade-offs vs Managed Agents
 
 | Capability | Managed Agents | Docker + claude.ai |
 |---|---|---|
-| Auth | `sk-ant-` API key | claude.ai OAuth (your subscription) |
-| Cost | $0.08/session-hour + token costs | Flat (your subscription) |
-| Sandbox | gVisor by default | Docker hardened; `--runtime=runsc` for gVisor parity |
-| Network | Kernel-side allowlist | DNS-level allowlist (slightly weaker — raw-IP bypassable) |
+| Auth | `sk-ant-` API key | claude.ai OAuth (your subscription) **or** API key |
+| Cost | $0.08/session-hour + token costs | Flat (your subscription) — not measured against plan limits |
+| Sandbox | gVisor by default | Docker hardened (`--cap-drop=ALL`, `--read-only`, `--user 1000`, `--security-opt=no-new-privileges`, `--memory/cpus/pids-limit` caps); `--runtime=runsc` NOT exposed as a v1 knob |
+| Network | Kernel-side allowlist | DNS-level allowlist via dnsmasq sidecar (raw-IP bypassable; documented in SECURITY.md "Non-defenses") |
 | Parallelism | High | Limited by claude.ai concurrency (1–2 on Pro, more on Team/Max) |
-| Cross-platform | Linux/macOS/Windows | Docker required; same OS support but adds the Docker dep |
+| Cross-platform | Linux/macOS/Windows | Docker required; CI matrix covers all three. dnsmasq sidecar on Windows not E2E-tested. |
 | Cost telemetry | Per-session billing data | None (flat subscription) |
-| **Internal package registries** | No | **Yes** — mount the user's npmrc/pip.conf |
-| Setup | API key in `.env` | Docker daemon, image build, dnsmasq config |
+| **Internal package registries** | No | **Yes** — auto-mounted `~/.npmrc`/`~/.pip/pip.conf`/`~/.docker/config.json`, plus `ORCH_WORKER_EXTRA_MOUNTS` + `ORCH_INTERNAL_REGISTRY_HOSTS` |
+| Setup | API key in `.env` | Docker daemon, image build, dnsmasq sidecar |
 | Cold start per spawn | ~direct API latency (~100ms) | ~500ms–1s container start |
-| Image distribution | Anthropic-managed | We maintain `orchestrator/worker` image |
+| Image distribution | Anthropic-managed | We maintain `orchestrator/worker` image (~2–3 GB monolithic; modular variant on backlog) |
+| Timeout enforcement | Anthropic-side | `ORCH_WORKER_TIMEOUT_SECONDS` (default 30 min) — `subprocess.run(timeout=…)` on spawn/resume |
 
-## Implementation plan
+## What shipped (replaces "Implementation plan")
 
-Rough ordering (each step shippable on its own):
+Original proposal sized this as **5 phases over ~5 days**. Shipped as
+**6 units over 2 days** (2026-05-12 → 2026-05-14), total cost ~$2.08 in
+session-hours (token costs not measured).
 
-### Phase 1 — Worker abstraction cleanup (~half day)
-Move `ManagedAgentWorker` to `orchestrator/workers/managed_agent.py`. Extract
-`Worker` protocol into `workers/base.py`. Add `make_worker(role)` factory
-reading `ORCH_WORKER_BACKEND` (default: `managed_agents`). No behavior change.
+| Unit | PR | Title | Notes |
+|---|---|---|---|
+| F-001-U-1 | [#1](https://github.com/boctorj/agent-orchestrator/pull/1) | Worker abstraction cleanup | Relocated `ManagedAgentWorker` and extracted the `Worker` protocol. No behavior change. |
+| F-001-U-2 | [#11](https://github.com/boctorj/agent-orchestrator/pull/11) | Docker worker MVP — hybrid auth, strict cred boundary | `docker/worker.Dockerfile`, `DockerClaudeCodeWorker`, `build_cred_audit`, `run_doctor_probes` (3 probes initially). |
+| F-001-U-3 | [#13](https://github.com/boctorj/agent-orchestrator/pull/13) | dnsmasq sidecar + orch-net probe | `scripts/run-worker-dns.sh`, `allowlist.dnsmasq.conf`, 4th doctor probe (network exists). |
+| F-001-U-4 | [#14](https://github.com/boctorj/agent-orchestrator/pull/14) | Internal-registry passthrough (default-on) | `AUTO_MOUNT_REGISTRY_PATHS`, `ORCH_WORKER_EXTRA_MOUNTS`, `ORCH_INTERNAL_REGISTRY_HOSTS`, NEVER_MOUNT guard (PR-review C4), `audit_registry_passthrough_for_repo`. |
+| F-001-U-6 | [#16](https://github.com/boctorj/agent-orchestrator/pull/16) | End-to-end smoke test (real Docker) | `tests/e2e/test_docker_worker_smoke.py` (11 tests), `tests/fixtures/sandbox-repo/`, `ORCH_RUN_E2E=1` gate, `ORCH_WORKER_TIMEOUT_SECONDS`, `.github/workflows/e2e-docker.yml`. **Was NOT in the original 5-phase plan** — added during planning to cover what unit tests can't. |
+| F-001-U-5 | [#18](https://github.com/boctorj/agent-orchestrator/pull/18) | Polish — init wizard + docs + BACKLOG | `orchestrator init` branches on backend choice, README "Choosing a worker backend" section, BACKLOG entries for sibling Worker implementations. |
 
-### Phase 2 — Docker worker MVP (~2 days)
-- `docker/worker.Dockerfile` building `orchestrator/worker:latest` (Python
-  3.12 + git + gh + claude + common test deps)
-- `orchestrator/workers/docker_claude_code.py` implementing `Worker` via
-  `subprocess.run("docker", "run", ...)`
-- Session store via volume mount on `~/.claude/sessions`
-- Doctor check: Docker daemon reachable, image built, `claude --version` works
-- Tests: subprocess mocked, verify the right `docker run` flags are emitted
+Merge order matches dependency order, except U-5 shipped after U-6 because
+the docs depend on the final config knob set landing.
 
-### Phase 3 — Network allowlist (~1 day)
-- `scripts/run-worker-dns.sh` starts dnsmasq sidecar
-- `network/allowlist.dnsmasq.conf` mirrors `ALLOWED_NETWORK_HOSTS`
-- Worker containers launch with `--dns=127.0.0.1`
-- Integration test: from a worker container, `curl github.com` succeeds,
-  `curl evil.com` fails
-
-### Phase 4 — Internal-registry support (~half day)
-Optional volume mounts for `~/.npmrc`, `~/.pip/pip.conf`, etc. configurable
-via `.env`. Doctor check warns when no internal-registry config is detected
-on a repo that looks like it needs one (`package.json` with `"registry"`
-field, etc.).
-
-### Phase 5 — Polish (~1 day)
-- `orchestrator init` wizard asks "Managed Agents or Docker workers?" and
-  configures accordingly
-- README + ARCHITECTURE.md gain a "Choosing a worker backend" section
-- BACKLOG entries for the next LLMs (aider, Codex, Gemini) reference the
-  abstraction
-
-**Total: ~5 days for a polished v1.**
-
-## Open questions
+## Open questions (post-v1)
 
 1. ~~**Claude Code's `--resume` semantics**~~ **RESOLVED 2026-05-12.** Tested
    via round-trip; `claude --resume <arbitrary-uuid>` works on CLI version
    2.1.140. Path 2 (orchestrator-managed transcript) not needed. See
    "Validation (2026-05-12)" addendum in the session-continuity section above.
-2. **claude.ai concurrency limit**: what's the actual cap per plan? Need to
-   test, then either gate `parallel_units` accordingly or document the limit.
+2. **claude.ai concurrency limit**: what's the actual cap per plan? **Still
+   open.** v1 ships without measurement or runtime gating. Mitigation today
+   is that fix-cycle traffic is naturally sequential.
 3. **Image size / pull time**: Claude Code + Node + Python + common test deps
-   is probably ~2–3 GB. Acceptable for a one-time pull; might want to make
-   the image modular.
-4. **Apple Silicon / Linux / Windows parity**: Docker Desktop on macOS /
-   Windows is fine for development; Linux native is faster. Need to test the
-   dnsmasq sidecar on each host OS (Windows has its own networking quirks).
+   is ~2–3 GB. **Still monolithic in v1**; a modular variant (slim base +
+   per-role layers) is on the backlog.
+4. **Apple Silicon / Linux / Windows parity**: CI matrix covers all three for
+   the unit suite. The E2E smoke suite runs on `ubuntu-latest` only.
+   `_expand_with_home` is OS-agnostic via `Path`, but `AUTO_MOUNT_REGISTRY_PATHS`
+   encodes Unix conventions (`~/.npmrc` etc.). Windows users wire passthrough
+   via `ORCH_WORKER_EXTRA_MOUNTS` pointing at `%APPDATA%/...` paths. dnsmasq
+   sidecar on Windows: untested in CI.
 5. **Cost of "flat subscription" framing**: claude.ai usage limits exist.
-   Heavy orchestrator use might bump against them faster than API usage
-   would. Worth measuring before the README claims "free."
+   Heavy orchestrator use might bump against them. **Not measured in v1.**
+   README documents the limitation but doesn't enforce a budget.
+6. **`--session-id <uuid>` optimization**: deferred from the original
+   proposal. Would let the orchestrator generate UUIDs on the host and
+   retire the JSON/JSONL/plaintext parsing in `extract_session_id`. On the
+   backlog as a low-priority cleanup.
+7. **`--runtime=runsc` knob**: a user can override Docker's default runtime
+   system-wide today, but the orchestrator doesn't expose it as a per-spawn
+   flag. Worth surfacing if a user asks.
 
-## Why this is worth doing
+## Why this was worth doing
 
-Three things you get that Managed Agents can't deliver today:
+Three things you get that Managed Agents can't deliver today (and the v1
+shipped each of them):
 
 1. **No API key billing surprise.** Hobbyists, students, and OSS maintainers
-   who already have a Pro/Max plan can just use it. Removes the biggest
-   onboarding friction.
+   who already have a Pro/Max plan can just use it. OAuth mode is the default
+   when `ANTHROPIC_API_KEY` is unset — zero-config for the common case.
 2. **Internal-network access.** The `SelfHostedWorker` BACKLOG entry exists
    exactly because Managed Agents can't reach corporate VPNs / internal
-   artifactory. Docker workers solve this without a Kubernetes cluster — the
-   user's laptop already has the network access.
+   artifactory. Docker workers solve this without a Kubernetes cluster —
+   `AUTO_MOUNT_REGISTRY_PATHS` makes `npm install` / `pip install` /
+   `docker pull` against internal registries "just work" out of the box.
 3. **LLM portability.** Once the worker is "spawn a container that runs an
    agentic CLI", swapping `claude` for `aider`, `codex`, or `gemini-cli` is a
    Dockerfile change. The orchestrator's state machine, MCP tools,
-   verification gate, CI gate — none of it cares.
+   verification gate, CI gate — none of it cares. Sized backlog entries
+   in `BACKLOG.md` for each.
 
 The trade-offs are real (concurrency, slightly weaker sandbox without runsc,
 no per-session cost telemetry). For sandbox / personal / OSS use, those are
@@ -320,21 +414,39 @@ acceptable. For enterprise repos requiring strong isolation guarantees,
 Managed Agents stays the right choice — but the orchestrator now supports
 both, and the user picks at install time.
 
-## Status / next step
+## Lessons learned (post-v1)
 
-This is captured for later exploration, not on the v1 roadmap. To pick it up:
+Surfacing two recurring patterns that came out of the F-001 cycle review
+loop, worth filing for future feature work:
 
-1. Re-read this doc.
-2. Run a feasibility spike on the open questions (especially #1 — Claude
-   Code's `--resume` semantics).
-3. Move Phase 1 from this doc into `BACKLOG.md` as a sized task and start
-   there; the rest stays as design until Phase 1 lands cleanly.
+- **State-desync on spawn timeout.** When `spawn_unit` errors after the
+  coder agent reaches GitHub but before the orchestrator records the
+  session id (e.g. read-timeout mid-spawn), the PR exists but the unit's
+  `coder_session_id` is empty — `address_review` and `cycle_review` then
+  refuse to advance the unit. Workaround: manual state.db patch
+  (`UPDATE work_units SET pr_number=...`) or bypass-via-worktree. Real
+  fix on the backlog: detect orphan PRs in `check_unit_pr` and offer an
+  adopt path.
+- **Coder-session silent failure.** Twice during F-001 (U-5 specifically),
+  `address_review` returned empty output with no FIX_PUSHED/BLOCKED marker,
+  burning cycle counters. Cause unclear (possibly upstream Anthropic
+  Managed Agents transient). Backlog item: session-health probe before
+  burning a cycle.
 
-Related BACKLOG entries:
+Both are tracked in `BACKLOG.md` as orchestrator-self-improvement tasks.
+
+## Related BACKLOG entries
+
 - `LocalWorker (self-driven loop on user infra)` — this proposal supersedes
   it; LocalWorker was the naïve "subprocess on host" version that this
-  improves on with Docker sandboxing
+  improves on with Docker sandboxing.
 - `Self-hosted Worker backend (enterprise enabler)` — separate concern;
   that's about running workers in an enterprise's own infra (K8s/ECS/Modal)
   to reach internal services at scale. Docker workers solve the laptop
   variant of the same problem.
+- `DockerAiderWorker`, `DockerOpenAICodexWorker`, `BedrockClaudeWorker` —
+  sibling Worker implementations on the same `~150 LOC + tests` template.
+- `--session-id <uuid> optimization` — retire stdout parsing in
+  `extract_session_id`.
+- `Modular worker image variants` — slim base + per-role layers to bring
+  pull time down from the current ~2–3 GB monolithic image.
