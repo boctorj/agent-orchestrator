@@ -259,9 +259,7 @@ class TestExtraMountsNeverMountGuard:
                 },
             )
 
-    def test_safe_extra_mount_alongside_never_path_still_accepted(
-        self, tmp_path: Path
-    ) -> None:
+    def test_safe_extra_mount_alongside_never_path_still_accepted(self, tmp_path: Path) -> None:
         """Sanity: a benign mount sibling to a NEVER path must still
         work. Guard rejects only entries that resolve INTO a NEVER path."""
         worker = _make_worker(tmp_path)
