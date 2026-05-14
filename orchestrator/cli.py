@@ -292,14 +292,21 @@ def doctor() -> None:
     backend = os.environ.get("ORCH_WORKER_BACKEND", "managed_agents")
     if backend == "docker":
         from orchestrator.workers.docker_claude_code import (
+            DEFAULT_IMAGE,
             audit_registry_passthrough_for_repo,
             build_cred_audit,
             run_doctor_probes,
         )
 
+        # The DEFAULT_IMAGE module docstring (in docker_claude_code.py)
+        # documents ORCH_DOCKER_WORKER_IMAGE as the per-environment
+        # override. Honor it here so the audit + probes both target the
+        # tag the user actually built (PR #16 review M1).
+        image_override = os.environ.get("ORCH_DOCKER_WORKER_IMAGE", DEFAULT_IMAGE)
+
         console.print()
         console.print("[bold]Worker credential audit (ORCH_WORKER_BACKEND=docker)[/bold]")
-        audit = build_cred_audit()
+        audit = build_cred_audit(image=image_override)
         console.print(audit.render())
 
         console.print()

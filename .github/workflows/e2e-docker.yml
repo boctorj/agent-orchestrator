@@ -1,0 +1,62 @@
+name: E2E Docker
+
+# Opt-in end-to-end smoke test exercising the whole Docker-worker pipeline
+# against a real Docker daemon (F-001-U-6). Runs on every non-draft PR
+# and on main pushes. Drafts are skipped to keep iteration fast.
+#
+# The E2E suite gates on (a) ORCH_RUN_E2E=1 and (b) a reachable Docker
+# daemon. Both are present in this job; the main CI matrix sets neither,
+# so the E2E suite stays out of every Ubuntu / macOS / Windows runner the
+# per-PR matrix spawns.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e-docker:
+    name: E2E Docker worker smoke
+    # Skip on drafts so iteration stays fast — flip the PR to
+    # "Ready for review" to trigger this job.
+    if: github.event.pull_request.draft != true
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install package + dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Verify Docker daemon is reachable
+        run: |
+          docker version
+          docker info
+
+      - name: Run E2E Docker smoke suite
+        run: pytest tests/e2e/ --no-cov -v
+        env:
+          # Opt into the E2E suite (the autouse fixture in
+          # tests/e2e/conftest.py gates on this). Without it the suite
+          # skips, which is the right default for the main CI matrix.
+          ORCH_RUN_E2E: "1"
+          # Force the orchestrator to pick the docker worker backend
+          # for any CLI invocation the suite shells out to.
+          ORCH_WORKER_BACKEND: docker
