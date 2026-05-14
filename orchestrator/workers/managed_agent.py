@@ -156,6 +156,7 @@ class ManagedAgentWorker:
         import time
 
         text_parts: list[str] = []
+        saw_activity = False
         deadline = time.time() + timeout_seconds
         with self.client.beta.sessions.events.stream(session_id) as stream:
             for event in stream:
@@ -164,13 +165,20 @@ class ManagedAgentWorker:
                         f"Session {session_id} did not idle within {timeout_seconds}s"
                     )
                 etype = getattr(event, "type", None)
+                # A freshly-created session is `idle` until our user.message
+                # transitions it to running. The stream may emit that initial
+                # status_idle before the message lands; treat status_idle as
+                # completion only after observing any other event.
+                if etype == "session.status_idle":
+                    if saw_activity:
+                        break
+                    continue
+                saw_activity = True
                 if etype == "agent.message":
                     for block in getattr(event, "content", []):
                         text = getattr(block, "text", None)
                         if text:
                             text_parts.append(text)
-                elif etype == "session.status_idle":
-                    break
         return "".join(text_parts)
 
     def resume(self, session_id: str, msg: str) -> str:
@@ -191,13 +199,21 @@ class ManagedAgentWorker:
                 ],
             )
             text_parts: list[str] = []
+            saw_activity = False
             for event in stream:
                 etype = getattr(event, "type", None)
+                # A freshly-created session is `idle` until our user.message
+                # transitions it to running. The stream may emit that initial
+                # status_idle before the message lands; treat status_idle as
+                # completion only after observing any other event.
+                if etype == "session.status_idle":
+                    if saw_activity:
+                        break
+                    continue
+                saw_activity = True
                 if etype == "agent.message":
                     for block in getattr(event, "content", []):
                         text = getattr(block, "text", None)
                         if text:
                             text_parts.append(text)
-                elif etype == "session.status_idle":
-                    break
             return "".join(text_parts)
