@@ -829,6 +829,58 @@ The biggest practical gotcha is the agent's tool surface (`agent_toolset_2026040
 gives Anthropic agents Bash/file ops/etc. for free; other backends need their
 own way to provide that — Modal/E2B sandboxes, OS-level subprocess, etc.).
 
+### 11b-bis. Choosing a worker backend (Managed Agents vs Docker)
+
+Two `Worker` implementations ship today, both pluggable via the
+`orchestrator/workers/__init__.py` factory keyed by
+`ORCH_WORKER_BACKEND`. The trade-offs are summarized in
+[`README.md` § "Choosing a worker backend"](../README.md#choosing-a-worker-backend);
+the architectural points worth pinning here:
+
+* **Auth boundary.** Managed Agents authenticate by the API key; the
+  Docker backend chooses at spawn time via
+  `select_auth_mode(host_env)` — `ANTHROPIC_API_KEY` set ⇒ API-key
+  mode (forwarded into the container, no `~/.claude` mount);
+  unset ⇒ OAuth mode (claude.ai credentials bind-mounted read-only
+  from `~/.claude`, sessions sub-mount bound rw separately so
+  `claude --resume` can persist state without writing through the ro
+  creds mount). No fallback identity in OAuth mode — a missing
+  claude.ai login surfaces as a spawn failure, not a silent demote
+  to API billing.
+* **Credential audit as receipts.** `build_cred_audit()` returns a
+  `CredAudit` dataclass (`workers/docker_claude_code.py`) the doctor
+  command renders as a fixed-format text block: every env var passed
+  / dropped, every mount, every never-mounted host path, every
+  internal-registry host added to the DNS allowlist. The shape is
+  pinned by snapshot tests (`tests/test_doctor_cred_audit.py`).
+  Adding a third backend should follow the same receipt pattern
+  rather than inventing a new audit surface.
+* **Network policy.** Managed Agents run on Anthropic's kernel-side
+  egress allowlist; Docker workers run on a DNS-level allowlist
+  (`network/allowlist.dnsmasq.conf`, served by
+  `scripts/run-worker-dns.sh`). The DNS layer is documented as a
+  **soft boundary** — raw-IP egress is still possible — alongside
+  the hard layers (read-only rootfs, `--cap-drop=ALL`, `--user
+  1000:1000`, `--memory`/`--cpus`/`--pids-limit`).
+* **OAuth lifecycle.** The host's Claude Code refreshes its OAuth
+  token in-place inside `~/.claude`; since we mount that directory
+  read-only the worker sees the refreshed token transparently for the
+  lifetime of its container. Per-session state (transcripts, the
+  session UUIDs `claude --resume` consumes) lives under the writable
+  `~/.claude/sessions` sub-mount.
+* **Concurrency model.** Managed Agents parallelism is bounded by
+  Anthropic's quotas. Docker workers are bounded by the user's
+  claude.ai plan concurrency (~1–2 on Pro, more on Team/Max), so
+  `parallel_units(_global)` can briefly drive 9 live sessions (3
+  units × 3 roles) which serialize against the plan cap. F-001-U-6's
+  E2E suite stress-tests this against a real daemon.
+
+The `Worker` Protocol in `workers/base.py` is the seam — adding
+`DockerAiderWorker`, `DockerOpenAICodexWorker`, or a `BedrockClaudeWorker`
+on top of U-1's abstraction is ~150 LOC + tests per backend and changes
+nothing in `tools/` or the lead persona. See `BACKLOG.md` for sized
+entries.
+
 ### 11c. Adding a new state backend (Postgres / etc.)
 
 1. Define a `StorageBackend` Protocol with the public functions of `state.py`
