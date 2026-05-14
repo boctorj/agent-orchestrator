@@ -171,26 +171,31 @@ class TestComposeTasks:
         assert "PR_URL: <url>" in out  # marker hint
 
     def test_tester_task_lists_three_markers(self, sample_feature, sample_unit):
-        out = compose_tester_task(sample_feature, sample_unit, "branch", "tok")
+        out = compose_tester_task(sample_feature, sample_unit, "branch", 42, "tok")
         assert "TESTS_PASS" in out
         assert "BUG_FOUND" in out
         assert "BLOCKED" in out
+        assert "PR_NUMBER: 42" in out
 
-    def test_reviewer_task_lists_all_markers(self, sample_feature, sample_unit):
+    def test_reviewer_task_lists_emittable_markers(self, sample_feature, sample_unit):
         out = compose_reviewer_task(sample_feature, sample_unit, 42, "tok")
         assert "PR #42" in out
-        assert "REVIEW_APPROVED" in out
         assert "REVIEW_RECOMMEND_MERGE" in out
         assert "REVIEW_REQUEST_CHANGES" in out
         assert "REVIEW_COMMENT" in out
         assert "BLOCKED" in out
+        # REVIEW_APPROVED is reserved (orchestrator never uses --approve);
+        # we don't list it as an emit option in the task message.
+        assert "REVIEW_APPROVED" not in out
 
     def test_fix_task_includes_feedback(self, sample_feature, sample_unit):
         feedback = "tests fail on n=0; division by zero"
-        out = compose_fix_task(sample_feature, sample_unit, "branch", "tester", feedback)
+        out = compose_fix_task(sample_feature, sample_unit, "branch", 42, "tester", feedback)
         assert feedback in out
         assert "tester" in out
         assert "FIX_PUSHED" in out
+        assert "PR_NUMBER: 42" in out
+        assert "SOURCE:    tester" in out
 
 
 # --------------------------- constants ---------------------------

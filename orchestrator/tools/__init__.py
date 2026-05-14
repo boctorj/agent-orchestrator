@@ -171,13 +171,16 @@ or `BLOCKED: <reason>` on the last line.
 """
 
 
-def compose_tester_task(feature: Feature, unit: WorkUnit, branch: str, github_token: str) -> str:
+def compose_tester_task(
+    feature: Feature, unit: WorkUnit, branch: str, pr_number: int, github_token: str
+) -> str:
     return f"""Write tests for work unit {unit.id} which the coder has already
 implemented and pushed to branch `{branch}`.
 
-REPO_URL: {feature.repo_path}
-BRANCH:   {branch}
-GH_TOKEN: {github_token}
+REPO_URL:  {feature.repo_path}
+BRANCH:    {branch}
+PR_NUMBER: {pr_number}
+GH_TOKEN:  {github_token}
 
 UNIT TITLE: {unit.title}
 
@@ -189,8 +192,9 @@ FEATURE CONTEXT:
 
 Follow your standard workflow (see system prompt). End with EXACTLY ONE of:
 - `TESTS_PASS` (tests written + pushed, all green)
-- `BUG_FOUND: <one-line bug summary>` (tests reveal an implementation bug;
-  include the failing assertion + expected vs actual above this line)
+- `BUG_FOUND: <one-line bug summary>` (failing tests committed + inline
+  review posted per system prompt; include the failing assertion + expected
+  vs actual above this line)
 - `BLOCKED: <one-line reason>` (can't even write/run tests)
 """
 
@@ -212,36 +216,43 @@ UNIT DESCRIPTION (intended behavior to validate against):
 FEATURE CONTEXT:
 {feature.description}
 
-Follow your standard workflow (see system prompt). Post the review via
-`gh pr review` and end with EXACTLY ONE of:
-- `REVIEW_APPROVED`
-- `REVIEW_RECOMMEND_MERGE: <one-line reason>` (when self-approval blocked)
-- `REVIEW_REQUEST_CHANGES: <one-line main issue>`
-- `REVIEW_COMMENT`
-- `BLOCKED: <one-line reason>`
+Follow your standard workflow (see system prompt). Post the review as
+inline comments via `gh api .../pulls/N/reviews` (one call with
+`comments[]`) and end with EXACTLY ONE of:
+- `REVIEW_RECOMMEND_MERGE: <one-line reason>` (endorsing — clean PR, human merges)
+- `REVIEW_REQUEST_CHANGES: <one-line main issue>` (any 🔴 or 🟠 finding — triggers fix-loop)
+- `REVIEW_COMMENT` (only 🟡 / 🔵 nits/observations, not endorsing)
+- `BLOCKED: <one-line reason>` (couldn't review)
 """
 
 
 def compose_fix_task(
-    feature: Feature, unit: WorkUnit, branch: str, source: str, feedback: str
+    feature: Feature,
+    unit: WorkUnit,
+    branch: str,
+    pr_number: int,
+    source: str,
+    feedback: str,
 ) -> str:
     return f"""You have feedback to address on your existing work for unit {unit.id}.
-Source of feedback: {source}.
 
-REPO_URL: {feature.repo_path}
-BRANCH:   {branch} (your branch, already checked out from your previous turn)
+REPO_URL:  {feature.repo_path}
+BRANCH:    {branch} (your branch, already checked out from your previous turn)
+PR_NUMBER: {pr_number}
+SOURCE:    {source}
 
-FEEDBACK:
+FEEDBACK (orchestrator summary — actionable detail lives in PR comments):
 {feedback}
 
-Make the smallest fix that addresses the feedback. Don't refactor unrelated
-code. Run the existing tests (committed by tester) and confirm they pass
-locally before pushing. Then `git add` only the files you changed, commit
-with a one-line message referencing what was fixed, and push to the same
-branch.
+Follow the source-specific fix-loop flow in your system prompt
+(`## When resumed with feedback`). For `reviewer` / `tester` / `human`
+sources, the source of truth is the inline review comments on PR #{pr_number} —
+fetch them, address each in code, then **reply inline** to each thread with
+what you did. For `ci`, the FEEDBACK above is the full context (no inline
+anchors possible).
 
-End your response with `FIX_PUSHED` on its own line, OR `BLOCKED: <reason>`
-if you couldn't apply the fix.
+End your response with `FIX_PUSHED` on its own line, OR a structured
+`BLOCKED:` line if you couldn't apply the fix.
 """
 
 

@@ -474,6 +474,25 @@ class TestAddressReview:
         msg = execution.address_review("F-001-U-1", "tester", "fix")
         assert "no coder session" in msg
 
+    def test_no_pr_number(self, tmp_state_db):
+        """address_review must refuse to resume the coder if no PR exists
+        yet — composer needs a real pr_number, and fix-loop instructions
+        in the system prompt operate against PR-scoped endpoints."""
+        _setup_feature()
+        state.upsert_unit_state(
+            WorkUnitState(
+                unit_id="F-001-U-1",
+                feature_id="F-001",
+                status="coding",
+                coder_session_id="s-1",
+                # branch set, pr_number deliberately unset
+                branch="feat/F-001-foo-u-1",
+            )
+        )
+        msg = execution.address_review("F-001-U-1", "tester", "fix")
+        assert "no PR" in msg
+        assert "spawn coder first" in msg
+
     def test_fix_pushed(self, tmp_state_db, monkeypatch):
         _seed_coded_unit()
         _install_fake_worker(monkeypatch, resume_response="ok\nFIX_PUSHED\ndone")

@@ -256,7 +256,7 @@ def spawn_tester(feature_id: str, unit_id: str) -> str:
         return err
     github_token = get_agent_token()
 
-    task = compose_tester_task(feature, unit, unit_state.branch, github_token)
+    task = compose_tester_task(feature, unit, unit_state.branch, unit_state.pr_number, github_token)
     state.touch_unit(unit_id, status="testing")
     state.record_event(
         unit_id,
@@ -599,6 +599,8 @@ def address_review(unit_id: str, source: str, feedback: str) -> str:
         return f"ERROR: no state for unit {unit_id}"
     if not unit_state.coder_session_id:
         return f"ERROR: no coder session for {unit_id}"
+    if not unit_state.pr_number:
+        return f"ERROR: no PR for unit {unit_id} — spawn coder first"
 
     feature = state.get_feature(unit_state.feature_id)
     plan = state.get_plan(unit_state.feature_id)
@@ -618,7 +620,9 @@ def address_review(unit_id: str, source: str, feedback: str) -> str:
         details=feedback[:1000],
     )
 
-    fix_msg = compose_fix_task(feature, unit, unit_state.branch, source, feedback)
+    fix_msg = compose_fix_task(
+        feature, unit, unit_state.branch, unit_state.pr_number, source, feedback
+    )
     try:
         worker = ManagedAgentWorker(role="coder")
         response = worker.resume(unit_state.coder_session_id, fix_msg)

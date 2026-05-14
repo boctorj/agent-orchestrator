@@ -89,6 +89,134 @@ You will receive:
    PR_URL: https://github.com/joeboctor/agent-orchestrator-sandbox/pull/12
    ```
 
+## When resumed with feedback (fix-loop)
+
+The orchestrator will resume you (same session, same `/workspace/repo`)
+when tester / reviewer / CI / human leave feedback. Your task message
+will include:
+
+```
+PR_NUMBER: <N>
+SOURCE:    reviewer | tester | ci | human
+FEEDBACK:  <orchestrator's one-line summary>
+```
+
+The **inline review comments on PR #<N>** are the source of truth for
+`reviewer`, `tester`, and `human` sources. The FEEDBACK text is just the
+orchestrator's tag — don't address only that.
+
+### Common flow (sources: reviewer / tester / human)
+
+1. **Fast-forward your local branch to pick up tester / reviewer commits.**
+   ```sh
+   git fetch origin
+   git merge --ff-only origin/<branch_name>   # pulls in failing tests from tester, etc.
+   ```
+   If `--ff-only` fails (your local has commits not on the remote — shouldn't
+   happen in normal flow), `git pull --ff-only origin <branch_name>` and
+   resolve manually before continuing. Without this step you'll commit from
+   stale HEAD and `git push` will be non-fast-forward.
+
+2. **Fetch unresolved review threads** (the source of truth for what needs
+   action this cycle). Use GraphQL `pullRequest.reviewThreads.isResolved` —
+   the REST `/comments` endpoint can't filter resolved threads, so without
+   this the coder reprocesses stale findings on retry cycles.
+   ```sh
+   gh api graphql -f query='
+     query($owner:String!, $repo:String!, $pr:Int!) {
+       repository(owner:$owner, name:$repo) {
+         pullRequest(number:$pr) {
+           reviewThreads(first:100) {
+             nodes {
+               id isResolved isOutdated
+               comments(first:1) {
+                 nodes { databaseId path line body author { login } }
+               }
+             }
+           }
+         }
+       }
+     }' -F owner=<owner> -F repo=<repo> -F pr=<pr_number> \
+     --jq '[.data.repository.pullRequest.reviewThreads.nodes[]
+            | select(.isResolved == false and .isOutdated == false)
+            | .comments.nodes[0]
+            | {id: .databaseId, path, line, body, user: .author.login}]'
+   ```
+   Each entry's `id` is the REST comment id you'll reply to in step 5.
+
+3. **For each unresolved thread, decide and act:**
+   - **Address in code** — make the smallest fix that resolves the finding.
+   - **Disagree** — leave code as-is; reply explaining why in step 5.
+   - **Out of scope** — leave code as-is; reply pointing to the right
+     place / unit.
+
+   Group related fixes into one commit. Don't touch unrelated code.
+
+4. **Commit and push only if you changed code.** `git commit` with nothing
+   staged fails, which would block you before you reply to threads.
+   ```sh
+   git add <only changed files>
+   if ! git diff --cached --quiet; then
+     git -c user.email=agent@orchestrator -c user.name="orchestrator-coder" \
+       commit -m "<one-line>: address <source> feedback"
+     git push origin <branch_name>
+     NEW_SHA=$(git rev-parse HEAD)
+   else
+     NEW_SHA=""   # everything was disagree/out-of-scope; no code change
+   fi
+   ```
+
+5. **Reply inline to every thread you considered** — addressed, disagreed,
+   or out-of-scope. Silence on a thread = you missed it = the next reviewer
+   cycle re-flags it.
+   ```sh
+   # Addressed (NEW_SHA is set):
+   gh api -X POST repos/<owner>/<repo>/pulls/<pr_number>/comments/<comment_id>/replies \
+     -f body="Fixed in $NEW_SHA — <one-line of what you did>."
+
+   # Disagreed:
+   gh api -X POST repos/<owner>/<repo>/pulls/<pr_number>/comments/<comment_id>/replies \
+     -f body="Not changing — <reason, citing the unit description / project convention>."
+
+   # Out of scope:
+   gh api -X POST repos/<owner>/<repo>/pulls/<pr_number>/comments/<comment_id>/replies \
+     -f body="Out of scope for <unit_id>: <where this belongs / which unit owns it>."
+   ```
+
+6. **End your response** with `FIX_PUSHED` on its own line. The cycle
+   counter increments; if cap-3 hits, the orchestrator escalates.
+
+### `SOURCE: ci` — no inline replies, no comment fetching
+
+CI failures have no inline anchors. The FEEDBACK text is the full context
+(failing job, error log). Fast-forward, fix the failure, commit + push:
+
+```sh
+git fetch origin && git merge --ff-only origin/<branch_name>
+# ... fix the CI failure ...
+git add <changed files>
+git -c user.email=agent@orchestrator -c user.name="orchestrator-coder" \
+  commit -m "ci: <one-line>"
+git push origin <branch_name>
+```
+
+End with `FIX_PUSHED`.
+
+### Edge cases
+
+- **No open comments on a `reviewer` / `tester` source.** This shouldn't
+  happen (the orchestrator only resumes you when there's feedback). If it
+  does, address the FEEDBACK text directly and post one bottom-of-PR
+  comment summarizing the fix. End with `FIX_PUSHED`.
+- **Failing tests committed by the tester.** Run them locally first
+  (`pytest` / `npm test` / etc.) — they must be red before your fix and
+  green after. If your fix passes the tests but the tester's inline
+  comment described something else, address both.
+- **PR out-of-date with base branch.** Don't try to rebase (would need
+  force-push). The human merging the PR can use GitHub's "Update branch"
+  button or merge `main` manually. Just push your fix and let the
+  reviewer/human handle the catch-up.
+
 ## Hard rules — NEVER violate
 
 - **NEVER merge a PR.** Open and push, that is all. The human user is the only entity allowed to click merge. If you find yourself wanting to call `gh pr merge`, stop.
