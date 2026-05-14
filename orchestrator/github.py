@@ -69,6 +69,70 @@ def post_pr_comment(repo_url: str, pr_number: int, body: str) -> None:
         r.raise_for_status()
 
 
+def submit_pr_review(repo_url: str, pr_number: int, body: str, event: str = "COMMENT") -> None:
+    """Submit a review via the Reviews API (top-level review, no inline comments).
+
+    Use this to supersede a prior CHANGES_REQUESTED review by the same user
+    — a same-user COMMENT (or APPROVE) review updates the effective review
+    state in GitHub's UI on most repo configurations. For repos with the
+    strict "Require resolution of changes requested" branch protection,
+    call `dismiss_own_change_requests` as well.
+
+    `event` must be one of "APPROVE", "REQUEST_CHANGES", "COMMENT".
+    The orchestrator never approves; pass "COMMENT" or "REQUEST_CHANGES".
+    """
+    owner, repo = parse_repo_url(repo_url)
+    url = f"{_API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
+    with httpx.Client(timeout=15.0, headers=_headers()) as client:
+        r = client.post(url, json={"body": body, "event": event})
+        r.raise_for_status()
+
+
+def dismiss_own_change_requests(repo_url: str, pr_number: int, message: str) -> int:
+    """Dismiss every CHANGES_REQUESTED review on the PR authored by the
+    current authenticated user.
+
+    Returns the number of reviews dismissed. Best-effort: 403/422 per-review
+    failures (e.g. someone else's review, insufficient perms) are swallowed
+    so a single un-dismissable review doesn't break the whole call.
+
+    Use on the TESTS_PASS retry path so the bot's prior REQUEST_CHANGES
+    review doesn't keep blocking merge under strict branch protection.
+    """
+    owner, repo = parse_repo_url(repo_url)
+    dismissed = 0
+    with httpx.Client(timeout=15.0, headers=_headers()) as client:
+        me = client.get(f"{_API_BASE}/user")
+        me.raise_for_status()
+        my_login = (me.json().get("login") or "").lower()
+        if not my_login:
+            return 0
+
+        reviews_url = f"{_API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
+        r = client.get(reviews_url)
+        r.raise_for_status()
+        for rev in r.json():
+            if (rev.get("user", {}).get("login", "") or "").lower() != my_login:
+                continue
+            if rev.get("state") != "CHANGES_REQUESTED":
+                continue
+            rid = rev.get("id")
+            if not rid:
+                continue
+            try:
+                # GitHub's "dismiss a review" endpoint accepts only {"message": ...};
+                # passing an extra "event" field causes the request to be rejected.
+                d = client.put(
+                    f"{reviews_url}/{rid}/dismissals",
+                    json={"message": message},
+                )
+                if d.status_code in (200, 201):
+                    dismissed += 1
+            except httpx.HTTPError:
+                continue
+    return dismissed
+
+
 def get_pr_state(repo_url: str, pr_number: int) -> dict:
     """Fetch the PR's open/closed/merged state + latest head SHA.
 

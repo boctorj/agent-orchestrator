@@ -299,3 +299,18 @@ def safe_comment_pr(repo_url: str, pr_number: int, body: str) -> str:
         return ""
     except Exception as e:  # noqa: BLE001 — best-effort
         return f"WARN: post PR comment failed: {e}"
+
+
+def safe_submit_pr_review(repo_url: str, pr_number: int, body: str, event: str = "COMMENT") -> str:
+    try:
+        github.submit_pr_review(repo_url, pr_number, body, event=event)
+        return ""
+    except Exception as e:  # noqa: BLE001 — best-effort
+        return f"WARN: submit PR review failed: {e}"
+
+
+def safe_dismiss_own_change_requests(repo_url: str, pr_number: int, message: str) -> int:
+    try:
+        return github.dismiss_own_change_requests(repo_url, pr_number, message)
+    except Exception:  # noqa: BLE001 — best-effort
+        return 0

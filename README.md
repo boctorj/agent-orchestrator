@@ -218,6 +218,36 @@ report prints automatically. The gate is in `pyproject.toml`
 Wire into cron or launchd if you want automatic snapshots. Or just rely
 on Time Machine / your normal backup setup.
 
+## Worker backends
+
+Coder / tester / reviewer agents run inside one of two backends. The choice
+is made at startup via `ORCH_WORKER_BACKEND` in `.env` — no code edits
+needed; the factory in
+[`orchestrator/workers/__init__.py`](orchestrator/workers/__init__.py)
+reads the env var at spawn time.
+
+| Backend | Default? | Where it runs | `.env` setting |
+|---|---|---|---|
+| **Managed Agents** | ✅ yes | Anthropic's managed infra (gVisor sandboxes) | unset, or `ORCH_WORKER_BACKEND=managed_agents` |
+| **Docker** | opt-in | A local container (`orchestrator/worker:latest`) on the host machine | `ORCH_WORKER_BACKEND=docker` |
+
+**Default — Managed Agents.** New users who follow `orchestrator init` get
+this path with no extra setup beyond an Anthropic API key. Workloads run on
+Anthropic infra with `limited` outbound networking — see the
+"Network allowlist (Managed Agent containers)" section below for the host
+allowlist applied to those sandboxes.
+
+**Opt-in — Docker.** Runs the same coder/tester/reviewer prompts inside a
+locally-managed container image you build and own. Use this when you want
+the worker on hardware you control — air-gapped environments,
+internal-registry access (private PyPI / npm / container registries), or
+custom toolchains the Managed Agent sandbox doesn't include. See
+[`docs/PROPOSAL-docker-workers.md`](docs/PROPOSAL-docker-workers.md) for
+the threat model, build instructions, and credential-boundary audit.
+
+`orchestrator doctor` prints which backend is currently selected and, on
+docker, audits the env vars / mounts / probes for the container.
+
 ## Network allowlist (Managed Agent containers)
 
 Coder/tester/reviewer containers run with **`limited` outbound networking**

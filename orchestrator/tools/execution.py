@@ -20,7 +20,6 @@ from orchestrator.tools import (
     CAP_3,
     FIX_PUSHED_RE,
     PR_URL_RE,
-    REVIEW_APPROVED_RE,
     REVIEW_CHANGES_RE,
     REVIEW_COMMENT_RE,
     REVIEW_RECOMMEND_MERGE_RE,
@@ -39,6 +38,8 @@ from orchestrator.tools import (
     need_github_token,
     safe_amend_pr_body,
     safe_comment_pr,
+    safe_dismiss_own_change_requests,
+    safe_submit_pr_review,
     tail,
 )
 
@@ -296,10 +297,21 @@ def spawn_tester(feature_id: str, unit_id: str) -> str:
             summary="All tests pass",
             session_id=session_id,
         )
-        safe_comment_pr(
+        # Supersede any prior REQUEST_CHANGES review by this bot identity
+        # (from an earlier BUG_FOUND cycle). A same-user COMMENT review
+        # resets the effective review state on most repos; dismissal
+        # handles the strict "Require resolution of changes requested"
+        # branch-protection setting.
+        safe_dismiss_own_change_requests(
+            feature.repo_path,
+            unit_state.pr_number,
+            "Tests pass on retry — superseding prior tester review.",
+        )
+        safe_submit_pr_review(
             feature.repo_path,
             unit_state.pr_number,
             f"🤖 **Tester:** all tests pass. _Session: `{session_id}`_",
+            event="COMMENT",
         )
         return json.dumps(
             {
@@ -324,13 +336,10 @@ def spawn_tester(feature_id: str, unit_id: str) -> str:
             session_id=session_id,
             details=tail(response),
         )
-        safe_comment_pr(
-            feature.repo_path,
-            unit_state.pr_number,
-            f"🤖 **Tester found a bug:** {reason}\n\n"
-            f"_Failing tests committed. Orchestrator will resume coder._\n"
-            f"_Session: `{session_id}`_",
-        )
+        # NB: tester posts its own inline REQUEST_CHANGES review with the
+        # per-bug detail (see tester.md "Posting the BUG_FOUND review").
+        # We don't add a top-level comment here — that would duplicate the
+        # inline review. The session-id breadcrumb lives in the event log.
         return json.dumps(
             {
                 "unit_id": unit_id,
@@ -382,9 +391,12 @@ def spawn_tester(feature_id: str, unit_id: str) -> str:
 def spawn_reviewer(feature_id: str, unit_id: str) -> str:
     """Spawn a reviewer Managed Agent for a unit's PR.
 
-    Reviewer is read-only. Posts review via `gh pr review`. Signals
-    REVIEW_APPROVED / REVIEW_RECOMMEND_MERGE / REVIEW_REQUEST_CHANGES /
-    REVIEW_COMMENT / BLOCKED. BLOCKS for minutes.
+    Reviewer is read-only. Posts review via the Reviews API. Signals
+    REVIEW_RECOMMEND_MERGE / REVIEW_REQUEST_CHANGES / REVIEW_COMMENT /
+    BLOCKED. BLOCKS for minutes. (`REVIEW_APPROVED` is deprecated — the
+    orchestrator never uses GitHub's `--approve`; a reviewer that emits
+    it falls through to the no-marker escalation path so prompt drift
+    is visible rather than silently accepted.)
 
     Refuses to spawn if CI is currently failing — reviewing a red PR
     duplicates effort the reviewer would otherwise spend critiquing the
@@ -444,27 +456,6 @@ def spawn_reviewer(feature_id: str, unit_id: str) -> str:
 
     unit_state.reviewer_session_id = session_id
     state.upsert_unit_state(unit_state)
-
-    if REVIEW_APPROVED_RE.search(response):
-        state.touch_unit(unit_id, status="in_ci")
-        state.record_event(
-            unit_id,
-            feature_id,
-            "reviewer_approved",
-            source="reviewer",
-            cycle_number=unit_state.review_round,
-            summary="Approved",
-            session_id=session_id,
-        )
-        return json.dumps(
-            {
-                "unit_id": unit_id,
-                "outcome": "REVIEW_APPROVED",
-                "session_id": session_id,
-                "summary": tail(response),
-            },
-            indent=2,
-        )
 
     recommend = REVIEW_RECOMMEND_MERGE_RE.search(response)
     if recommend:
@@ -1046,7 +1037,7 @@ def _reviewer_phase(ctx: CycleContext) -> tuple[bool, str | None]:
         if isinstance(outcome, str) and outcome.startswith("BLOCKED"):
             return False, "reviewer blocked on retry"
 
-    if outcome in ("REVIEW_APPROVED", "REVIEW_COMMENT", "REVIEW_RECOMMEND_MERGE"):
+    if outcome in ("REVIEW_COMMENT", "REVIEW_RECOMMEND_MERGE"):
         return True, None
 
     return False, f"reviewer ended with unexpected outcome: {outcome}"

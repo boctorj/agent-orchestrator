@@ -1,3 +1,5 @@
 **/__pycache__/**
 .coverage
 agent_orchestrator.egg-info/*
+.env
+state.db
