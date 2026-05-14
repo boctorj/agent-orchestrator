@@ -195,6 +195,48 @@ AUTO_MOUNT_REGISTRY_PATHS: tuple[str, ...] = (
 EXTRA_MOUNTS_ENV = "ORCH_WORKER_EXTRA_MOUNTS"
 INTERNAL_REGISTRY_HOSTS_ENV = "ORCH_INTERNAL_REGISTRY_HOSTS"
 
+# Subprocess timeout knob for spawn() / resume(). Default 30 min: long
+# enough for a worker to clone, install deps, run tests, push a PR;
+# short enough to catch a deadlock without burning a full CI budget.
+# Override via the ORCH_WORKER_TIMEOUT_SECONDS env knob (or pass
+# `timeout_seconds=` to `DockerClaudeCodeWorker`).
+#
+# F-001-U-6 (folded from PR #11 reviewer SUGGESTION 1): without this the
+# orchestrator thread blocks indefinitely on a hung `docker run`. The
+# doctor probes already use 10s/30s timeouts; this closes the parallel
+# gap on the real spawn/resume path.
+DEFAULT_SPAWN_TIMEOUT_SECONDS = 30 * 60
+TIMEOUT_ENV = "ORCH_WORKER_TIMEOUT_SECONDS"
+
+
+def _resolve_timeout_seconds(
+    override: int | None,
+    host_env: Mapping[str, str] | None = None,
+) -> int:
+    """Pick the effective subprocess timeout for one spawn/resume call.
+
+    Resolution order:
+      1. Explicit `timeout_seconds=` constructor field on the worker
+         (wins outright when set; tests use this to drive 10s timeouts).
+      2. `ORCH_WORKER_TIMEOUT_SECONDS` env knob (positive integer).
+      3. `DEFAULT_SPAWN_TIMEOUT_SECONDS` (30 min).
+
+    A non-positive or unparseable env value is silently ignored: fall
+    through to the default rather than crash a real spawn over a typo.
+    """
+    if override is not None and override > 0:
+        return override
+    src: Mapping[str, str] = host_env if host_env is not None else os.environ
+    raw = src.get(TIMEOUT_ENV, "")
+    if raw:
+        try:
+            val = int(raw)
+        except ValueError:
+            return DEFAULT_SPAWN_TIMEOUT_SECONDS
+        if val > 0:
+            return val
+    return DEFAULT_SPAWN_TIMEOUT_SECONDS
+
 
 # ---------------------------------------------------------------------------
 # Public helpers — session id extraction, auth-mode selection.
@@ -955,6 +997,12 @@ class DockerClaudeCodeWorker:
     # log "Auth: API key" / "Auth: claude.ai OAuth" at spawn without
     # this module depending on rich/Click.
     log: LogFn | None = None
+    # Optional per-instance override of the spawn/resume subprocess
+    # timeout in seconds. None means: fall back to ORCH_WORKER_TIMEOUT_SECONDS
+    # from the env, then to DEFAULT_SPAWN_TIMEOUT_SECONDS. Tests use this
+    # to drive a 10s timeout against a deliberately hanging in-container
+    # command (F-001-U-6).
+    timeout_seconds: int | None = None
 
     def _runner(self) -> SubprocessRunner:
         return self.run if self.run is not None else subprocess.run
@@ -967,6 +1015,10 @@ class DockerClaudeCodeWorker:
 
         with contextlib.suppress(Exception):
             self.log(msg)
+
+    def _resolve_timeout(self, host_env: dict[str, str] | None = None) -> int:
+        """Pick the effective subprocess timeout (see `_resolve_timeout_seconds`)."""
+        return _resolve_timeout_seconds(self.timeout_seconds, host_env)
 
     def auth_mode(self, host_env: dict[str, str] | None = None) -> AuthMode:
         return select_auth_mode(host_env)
@@ -1099,13 +1151,22 @@ class DockerClaudeCodeWorker:
         argv = self.build_docker_argv(claude_cmd)
         env = self.build_subprocess_env()
         runner = self._runner()
-        proc = runner(
-            argv,
-            capture_output=True,
-            text=True,
-            env=env,
-            check=False,
-        )
+        timeout = self._resolve_timeout()
+        try:
+            proc = runner(
+                argv,
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"docker run timed out after {timeout}s for {self.role} spawn "
+                f"(ORCH_WORKER_TIMEOUT_SECONDS or DockerClaudeCodeWorker."
+                f"timeout_seconds controls this budget)"
+            ) from exc
         stdout = (proc.stdout or "") if hasattr(proc, "stdout") else ""
         stderr = (proc.stderr or "") if hasattr(proc, "stderr") else ""
         returncode = getattr(proc, "returncode", 0)
@@ -1139,13 +1200,22 @@ class DockerClaudeCodeWorker:
         argv = self.build_docker_argv(claude_cmd)
         env = self.build_subprocess_env()
         runner = self._runner()
-        proc = runner(
-            argv,
-            capture_output=True,
-            text=True,
-            env=env,
-            check=False,
-        )
+        timeout = self._resolve_timeout()
+        try:
+            proc = runner(
+                argv,
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"docker run timed out after {timeout}s for {self.role} resume "
+                f"(ORCH_WORKER_TIMEOUT_SECONDS or DockerClaudeCodeWorker."
+                f"timeout_seconds controls this budget)"
+            ) from exc
         stdout = (proc.stdout or "") if hasattr(proc, "stdout") else ""
         stderr = (proc.stderr or "") if hasattr(proc, "stderr") else ""
         returncode = getattr(proc, "returncode", 0)
@@ -1214,11 +1284,13 @@ __all__ = [
     "DEFAULT_MEMORY",
     "DEFAULT_NETWORK",
     "DEFAULT_PIDS_LIMIT",
+    "DEFAULT_SPAWN_TIMEOUT_SECONDS",
     "EXTRA_MOUNTS_ENV",
     "INTERNAL_REGISTRY_HOSTS_ENV",
     "NEVER_MOUNTED_HOST_PATHS",
     "SENSITIVE_ENV_NAMES",
     "SENSITIVE_ENV_PREFIXES",
+    "TIMEOUT_ENV",
     "AuthMode",
     "CredAudit",
     "DockerClaudeCodeWorker",
