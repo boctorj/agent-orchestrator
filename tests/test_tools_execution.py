@@ -85,6 +85,10 @@ def _stub_github(monkeypatch, copilot_review=None):
     """Patch github.* helpers to no-op stubs."""
     monkeypatch.setattr("orchestrator.tools.execution.safe_amend_pr_body", lambda *a, **k: "")
     monkeypatch.setattr("orchestrator.tools.execution.safe_comment_pr", lambda *a, **k: "")
+    monkeypatch.setattr("orchestrator.tools.execution.safe_submit_pr_review", lambda *a, **k: "")
+    monkeypatch.setattr(
+        "orchestrator.tools.execution.safe_dismiss_own_change_requests", lambda *a, **k: 0
+    )
     monkeypatch.setattr(
         "orchestrator.tools.execution.github.request_copilot_review",
         lambda *a, **k: {"requested": True, "status_code": 201, "note": ""},

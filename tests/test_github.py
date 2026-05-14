@@ -108,6 +108,9 @@ class FakeClient:
     def patch(self, url, **kwargs):
         return self._handle("PATCH", url, **kwargs)
 
+    def put(self, url, **kwargs):
+        return self._handle("PUT", url, **kwargs)
+
 
 @pytest.fixture
 def fake_httpx(monkeypatch, with_github_token):
@@ -316,3 +319,167 @@ class TestGetCopilotReview:
         # Only Copilot-authored comment is included
         assert result["inline_comments"][0]["body"] == "use enumerate"
         assert result["inline_comments"][0]["line"] == 12
+
+
+# --------------------------- submit_pr_review ---------------------------
+
+
+class TestSubmitPrReview:
+    def test_posts_to_reviews_endpoint_with_event_and_body(self, fake_httpx):
+        github.submit_pr_review("https://github.com/o/r", 42, "all green now", event="COMMENT")
+        client = fake_httpx[-1]
+        assert len(client.calls) == 1
+        method, url, payload = client.calls[0]
+        assert method == "POST"
+        assert url.endswith("/repos/o/r/pulls/42/reviews")
+        assert payload == {"body": "all green now", "event": "COMMENT"}
+
+    def test_event_defaults_to_comment(self, fake_httpx):
+        github.submit_pr_review("https://github.com/o/r", 7, "endorse")
+        _, _, payload = fake_httpx[-1].calls[0]
+        assert payload["event"] == "COMMENT"
+
+    def test_request_changes_event_passes_through(self, fake_httpx):
+        github.submit_pr_review("https://github.com/o/r", 7, "fix this", event="REQUEST_CHANGES")
+        _, _, payload = fake_httpx[-1].calls[0]
+        assert payload["event"] == "REQUEST_CHANGES"
+
+    def test_raises_on_http_error(self, fake_httpx):
+        client = FakeClient()
+        client.responder = lambda method, url, **kw: FakeResponse(422, text="invalid event")
+
+        import orchestrator.github as gh
+
+        orig = gh.httpx.Client
+        gh.httpx.Client = lambda *a, **k: client
+        try:
+            with pytest.raises(RuntimeError, match="HTTP 422"):
+                gh.submit_pr_review("https://github.com/o/r", 1, "x")
+        finally:
+            gh.httpx.Client = orig
+
+
+# --------------------------- dismiss_own_change_requests ---------------------------
+
+
+class TestDismissOwnChangeRequests:
+    def _build_client(self, my_login: str, reviews: list[dict]):
+        """Stage a FakeClient that returns my_login on /user and reviews on the
+        first reviews GET, then echoes 200 OK for every subsequent call."""
+        client = FakeClient()
+        call_idx = [0]
+
+        def responder(method, url, **kwargs):
+            call_idx[0] += 1
+            if call_idx[0] == 1:  # GET /user
+                return FakeResponse(200, {"login": my_login})
+            if call_idx[0] == 2:  # GET .../reviews
+                return FakeResponse(200, reviews)
+            return FakeResponse(200, {})  # PUT .../dismissals
+
+        client.responder = responder
+        return client
+
+    def _run_with(self, client, *args, **kwargs):
+        import orchestrator.github as gh
+
+        orig = gh.httpx.Client
+        gh.httpx.Client = lambda *a, **k: client
+        try:
+            return gh.dismiss_own_change_requests(*args, **kwargs)
+        finally:
+            gh.httpx.Client = orig
+
+    def test_dismiss_payload_has_only_message_no_event(self, fake_httpx):
+        """Regression: a Copilot review on PR #17 flagged that passing
+        `event: "DISMISS"` causes the GitHub dismissal endpoint to reject
+        the request. The body must contain ONLY `message`."""
+        client = self._build_client(
+            my_login="orch-bot",
+            reviews=[
+                {"id": 100, "state": "CHANGES_REQUESTED", "user": {"login": "orch-bot"}},
+            ],
+        )
+        count = self._run_with(client, "https://github.com/o/r", 1, "superseded")
+        assert count == 1
+        put_calls = [c for c in client.calls if c[0] == "PUT"]
+        assert len(put_calls) == 1
+        _, url, payload = put_calls[0]
+        assert url.endswith("/repos/o/r/pulls/1/reviews/100/dismissals")
+        assert payload == {"message": "superseded"}
+        assert "event" not in payload
+
+    def test_skips_other_users_reviews(self, with_github_token):
+        client = self._build_client(
+            my_login="orch-bot",
+            reviews=[
+                {"id": 1, "state": "CHANGES_REQUESTED", "user": {"login": "alice"}},
+                {"id": 2, "state": "CHANGES_REQUESTED", "user": {"login": "orch-bot"}},
+            ],
+        )
+        count = self._run_with(client, "https://github.com/o/r", 1, "msg")
+        assert count == 1
+        put_urls = [c[1] for c in client.calls if c[0] == "PUT"]
+        assert any("/reviews/2/" in u for u in put_urls)
+        assert not any("/reviews/1/" in u for u in put_urls)
+
+    def test_skips_non_changes_requested_reviews(self, with_github_token):
+        client = self._build_client(
+            my_login="orch-bot",
+            reviews=[
+                {"id": 1, "state": "APPROVED", "user": {"login": "orch-bot"}},
+                {"id": 2, "state": "COMMENTED", "user": {"login": "orch-bot"}},
+                {"id": 3, "state": "CHANGES_REQUESTED", "user": {"login": "orch-bot"}},
+            ],
+        )
+        count = self._run_with(client, "https://github.com/o/r", 1, "msg")
+        assert count == 1
+        put_urls = [c[1] for c in client.calls if c[0] == "PUT"]
+        assert len(put_urls) == 1
+        assert "/reviews/3/" in put_urls[0]
+
+    def test_returns_zero_when_login_unknown(self, with_github_token):
+        """If /user has no `login` field, bail out without making any PUTs."""
+        client = FakeClient()
+        client.responder = lambda method, url, **kw: FakeResponse(200, {})
+        count = self._run_with(client, "https://github.com/o/r", 1, "msg")
+        assert count == 0
+        assert not any(c[0] == "PUT" for c in client.calls)
+
+    def test_case_insensitive_login_match(self, with_github_token):
+        """GitHub returns logins with arbitrary case; comparison must normalize."""
+        client = self._build_client(
+            my_login="Orch-Bot",
+            reviews=[
+                {"id": 1, "state": "CHANGES_REQUESTED", "user": {"login": "orch-bot"}},
+            ],
+        )
+        count = self._run_with(client, "https://github.com/o/r", 1, "msg")
+        assert count == 1
+
+    def test_swallows_per_review_http_error(self, with_github_token):
+        """One failing dismissal must not break the loop for the rest."""
+        client = FakeClient()
+        call_idx = [0]
+
+        def responder(method, url, **kwargs):
+            call_idx[0] += 1
+            if call_idx[0] == 1:
+                return FakeResponse(200, {"login": "bot"})
+            if call_idx[0] == 2:
+                return FakeResponse(
+                    200,
+                    [
+                        {"id": 1, "state": "CHANGES_REQUESTED", "user": {"login": "bot"}},
+                        {"id": 2, "state": "CHANGES_REQUESTED", "user": {"login": "bot"}},
+                    ],
+                )
+            if "/reviews/1/" in url:
+                import httpx as real_httpx
+
+                raise real_httpx.HTTPError("transient")
+            return FakeResponse(200, {})
+
+        client.responder = responder
+        count = self._run_with(client, "https://github.com/o/r", 1, "msg")
+        assert count == 1  # only #2 dismissed

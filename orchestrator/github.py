@@ -120,9 +120,11 @@ def dismiss_own_change_requests(repo_url: str, pr_number: int, message: str) -> 
             if not rid:
                 continue
             try:
+                # GitHub's "dismiss a review" endpoint accepts only {"message": ...};
+                # passing an extra "event" field causes the request to be rejected.
                 d = client.put(
                     f"{reviews_url}/{rid}/dismissals",
-                    json={"message": message, "event": "DISMISS"},
+                    json={"message": message},
                 )
                 if d.status_code in (200, 201):
                     dismissed += 1
