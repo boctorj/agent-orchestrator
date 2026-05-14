@@ -212,7 +212,7 @@ def test_linkcheck_has_files() -> None:
     files = _markdown_files()
     assert len(files) >= 5, files
     # And the most-load-bearing docs are in scope.
-    rel = {str(f.relative_to(REPO_ROOT)) for f in files}
+    rel = {f.relative_to(REPO_ROOT).as_posix() for f in files}
     assert "README.md" in rel
     assert "BACKLOG.md" in rel
     assert "docs/ARCHITECTURE.md" in rel
