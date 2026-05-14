@@ -246,7 +246,10 @@ custom toolchains the Managed Agent sandbox doesn't include. See
 the threat model, build instructions, and credential-boundary audit.
 
 `orchestrator doctor` prints which backend is currently selected and, on
-docker, audits the env vars / mounts / probes for the container.
+docker, runs four pre-flight probes (1: docker CLI on PATH · 2: daemon
+reachable · 3: `claude --version` succeeds inside the worker image ·
+4: `orch-net` bridge network exists) and renders the credential audit
+described below.
 
 `orchestrator init` asks **"Managed Agents or Docker workers?"** during
 setup and writes `ORCH_WORKER_BACKEND` into `.env` accordingly. Picking
@@ -270,7 +273,7 @@ time. Trade-offs, distilled from
 | **Internal package registries** | No (not reachable from Managed Agents sandbox) | Yes — auto-mounts `~/.npmrc`, `~/.pip/pip.conf`, `~/.docker/config.json` read-only into the worker |
 | **Cost telemetry** | Per-session billing data | None (flat subscription) |
 | **Setup** | API key in `.env` | Docker daemon, image build, dnsmasq sidecar |
-| **Image distribution** | Anthropic-managed | You maintain `orchestrator/worker:latest` |
+| **Image distribution** | Anthropic-managed | You maintain `orchestrator/worker:latest`. Override the tag with `ORCH_DOCKER_WORKER_IMAGE=<tag>` to ship custom images per environment. |
 
 ### Credential boundary + `doctor` audit (Docker)
 
@@ -354,16 +357,24 @@ isolation.
 ```bash
 # Requirements on host: Docker daemon running, ~/.claude with a real
 # claude.ai session for the OAuth-path tests.
-pytest tests/e2e -q                          # most coverage, skips claude itself
-ORCH_E2E_CLAUDE_AUTH=1 pytest tests/e2e -q   # also runs the spawn/resume round-trip
+ORCH_RUN_E2E=1 pytest tests/e2e -q                                    # most coverage, skips claude itself
+ORCH_RUN_E2E=1 ORCH_E2E_CLAUDE_AUTH=1 pytest tests/e2e -q             # also runs the spawn/resume round-trip
 ```
 
-The whole module auto-skips when Docker isn't reachable
-([`tests/e2e/conftest.py`](tests/e2e/conftest.py)'s `docker_available`
-autouse fixture), so you don't have to gate on env vars yourself.
-Tests that need a real claude.ai login are individually gated on
-`ORCH_E2E_CLAUDE_AUTH=1` so contributors without a claude.ai session
-see a clear skip reason.
+**Two gates:**
+
+- **Suite-level: `ORCH_RUN_E2E=1`.** The `docker_available` autouse
+  fixture in [`tests/e2e/conftest.py`](tests/e2e/conftest.py) skips the
+  module unless this env var is set. The main CI matrix doesn't set it
+  (E2E is opt-in to keep iteration fast); the dedicated
+  `e2e-docker.yml` workflow sets it and runs the suite on every PR.
+- **Test-level: `ORCH_E2E_CLAUDE_AUTH=1`.** Individual tests needing a
+  real claude.ai login (notably the spawn/resume round-trip) gate on
+  this so contributors without a session see a clear skip reason
+  instead of a confusing auth failure.
+
+If Docker isn't reachable, the autouse fixture skips cleanly even with
+`ORCH_RUN_E2E=1` set, so failed-daemon doesn't fail the suite.
 
 ## Network allowlist (Managed Agent containers)
 

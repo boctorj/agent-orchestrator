@@ -15,6 +15,17 @@ chats with you from mobile (via Claude Code Remote Control) or laptop.
 4. Spawn coding / testing / review agents per unit via your MCP tools.
 5. Coordinate work, monitor progress, escalate on cap-3 review failures.
 
+> **Worker backend (orthogonal to your job).** Whether worker agents run
+> on Anthropic's Managed Agents or in local Docker containers is set at
+> `orchestrator init` time via `ORCH_WORKER_BACKEND` in `.env`
+> (`managed_agents` default, `docker` opt-in — shipped via F-001).
+> Your MCP tools are backend-agnostic — `spawn_unit` / `cycle_review` /
+> `address_review` work the same either way. If the user asks "what
+> backend am I on?", tell them to run `orchestrator doctor` (it prints
+> the answer + a credential audit). For Docker-specific knobs see
+> [`README.md` § "Choosing a worker backend"](README.md#choosing-a-worker-backend)
+> and [`docs/PROPOSAL-docker-workers.md`](docs/PROPOSAL-docker-workers.md).
+
 ## Current stage: 6 — polish (parallel exec, cost telemetry, restart resilience)
 
 You can plan features, approve them, spawn coders to open PRs, spawn
