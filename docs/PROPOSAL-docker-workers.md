@@ -37,7 +37,7 @@ scripts/
   run-worker-dns.sh        ← starts dnsmasq sidecar on 127.0.0.1:5353,
                              ensures orch-net bridge exists
 tests/
-  e2e/test_docker_worker_smoke.py  ← 11 E2E tests against real Docker
+  e2e/test_docker_worker_smoke.py  ← E2E suite against real Docker
   fixtures/sandbox-repo/   ← minimal repo fixture for the workspace mount
 .github/workflows/
   ci.yml                   ← matrix: ubuntu/macos/windows × Python 3.11+3.12
@@ -46,8 +46,9 @@ tests/
 
 **[Δ shipped]** The proposal named the Worker protocol's home as
 `orchestrator/agents.py`. U-1 relocated it to `orchestrator/workers/base.py`;
-`orchestrator/agents.py` survives as a 4-line shim that re-exports
-`ManagedAgentWorker` for backwards-compat callers.
+`orchestrator/agents.py` survives as a small shim module (docstring + `__all__`
++ re-exports of `Worker`, `ManagedAgentWorker`, and `make_worker`) so historical
+callers don't break.
 
 The factory reads `ORCH_WORKER_BACKEND=managed_agents|docker` from `.env`
 (default: `managed_agents`). Everything downstream — `cycle_review`, the gate
@@ -137,13 +138,30 @@ and tmpfs scratch space mean a compromised worker can scribble in `/workspace`
 
 ### Credential boundary (the receipts surface)
 
-`build_subprocess_env()` and `build_cred_audit()` enforce a strict whitelist
-boundary. The subprocess env handed to `docker run` is a **curated dict**,
-NOT `os.environ`. Sensitive prefixes (`AWS_`, `SSH_`, `GCP_`, `GOOGLE_`,
-`AZURE_`, `KUBE`, `DOCKER_`) and full names (`OPENAI_API_KEY`,
-`ANTHROPIC_AUTH_TOKEN`, `GITHUB_APP_PRIVATE_KEY*`, `HOME`, `USER`, `PATH`)
-are dropped on the floor; only `GITHUB_TOKEN` (always) and
-`ANTHROPIC_API_KEY` (API-key mode only) cross the boundary.
+Two env contexts to keep distinct — both `build_subprocess_env()` and
+`build_cred_audit()` enforce strict whitelist boundaries, but at different
+layers:
+
+- **The host-side subprocess env** handed to `subprocess.run(["docker", "run", ...])`
+  is a **curated dict**, NOT `os.environ`. It preserves the minimum the
+  docker CLI itself needs to function: `PATH`, `HOME`, `LANG`, `LC_ALL`,
+  and `DOCKER_HOST` (if set). Plus `GITHUB_TOKEN` always; plus
+  `ANTHROPIC_API_KEY` in API-key mode. Everything else from `os.environ`
+  is dropped on the floor.
+- **The container env** (passed via the `--env <NAME>` flags in the
+  docker argv) is a stricter whitelist on top of the subprocess env:
+  only `GITHUB_TOKEN` always, plus `ANTHROPIC_API_KEY` in API-key mode,
+  cross into the container. `PATH`/`HOME`/`DOCKER_HOST` etc. stay
+  host-side; the container has its own minimal env baked into the
+  Dockerfile.
+
+The cred-audit reports the container-env boundary (what the worker actually
+sees), since that's the trust-relevant surface. `SENSITIVE_ENV_PREFIXES`
+(`AWS_`, `SSH_`, `GCP_`, `GOOGLE_`, `AZURE_`, `KUBE`, `DOCKER_`) and
+`SENSITIVE_ENV_NAMES` (`OPENAI_API_KEY`, `ANTHROPIC_AUTH_TOKEN`,
+`GITHUB_APP_PRIVATE_KEY*`, `HOME`, `USER`, `PATH`) are the explicit
+"audit me — was this on the host but blocked from the container?" list
+shown in the audit's "Env vars dropped" section.
 
 `CredAudit.render()` is what `orchestrator doctor` prints — five sections:
 env vars passed, env vars dropped (sensitives present on host that did
@@ -313,8 +331,10 @@ for current values + docstrings):
 | `ORCH_DOCKER_WORKER_IMAGE` | `orchestrator/worker:latest` | Override the container image tag (CLI passes through to `cli.py` for `init`/`doctor`). |
 | `ORCH_WORKER_EXTRA_MOUNTS` | (unset) | Comma-separated host paths to bind-mount read-only into the container. Rejected if any resolves into `NEVER_MOUNTED_HOST_PATHS`. |
 | `ORCH_INTERNAL_REGISTRY_HOSTS` | (unset) | Comma-separated hostnames to add to the dnsmasq allowlist (e.g. `artifactory.internal,internal-pypi.corp`). |
+| `ORCH_INTERNAL_REGISTRY_UPSTREAM` | `1.1.1.1` | DNS upstream the sidecar forwards each `ORCH_INTERNAL_REGISTRY_HOSTS` entry to (read by `scripts/run-worker-dns.sh`). |
 | `ORCH_WORKER_TIMEOUT_SECONDS` | `1800` (30 min) | Per-spawn / per-resume subprocess timeout. Added in U-6 review (PR #11 reviewer SUGGESTION 1). |
-| `ORCH_RUN_E2E` | (unset) | Opt-in gate for the E2E smoke suite (`tests/e2e/`). CI workflow sets this; local dev runs require explicit opt-in. |
+| `ORCH_RUN_E2E` | (unset) | Suite-level opt-in gate for the E2E smoke suite (`tests/e2e/`). CI workflow sets this; local dev runs require explicit opt-in. |
+| `ORCH_E2E_CLAUDE_AUTH` | (unset) | Test-level gate within the E2E suite — individual tests needing a real `claude` login (e.g. spawn/resume round-trip) skip cleanly unless this is set. |
 | `ORCH_DNSMASQ_BIND` | `127.0.0.1` | Where `scripts/run-worker-dns.sh` binds the sidecar. |
 | `ORCH_DNSMASQ_CONFIG` | bundled allowlist path | Override the dnsmasq config file path. |
 | `ORCH_DOCKER_NETWORK` | `orch-net` | Bridge network name; the script ensures it exists idempotently. |
@@ -354,7 +374,7 @@ session-hours (token costs not measured).
 | F-001-U-2 | [#11](https://github.com/boctorj/agent-orchestrator/pull/11) | Docker worker MVP — hybrid auth, strict cred boundary | `docker/worker.Dockerfile`, `DockerClaudeCodeWorker`, `build_cred_audit`, `run_doctor_probes` (3 probes initially). |
 | F-001-U-3 | [#13](https://github.com/boctorj/agent-orchestrator/pull/13) | dnsmasq sidecar + orch-net probe | `scripts/run-worker-dns.sh`, `allowlist.dnsmasq.conf`, 4th doctor probe (network exists). |
 | F-001-U-4 | [#14](https://github.com/boctorj/agent-orchestrator/pull/14) | Internal-registry passthrough (default-on) | `AUTO_MOUNT_REGISTRY_PATHS`, `ORCH_WORKER_EXTRA_MOUNTS`, `ORCH_INTERNAL_REGISTRY_HOSTS`, NEVER_MOUNT guard (PR-review C4), `audit_registry_passthrough_for_repo`. |
-| F-001-U-6 | [#16](https://github.com/boctorj/agent-orchestrator/pull/16) | End-to-end smoke test (real Docker) | `tests/e2e/test_docker_worker_smoke.py` (11 tests), `tests/fixtures/sandbox-repo/`, `ORCH_RUN_E2E=1` gate, `ORCH_WORKER_TIMEOUT_SECONDS`, `.github/workflows/e2e-docker.yml`. **Was NOT in the original 5-phase plan** — added during planning to cover what unit tests can't. |
+| F-001-U-6 | [#16](https://github.com/boctorj/agent-orchestrator/pull/16) | End-to-end smoke test (real Docker) | `tests/e2e/test_docker_worker_smoke.py`, `tests/e2e/conftest.py` (autouse `docker_available` gate), `tests/fixtures/sandbox-repo/`, `ORCH_RUN_E2E=1` suite gate + `ORCH_E2E_CLAUDE_AUTH=1` test-level gate, `ORCH_WORKER_TIMEOUT_SECONDS`, `.github/workflows/e2e-docker.yml`. **Was NOT in the original 5-phase plan** — added during planning to cover what unit tests can't. |
 | F-001-U-5 | [#18](https://github.com/boctorj/agent-orchestrator/pull/18) | Polish — init wizard + docs + BACKLOG | `orchestrator init` branches on backend choice, README "Choosing a worker backend" section, BACKLOG entries for sibling Worker implementations. |
 
 Merge order matches dependency order, except U-5 shipped after U-6 because
