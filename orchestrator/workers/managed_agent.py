@@ -12,7 +12,10 @@ import json
 import logging
 from pathlib import Path
 
+import anthropic
 from anthropic import Anthropic
+
+from orchestrator.workers.base import TailMessage, TailResult, TailStatus
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +51,43 @@ DEFAULT_TOOLS: list[dict] = [{"type": "agent_toolset_20260401"}]
 
 def load_role_prompt(role: str) -> str:
     return (PROMPTS_DIR / f"{role}.md").read_text()
+
+
+# Map Anthropic's session.status enum onto the four-value taxonomy the
+# ``Worker.tail_messages`` protocol exposes. The provider has four states
+# today (``rescheduling | running | idle | terminated``); ``rescheduling``
+# is still in-flight from the caller's perspective so we collapse it onto
+# ``running`` rather than introducing a fifth status callers must handle.
+_MANAGED_STATUS_MAP: dict[str, TailStatus] = {
+    "idle": "idle",
+    "running": "running",
+    "rescheduling": "running",
+    "terminated": "terminated",
+}
+
+
+def _map_managed_status(raw: str) -> TailStatus:
+    """Translate a raw Anthropic session.status into a ``TailStatus``.
+
+    Unknown statuses fall back to ``idle`` so an SDK enum addition can't
+    crash the tool — callers see the raw value via the ``reason`` field
+    on the ``TailResult`` if it's worth surfacing.
+    """
+    return _MANAGED_STATUS_MAP.get(raw, "idle")
+
+
+def _format_ts(event: object) -> str:
+    """Render an event's ``processed_at`` timestamp as a string.
+
+    Anthropic SDK events expose ``processed_at`` as a ``datetime``; some
+    fakes pass a plain string. Handle both without raising.
+    """
+    raw = getattr(event, "processed_at", None)
+    if raw is None:
+        return ""
+    if hasattr(raw, "isoformat"):
+        return raw.isoformat()
+    return str(raw)
 
 
 def _resource_signature(role: str, prompt: str, model: str) -> str:
@@ -247,6 +287,54 @@ class ManagedAgentWorker:
             self.SESSION_ACTIVE_POLL_TIMEOUT,
             polls,
         )
+
+    def tail_messages(self, session_id: str, *, limit: int = 50) -> TailResult:
+        """Return the session's status + its most recent agent messages.
+
+        Two SDK calls in sequence:
+          1. ``sessions.retrieve`` for the status (same field
+             ``resume_unit`` surfaces today).
+          2. ``sessions.events.list`` for the recent ``agent.message``
+             events. Asked for ``order='desc'`` so the cursor yields the
+             newest events first; we collect up to ``limit`` and reverse
+             so the caller sees them chronologically.
+
+        ``NotFoundError`` from ``retrieve`` maps cleanly to
+        ``status='not_found'`` — the only branch where ``messages`` is
+        guaranteed empty. Other API failures bubble up unchanged so the
+        caller sees real outages rather than a silent empty tail.
+        """
+        try:
+            session = self.client.beta.sessions.retrieve(session_id)
+        except anthropic.NotFoundError as exc:
+            return {"status": "not_found", "messages": [], "reason": str(exc)}
+
+        raw_status = getattr(session, "status", "unknown")
+        status = _map_managed_status(raw_status)
+        reason: str | None = None
+        if status == "terminated":
+            reason = f"session.status={raw_status}"
+
+        events = self.client.beta.sessions.events.list(
+            session_id,
+            types=["agent.message"],
+            limit=limit,
+            order="desc",
+        )
+        collected: list[TailMessage] = []
+        for ev in events:
+            if getattr(ev, "type", None) != "agent.message":
+                continue
+            text = "".join(
+                getattr(block, "text", "") or "" for block in (getattr(ev, "content", None) or [])
+            )
+            if not text:
+                continue
+            collected.append({"ts": _format_ts(ev), "role": "agent", "text": text})
+            if len(collected) >= limit:
+                break
+        collected.reverse()  # chronological (events.list returns newest-first)
+        return {"status": status, "messages": collected, "reason": reason}
 
     def _send_and_collect(self, session_id: str, msg: str) -> str:
         # Send the user.message BEFORE subscribing to the SSE event stream.

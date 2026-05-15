@@ -52,6 +52,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from orchestrator.workers.base import TailMessage, TailResult
+
 # Type alias for the subprocess.run-shaped callable that tests inject.
 # Real `subprocess.run` has a complex overloaded signature; for our
 # purposes we only need "called with argv + kwargs, returns something
@@ -1236,6 +1238,196 @@ class DockerClaudeCodeWorker:
         Worker-protocol completeness.
         """
         return None
+
+    def tail_messages(self, session_id: str, *, limit: int = 50) -> TailResult:
+        """Return the worker container's state + its most recent messages.
+
+        Two reads, both safe to call mid-cycle:
+          1. ``docker inspect <session_id>`` for container state. The
+             container is expected to be named after the session id
+             (the contract F-008's spawn-side wiring follows).
+          2. The Claude Code session JSONL at
+             ``<home>/.claude/sessions/<session_id>.jsonl`` for the
+             recent agent messages. The bind-mounted sessions dir is
+             persisted across container lifetimes so we can read it
+             even after ``--rm`` removed the container.
+
+        Status resolution:
+          * container.State.Status == 'running'      → ``running``
+          * container.State.Status == 'exited' & code == 0 → ``idle``
+          * container.State.Status == 'exited' & code != 0 → ``terminated``
+            (``reason`` carries ``exit_code=<code>``)
+          * no container, session JSONL exists       → ``idle``
+            (``--rm`` removed the finished container)
+          * no container, no session JSONL           → ``not_found``
+        """
+        container_state = self._inspect_container(session_id)
+        messages = _read_session_messages(self.home_dir, session_id, limit)
+
+        if container_state is None:
+            # `--rm` removes a finished container on exit; the only
+            # surviving artifact is the JSONL. If the JSONL is there the
+            # worker definitely existed, so report 'idle' rather than
+            # claiming we never heard of this session.
+            if _session_file_exists(self.home_dir, session_id):
+                return {"status": "idle", "messages": messages, "reason": None}
+            return {"status": "not_found", "messages": [], "reason": None}
+
+        state = container_state.get("status", "")
+        if state == "running":
+            return {"status": "running", "messages": messages, "reason": None}
+        if state == "exited":
+            exit_code = container_state.get("exit_code", 0)
+            if exit_code == 0:
+                return {"status": "idle", "messages": messages, "reason": None}
+            return {
+                "status": "terminated",
+                "messages": messages,
+                "reason": f"exit_code={exit_code}",
+            }
+        # Anything else (created, paused, restarting, removing, dead) is
+        # still "the container is here, work isn't done yet" — surface
+        # as running with the raw state in `reason` so callers can see
+        # the unusual transition.
+        return {
+            "status": "running",
+            "messages": messages,
+            "reason": f"container_state={state}",
+        }
+
+    def _inspect_container(self, name: str) -> dict[str, Any] | None:
+        """Run ``docker inspect`` and parse out ``State.Status`` + ``ExitCode``.
+
+        Returns ``None`` when docker reports no such container (the
+        normal post-``--rm`` state). Other errors also collapse to
+        ``None`` — tail_messages treats absence of a container as "use
+        the JSONL alone", which is the right fallback for any inspect
+        failure the user could plausibly hit.
+        """
+        runner = self._runner()
+        try:
+            proc = runner(
+                [
+                    "docker",
+                    "inspect",
+                    "--format",
+                    "{{.State.Status}} {{.State.ExitCode}}",
+                    name,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except Exception:  # noqa: BLE001 — inspect failures collapse to "no container"
+            return None
+        if getattr(proc, "returncode", 1) != 0:
+            return None
+        out = (getattr(proc, "stdout", "") or "").strip()
+        if not out:
+            return None
+        parts = out.split()
+        status = parts[0]
+        exit_code = 0
+        if len(parts) > 1:
+            try:
+                exit_code = int(parts[1])
+            except ValueError:
+                exit_code = 0
+        return {"status": status, "exit_code": exit_code}
+
+
+def _session_jsonl_path(home: Path, session_id: str) -> Path:
+    """Canonical location of a Claude Code session's JSONL transcript."""
+    return home / ".claude" / "sessions" / f"{session_id}.jsonl"
+
+
+def _session_file_exists(home: Path, session_id: str) -> bool:
+    return _session_jsonl_path(home, session_id).is_file()
+
+
+def _read_session_messages(home: Path, session_id: str, limit: int) -> list[TailMessage]:
+    """Parse the session JSONL into ``TailMessage`` dicts, capped at ``limit``.
+
+    Permissive parser — claude's JSONL has shifted shape across CLI
+    versions, so we walk every line independently and accept either of
+    two layouts:
+
+      * ``{type, role, text, ts}`` flat on the object
+      * ``{type, timestamp, message: {role, content: <str | list[block]>}}``
+        — the current Claude Code shape, where ``content`` may be a
+        plain string or a list of typed blocks each carrying ``text``.
+
+    Lines that don't parse, lines that aren't a recognized shape, and
+    lines without any text payload are silently skipped. Returns the
+    most recent ``limit`` entries in chronological order.
+    """
+    path = _session_jsonl_path(home, session_id)
+    if not path.is_file():
+        return []
+    try:
+        text = path.read_text()
+    except OSError:
+        return []
+    out: list[TailMessage] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        msg = _extract_tail_message(obj)
+        if msg is not None:
+            out.append(msg)
+    return out[-limit:]
+
+
+def _extract_tail_message(obj: object) -> TailMessage | None:
+    """Map one JSONL record onto the ``TailMessage`` shape, or ``None``.
+
+    See ``_read_session_messages`` for the supported shapes.
+    """
+    if not isinstance(obj, dict):
+        return None
+    ts = str(obj.get("timestamp") or obj.get("processed_at") or obj.get("created_at") or "")
+    # Flat shape: {role, text, ...}
+    flat_role = obj.get("role")
+    flat_text = obj.get("text")
+    if isinstance(flat_role, str) and isinstance(flat_text, str) and flat_text:
+        return {"ts": ts, "role": flat_role, "text": flat_text}
+    # Nested shape: {type, message: {role, content}}
+    nested = obj.get("message")
+    if isinstance(nested, dict):
+        role = nested.get("role") or obj.get("type")
+        content = nested.get("content")
+        text = _coerce_content_text(content)
+        if isinstance(role, str) and text:
+            return {"ts": ts, "role": role, "text": text}
+    return None
+
+
+def _coerce_content_text(content: object) -> str:
+    """Reduce claude's ``content`` value to a single text string.
+
+    The field is either a string (older schemas) or a list of block
+    dicts (current), each block typically ``{type: 'text', text: '...'}``
+    but tolerated to carry the raw string directly.
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict):
+            text = block.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+        elif isinstance(block, str):
+            parts.append(block)
+    return "".join(parts)
 
 
 def _extract_response_text(stdout: str) -> str:
