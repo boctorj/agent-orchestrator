@@ -190,3 +190,47 @@ def test_multiple_agent_messages_are_concatenated(_worker):
     result = worker._send_and_collect("sess_abc", "x")
 
     assert result == "part one. part two."
+
+
+def test_send_precedes_stream_subscribe(monkeypatch):
+    """Structural fix: ``_send_and_collect`` must send the user.message
+    BEFORE subscribing to the SSE stream. PR #21's saw_activity gate is
+    only sufficient if the stream stays open after the initial
+    status_idle — but the Anthropic SSE endpoint can emit only that
+    event and CLOSE the connection on a still-idle session, yielding
+    zero events and an empty return. Sending first transitions the
+    session to ``running`` so the stream stays open.
+    """
+    call_order: list[str] = []
+
+    class _OrderingEvents:
+        def __init__(self) -> None:
+            self._events = [
+                _status("running"),
+                _agent_message("ok"),
+                _status("idle"),
+            ]
+
+        def send(self, session_id: str, *, events: list[dict]) -> None:
+            call_order.append("send")
+
+        def stream(self, _session_id: str) -> _FakeStream:
+            call_order.append("stream")
+            return _FakeStream(self._events)
+
+    class _OrderingSessions:
+        events = _OrderingEvents()
+
+    fake = SimpleNamespace(beta=SimpleNamespace(sessions=_OrderingSessions()))
+    monkeypatch.setattr(
+        "orchestrator.workers.managed_agent.Anthropic",
+        lambda *a, **kw: fake,
+    )
+    worker = ManagedAgentWorker(role="coder")
+
+    worker._send_and_collect("sess_abc", "go")
+
+    assert call_order == ["send", "stream"], (
+        "user.message must be sent BEFORE the SSE stream is subscribed; "
+        f"got call order: {call_order}"
+    )

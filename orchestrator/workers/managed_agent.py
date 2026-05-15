@@ -188,24 +188,30 @@ class ManagedAgentWorker:
         self.client.beta.sessions.archive(session_id)
 
     def _send_and_collect(self, session_id: str, msg: str) -> str:
+        # Send the user.message BEFORE subscribing to the SSE event stream.
+        # PR #21 added a `saw_activity` gate to ignore an initial spurious
+        # `status_idle`, but that wasn't enough: when the stream subscribes
+        # against a still-idle session, the SSE endpoint can emit only the
+        # initial status_idle and CLOSE the connection — leaving the for-
+        # loop with zero events and an empty return. Sending first
+        # transitions the session to `running` so the stream stays open
+        # and delivers agent events as the agent produces them.
+        # The saw_activity gate stays as defense-in-depth in case the
+        # agent finishes between send and stream-open on a very fast task.
+        self.client.beta.sessions.events.send(
+            session_id,
+            events=[
+                {
+                    "type": "user.message",
+                    "content": [{"type": "text", "text": msg}],
+                }
+            ],
+        )
+        text_parts: list[str] = []
+        saw_activity = False
         with self.client.beta.sessions.events.stream(session_id) as stream:
-            self.client.beta.sessions.events.send(
-                session_id,
-                events=[
-                    {
-                        "type": "user.message",
-                        "content": [{"type": "text", "text": msg}],
-                    }
-                ],
-            )
-            text_parts: list[str] = []
-            saw_activity = False
             for event in stream:
                 etype = getattr(event, "type", None)
-                # A freshly-created session is `idle` until our user.message
-                # transitions it to running. The stream may emit that initial
-                # status_idle before the message lands; treat status_idle as
-                # completion only after observing any other event.
                 if etype == "session.status_idle":
                     if saw_activity:
                         break
@@ -216,4 +222,4 @@ class ManagedAgentWorker:
                         text = getattr(block, "text", None)
                         if text:
                             text_parts.append(text)
-            return "".join(text_parts)
+        return "".join(text_parts)
