@@ -289,6 +289,7 @@ def _render_pr_section(
     pr_number: int | None,
     repo_url: str,
     unit_status: str,
+    status_ts: str = "",
 ) -> list[str]:
     lines = ["## PR"]
     if pr_number and repo_url:
@@ -301,7 +302,13 @@ def _render_pr_section(
         lines.append(f"#{pr_number}")
     else:
         lines.append("_no PR opened_")
-    lines.append(f"Status: {unit_status}")
+    status_line = f"Status: {unit_status}"
+    if status_ts:
+        # Match the proposal § "Per-unit cycle log" example: `Status: merged
+        # (2026-05-15 14:32 UTC)`. ``last_activity`` is already UTC ISO-8601
+        # so we surface it verbatim and tag the timezone.
+        status_line += f" ({status_ts} UTC)"
+    lines.append(status_line)
     head_sha = pr_info.get("headRefOid") or ""
     lines.append(f"PR head SHA: {head_sha or '_unknown_'}")
     return lines
@@ -314,7 +321,11 @@ def _render_pr_description(pr_info: dict[str, Any]) -> list[str]:
     return lines
 
 
-def _render_cycle_history(events: list[dict[str, Any]]) -> list[str]:
+def _render_cycle_history(
+    events: list[dict[str, Any]],
+    *,
+    unit_status: str = "",
+) -> list[str]:
     rendered: list[dict[str, Any]] = []
     for ev in events:
         heading = _EVENT_HEADINGS.get(ev["event_type"])
@@ -329,7 +340,14 @@ def _render_cycle_history(events: list[dict[str, Any]]) -> list[str]:
         )
 
     cycle_count = max((r["cycle"] for r in rendered), default=0)
-    cap_hit = cycle_count >= 3
+    # "cap-3 hit" ⇔ the unit was escalated *because* the cap was reached.
+    # A unit that runs 3 cycles and is approved on cycle 3 has
+    # ``cycle_count == 3`` but the cap was NOT hit — see the proposal §
+    # "Per-unit cycle log" example, which renders that case as
+    # `3 cycles · cap-3 not hit`. The execution-side enforcement at
+    # ``review_round >= CAP_3`` only escalates when the *next* fix would
+    # exceed the cap, so unit_status is the authoritative signal.
+    cap_hit = unit_status == "escalated" and cycle_count >= 3
     lines = ["## Cycle history"]
     lines.append(f"{cycle_count} cycles · " + ("cap-3 hit" if cap_hit else "cap-3 not hit"))
     if not rendered:
@@ -419,9 +437,13 @@ def render_cycle_log(
             unit_state.pr_number if unit_state else None,
             feature.repo_path if feature else "",
             unit_state.status if unit_state else "unknown",
+            status_ts=unit_state.last_activity if unit_state else "",
         ),
         _render_pr_description(pr_info),
-        _render_cycle_history(state.list_events(unit_id) if unit_state else []),
+        _render_cycle_history(
+            state.list_events(unit_id) if unit_state else [],
+            unit_status=unit_state.status if unit_state else "",
+        ),
         _render_review_threads(review_threads),
     ]
     return "\n\n".join("\n".join(block) for block in blocks) + "\n"

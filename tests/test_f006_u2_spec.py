@@ -645,9 +645,10 @@ class TestNoRuntimeCallSitesWired:
 class TestWriteCycleLogValidation:
     def test_raises_when_unit_state_missing(self, tmp_path: Path, tmp_state_db: Path) -> None:
         """write_cycle_log must surface a clear error when the unit row
-        is absent — the caller should switch to ``regenerate_cycle_log``
-        in that case (which derives the feature_id from the unit_id
-        prefix).
+        is absent. (``regenerate_cycle_log`` is a thin wrapper around
+        ``write_cycle_log`` and surfaces the same error; the prefix
+        fallback in ``cycle_log_path`` only applies when callers invoke
+        ``cycle_log_path`` directly.)
         """
         with pytest.raises(ValueError):
             cycle_log.write_cycle_log("F-999-U-1", base_dir=tmp_path, run=_Runner())

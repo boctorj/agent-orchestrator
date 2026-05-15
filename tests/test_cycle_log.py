@@ -315,6 +315,19 @@ class TestRenderCycleLog:
         assert "PR head SHA: _unknown_" in md
         assert "_unavailable_" in md  # PR description placeholder
 
+    def test_status_line_includes_last_activity_timestamp(self, tmp_state_db: Path) -> None:
+        # The proposal example schema renders
+        # `Status: merged (2026-05-15 14:32 UTC)`. The renderer reads
+        # the timestamp out of ``unit_state.last_activity`` (already UTC
+        # ISO-8601 from ``state._now()``).
+        _seed()
+        unit_state = state.get_unit_state("F-007-U-2")
+        assert unit_state is not None and unit_state.last_activity, (
+            "_seed should leave last_activity set so this test exercises the timestamp path"
+        )
+        md = cycle_log.render_cycle_log("F-007-U-2", pr_info={}, review_threads=[])
+        assert f"Status: in_ci ({unit_state.last_activity} UTC)" in md
+
     def test_renders_review_threads_with_tier_marker(self, tmp_state_db: Path) -> None:
         _seed()
         threads = [
@@ -361,16 +374,40 @@ class TestRenderCycleLog:
         assert "spawn" not in md.lower()
         assert "### Cycle 1 — coder fix: FIX_PUSHED" in md
 
-    def test_cap_3_marker_when_three_cycles(self, tmp_state_db: Path) -> None:
+    def test_cap_3_marker_when_cap_actually_hit(self, tmp_state_db: Path) -> None:
+        # Three fix cycles AND the unit ended in `escalated` status —
+        # exactly the cap-hit scenario the execution layer produces when
+        # `review_round >= CAP_3` blocks the next fix attempt.
         _seed(
+            status="escalated",
             events=[
                 {"event_type": "fix_pushed", "cycle_number": 1, "summary": "f1"},
                 {"event_type": "fix_pushed", "cycle_number": 2, "summary": "f2"},
                 {"event_type": "fix_pushed", "cycle_number": 3, "summary": "f3"},
-            ]
+            ],
         )
         md = cycle_log.render_cycle_log("F-007-U-2", pr_info={}, review_threads=[])
         assert "3 cycles · cap-3 hit" in md
+
+    def test_three_cycles_with_recommend_merge_renders_not_hit(self, tmp_state_db: Path) -> None:
+        # Mirror the proposal § "Per-unit cycle log" example schema:
+        # three cycles ending in REVIEW_RECOMMEND_MERGE must render as
+        # `cap-3 not hit` — the cap was reached but the unit succeeded.
+        _seed(
+            status="in_ci",
+            events=[
+                {"event_type": "fix_pushed", "cycle_number": 1, "summary": "f1"},
+                {"event_type": "fix_pushed", "cycle_number": 2, "summary": "f2"},
+                {
+                    "event_type": "reviewer_recommend_merge",
+                    "cycle_number": 3,
+                    "summary": "endorsed",
+                },
+            ],
+        )
+        md = cycle_log.render_cycle_log("F-007-U-2", pr_info={}, review_threads=[])
+        assert "3 cycles · cap-3 not hit" in md
+        assert "### Cycle 3 — reviewer: REVIEW_RECOMMEND_MERGE" in md
 
 
 # --------------------------- writing ---------------------------
