@@ -46,7 +46,6 @@ import pytest
 from orchestrator import cycle_log, state
 from orchestrator.models import Feature, WorkUnit, WorkUnitState
 
-
 # --------------------------- fakes ---------------------------
 
 
@@ -92,9 +91,7 @@ def _seed_unit(
     title: str = "Demo unit",
     events: list[dict[str, Any]] | None = None,
 ) -> None:
-    state.save_feature(
-        Feature(id=feature_id, title="Demo", description="d", repo_path=repo_path)
-    )
+    state.save_feature(Feature(id=feature_id, title="Demo", description="d", repo_path=repo_path))
     state.save_plan(
         feature_id,
         [WorkUnit(id=unit_id, feature_id=feature_id, title=title, description="")],
@@ -150,9 +147,7 @@ class TestMkdirBeforeAnyWrite:
         _seed_unit(pr_number=None)
         assert not (tmp_path / "features").exists()
 
-        target = cycle_log.regenerate_cycle_log(
-            "F-042-U-1", base_dir=tmp_path, run=_Runner()
-        )
+        target = cycle_log.regenerate_cycle_log("F-042-U-1", base_dir=tmp_path, run=_Runner())
 
         assert (tmp_path / "features" / "F-042").is_dir()
         assert target.is_file()
@@ -169,9 +164,7 @@ class TestMkdirBeforeAnyWrite:
 
         assert (tmp_path / "features" / "F-042" / "U-1.md").is_file()
 
-    def test_feature_dir_uses_parents_true_exist_ok_true_pattern(
-        self, tmp_path: Path
-    ) -> None:
+    def test_feature_dir_uses_parents_true_exist_ok_true_pattern(self, tmp_path: Path) -> None:
         """Locks in the exact pattern from the unit description.
 
         Calling ``feature_dir`` twice on a nested path must succeed
@@ -336,9 +329,7 @@ class TestAtomicWrite:
         # Final lands at U-1.md.
         assert dst.name == "U-1.md"
 
-    def test_no_tmp_file_remains_on_success(
-        self, tmp_path: Path, tmp_state_db: Path
-    ) -> None:
+    def test_no_tmp_file_remains_on_success(self, tmp_path: Path, tmp_state_db: Path) -> None:
         _seed_unit(pr_number=None)
         cycle_log.write_cycle_log("F-042-U-1", base_dir=tmp_path, run=_Runner())
         assert list((tmp_path / "features" / "F-042").glob("*.tmp")) == []
@@ -407,9 +398,7 @@ class TestAutoCommitPolicy:
         assert "user.email=agent@orchestrator" in flat
         assert "user.name=orchestrator-bot" in flat
 
-    def test_no_push_call_is_ever_emitted(
-        self, tmp_path: Path, tmp_state_db: Path
-    ) -> None:
+    def test_no_push_call_is_ever_emitted(self, tmp_path: Path, tmp_state_db: Path) -> None:
         """Hard rule: ``auto-commit is local only``. `git push` is a bug."""
         _seed_unit(pr_number=None)
         runner = _Runner()
@@ -419,13 +408,9 @@ class TestAutoCommitPolicy:
         cycle_log.regenerate_cycle_log("F-042-U-1", base_dir=tmp_path, run=runner)
 
         for argv in runner.calls:
-            assert "push" not in argv, (
-                f"local-only push policy violated: {argv}"
-            )
+            assert "push" not in argv, f"local-only push policy violated: {argv}"
 
-    def test_no_op_commit_is_skipped(
-        self, tmp_path: Path, tmp_state_db: Path
-    ) -> None:
+    def test_no_op_commit_is_skipped(self, tmp_path: Path, tmp_state_db: Path) -> None:
         """Re-rendering on unchanged input must not pollute history."""
         _seed_unit(pr_number=None)
         runner = _Runner()
@@ -436,7 +421,7 @@ class TestAutoCommitPolicy:
 
         commit_attempts = [c for c in runner.calls if c[:1] == ["git"] and "commit" in c]
         assert commit_attempts == [], (
-            "no-op re-render must skip the commit; got attempts: %r" % commit_attempts
+            f"no-op re-render must skip the commit; got attempts: {commit_attempts!r}"
         )
 
 
@@ -454,15 +439,16 @@ class TestRegenerateRecoveryScenarios:
             pr_number=None,
             events=[
                 {"event_type": "pr_opened", "cycle_number": 0, "summary": "PR open"},
-                {"event_type": "reviewer_recommend_merge", "cycle_number": 1,
-                 "summary": "endorsed"},
+                {
+                    "event_type": "reviewer_recommend_merge",
+                    "cycle_number": 1,
+                    "summary": "endorsed",
+                },
             ],
         )
         assert not (tmp_path / "features").exists()
 
-        target = cycle_log.regenerate_cycle_log(
-            "F-042-U-1", base_dir=tmp_path, run=_Runner()
-        )
+        target = cycle_log.regenerate_cycle_log("F-042-U-1", base_dir=tmp_path, run=_Runner())
 
         body = target.read_text(encoding="utf-8")
         assert "F-042-U-1" in body
@@ -530,7 +516,6 @@ class TestRegenerateRecoveryScenarios:
         no-op-commit gate).
         """
         _seed_unit(pr_number=None)
-        runner = _Runner()
         # First call: simulate "there are staged changes" so we commit.
         # Second call: simulate "nothing changed" so we skip.
         call_count: dict[str, int] = {"n": 0}
@@ -568,17 +553,24 @@ class TestStateDrivenRendering:
     cycle history itself must come from ``state.list_events``.
     """
 
-    def test_cycle_history_reflects_unit_events_rows(
-        self, tmp_state_db: Path
-    ) -> None:
+    def test_cycle_history_reflects_unit_events_rows(self, tmp_state_db: Path) -> None:
         _seed_unit(
             events=[
-                {"event_type": "tester_bug_found", "cycle_number": 1,
-                 "summary": "race in oauth handler"},
-                {"event_type": "fix_pushed", "cycle_number": 1,
-                 "summary": "added mutex around token cache"},
-                {"event_type": "reviewer_request_changes", "cycle_number": 2,
-                 "summary": "needs Fernet wrap"},
+                {
+                    "event_type": "tester_bug_found",
+                    "cycle_number": 1,
+                    "summary": "race in oauth handler",
+                },
+                {
+                    "event_type": "fix_pushed",
+                    "cycle_number": 1,
+                    "summary": "added mutex around token cache",
+                },
+                {
+                    "event_type": "reviewer_request_changes",
+                    "cycle_number": 2,
+                    "summary": "needs Fernet wrap",
+                },
             ]
         )
         md = cycle_log.render_cycle_log("F-042-U-1", pr_info={}, review_threads=[])
@@ -590,9 +582,7 @@ class TestStateDrivenRendering:
         assert re.search(r"### Cycle 1 — tester: BUG_FOUND", md)
         assert re.search(r"### Cycle 2 — reviewer: REVIEW_REQUEST_CHANGES", md)
 
-    def test_no_cycle_events_renders_empty_marker(
-        self, tmp_state_db: Path
-    ) -> None:
+    def test_no_cycle_events_renders_empty_marker(self, tmp_state_db: Path) -> None:
         _seed_unit(events=[])
         md = cycle_log.render_cycle_log("F-042-U-1", pr_info={}, review_threads=[])
         # The "## Cycle history" section must still exist (schema
@@ -635,13 +625,11 @@ class TestNoRuntimeCallSitesWired:
             text = path.read_text(encoding="utf-8")
             # Any import or attribute access on the cycle_log module
             # would constitute a runtime call-site wiring.
-            if re.search(r"\bfrom\s+orchestrator\s+import\s+[^\n]*\bcycle_log\b", text):
-                offenders.append(path)
-            elif re.search(
-                r"\bfrom\s+orchestrator\.cycle_log\s+import\b", text
+            if (
+                re.search(r"\bfrom\s+orchestrator\s+import\s+[^\n]*\bcycle_log\b", text)
+                or re.search(r"\bfrom\s+orchestrator\.cycle_log\s+import\b", text)
+                or re.search(r"\bimport\s+orchestrator\.cycle_log\b", text)
             ):
-                offenders.append(path)
-            elif re.search(r"\bimport\s+orchestrator\.cycle_log\b", text):
                 offenders.append(path)
         assert offenders == [], (
             "F-006-U-2 ships as a pure library — no orchestrator module "
@@ -655,24 +643,16 @@ class TestNoRuntimeCallSitesWired:
 
 
 class TestWriteCycleLogValidation:
-    def test_raises_when_unit_state_missing(
-        self, tmp_path: Path, tmp_state_db: Path
-    ) -> None:
+    def test_raises_when_unit_state_missing(self, tmp_path: Path, tmp_state_db: Path) -> None:
         """write_cycle_log must surface a clear error when the unit row
         is absent — the caller should switch to ``regenerate_cycle_log``
         in that case (which derives the feature_id from the unit_id
         prefix).
         """
         with pytest.raises(ValueError):
-            cycle_log.write_cycle_log(
-                "F-999-U-1", base_dir=tmp_path, run=_Runner()
-            )
+            cycle_log.write_cycle_log("F-999-U-1", base_dir=tmp_path, run=_Runner())
 
-    def test_write_returns_correct_path(
-        self, tmp_path: Path, tmp_state_db: Path
-    ) -> None:
+    def test_write_returns_correct_path(self, tmp_path: Path, tmp_state_db: Path) -> None:
         _seed_unit(pr_number=None)
-        target = cycle_log.write_cycle_log(
-            "F-042-U-1", base_dir=tmp_path, run=_Runner()
-        )
+        target = cycle_log.write_cycle_log("F-042-U-1", base_dir=tmp_path, run=_Runner())
         assert target == tmp_path / "features" / "F-042" / "U-1.md"
