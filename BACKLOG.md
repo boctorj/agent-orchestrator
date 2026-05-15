@@ -117,6 +117,36 @@ After merge, run smoke test on main; if broken, spawn a fix unit.
 Delete merged-unit branches after N days (orchestrator-side, not agent-side).
 **Effort:** ~1 hr.
 
+### Cross-feature dependencies 🆕
+F-008 depends on F-007 landing is a planning concern today. Could
+become a `state.db features.depends_on` column so the daemon respects
+ordering across features (don't start F-008 units before F-007's
+PRs are merged). Mentioned in PR #19's open-questions section.
+**Effort:** ~3-4 hrs (schema migration + scheduler update + tests).
+
+### Cross-feature memory / preferences 🆕
+A user-level `~/.orchestrator/preferences.md` (your preferred libraries,
+test conventions, team norms, code-style notes) auto-injected into
+every new spec.md's Constraints section at `load_feature` time. Stops
+you from re-typing the same context across 20 features.
+**Effort:** ~3-4 hrs. **Depends on:** spec.md infrastructure (PR #19
+Phase 1).
+
+### Plan revision tracking 🆕
+Re-planning a feature today wipes the old plan. Could track plan
+versions so escalations that trigger a re-plan don't lose the prior
+decomposition. Useful for postmortems and learning from the planning
+mistakes that led to the re-plan.
+**Effort:** ~half day (schema migration + UI updates).
+
+### Replay / what-if 🆕
+Re-run a failed unit with different prompts / strategy without losing
+the existing history. Useful for debugging meta-prompt changes —
+"would this prompt edit have prevented yesterday's escalation?" —
+without polluting state.db.
+**Effort:** ~1 day. Medium complexity; needs careful state-machine
+work so the original cycle history stays intact.
+
 ---
 
 ## Quality gates
@@ -133,6 +163,22 @@ failures route back to coder via `address_review`.
 ### Security scan integration
 Pipe Trivy / Snyk / GitHub Code Scanning into reviewer context.
 **Effort:** ~1-2 days.
+
+### Ultrareview as a terminal gate 🆕
+After our reviewer emits `REVIEW_RECOMMEND_MERGE`, fire `/ultrareview`
+as an optional final pass; only emit ready-to-merge if it passes.
+Catches final-mile issues our reviewer + Copilot miss; costs measurably
+per cycle, so likely opt-in via a feature-level flag.
+**Effort:** ~half day. **Depends on:** PR #19 Phase 1 (so ultrareview
+has spec.md as intent to compare against).
+
+### Reviewer / tester learning from past escalations 🆕
+If a class of bug recurs across units (race condition, validation gap,
+prop drift), future units in similar territory get an automated hint
+in their task message. Cross-unit memory beyond the spec — possibly a
+`patterns.md` per repo that accumulates "things we have learned to
+watch for here."
+**Effort:** ~1 day. **Depends on:** cycle logs accumulated (PR #19 Phase 1).
 
 ---
 
@@ -153,6 +199,23 @@ Per-feature dollar + wall-clock limits; orchestrator halts on cap.
 ### Structured logging (compliance-ready)
 JSON logs, exportable, SOC 2-friendly.
 **Effort:** ~half day.
+
+### Worker observability — `tail_worker(unit_id, role)` 🆕
+New MCP tool that streams a worker's recent agent.message output
+mid-cycle. Today you can't see what a hung worker is doing until it
+times out at 30 min. Particularly load-bearing once the headless
+daemon ships (Phase 3 of PR #19) since synchronous chat visibility
+goes away.
+**Effort:** ~3-4 hrs. **Required for:** debugging the daemon era.
+
+### Cost guardrails — per-feature budget caps + alerts 🆕
+Two-layer policy on top of the existing `feature_cost` / `unit_cost`
+telemetry: (a) per-feature daily $ cap that pauses spawns when hit;
+(b) ntfy alert when feature spend crosses a threshold (e.g., 50% of
+cap); (c) daemon-level kill-switch on global spend rate. Today nothing
+prevents an autonomous daemon from burning unattended over a weekend.
+**Effort:** ~1 day. **Required for:** safely running PR #19 Phase 3
+(daemon) at scale.
 
 ---
 
