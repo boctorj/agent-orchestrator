@@ -47,6 +47,12 @@ class Feature:
     branch_prefix: str = ""
     status: FeatureStatus = "draft"
     created_at: str = ""
+    # Opt-in flag for the ultrareview terminal gate (F-007). When True,
+    # cycle_review fires /ultrareview after our reviewer endorses and only
+    # emits ready-to-merge if ultrareview passes too. Off by default —
+    # ultrareview costs measurably per cycle. See
+    # docs/PROPOSAL-ultrareview-gate.md for the opt-in semantics.
+    ultrareview_enabled: bool = False
 
 
 @dataclass

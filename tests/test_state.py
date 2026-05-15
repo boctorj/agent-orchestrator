@@ -112,6 +112,90 @@ class TestFeatures:
         state.save_feature(Feature(id="weird-id", title="b", description=""))
         assert state.next_feature_id() == "F-006"
 
+    # --- ultrareview_enabled (F-007-U-1) ---
+
+    def test_ultrareview_enabled_defaults_false(self, tmp_state_db):
+        state.save_feature(Feature(id="F", title="t", description=""))
+        got = state.get_feature("F")
+        assert got is not None
+        assert got.ultrareview_enabled is False
+
+    def test_ultrareview_enabled_round_trip_true(self, tmp_state_db):
+        state.save_feature(Feature(id="F", title="t", description="", ultrareview_enabled=True))
+        got = state.get_feature("F")
+        assert got is not None
+        assert got.ultrareview_enabled is True
+
+    def test_ultrareview_enabled_upsert_can_toggle_off(self, tmp_state_db):
+        """Toggling the flag back to False on an existing row must stick."""
+        state.save_feature(Feature(id="F", title="t", description="", ultrareview_enabled=True))
+        state.save_feature(Feature(id="F", title="t", description="", ultrareview_enabled=False))
+        assert state.get_feature("F").ultrareview_enabled is False
+
+    def test_list_features_returns_bool_not_int(self, tmp_state_db):
+        """SQLite stores 0/1 ints; the dataclass declares bool. The row
+        helper must coerce so callers can rely on `is True` / `is False`."""
+        state.save_feature(Feature(id="F", title="t", description="", ultrareview_enabled=True))
+        rows = state.list_features()
+        assert len(rows) == 1
+        assert isinstance(rows[0].ultrareview_enabled, bool)
+        assert rows[0].ultrareview_enabled is True
+
+
+class TestUltrareviewMigration:
+    """`ultrareview_enabled` must be added to pre-F-007 state.db files.
+
+    SQLite's `CREATE TABLE IF NOT EXISTS` is a no-op when the table
+    already exists, so `init_db()` alone can't add a column. The
+    migration step in `init_db()` patches the column in on the next
+    open, idempotently.
+    """
+
+    def test_migration_adds_column_to_pre_existing_features_table(self, monkeypatch, tmp_path):
+        db_path = tmp_path / "legacy.db"
+        monkeypatch.setattr("orchestrator.state.STATE_DB", db_path)
+
+        # Hand-build a pre-F-007 features table (no ultrareview_enabled).
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE features (
+                    id            TEXT PRIMARY KEY,
+                    title         TEXT NOT NULL,
+                    description   TEXT NOT NULL,
+                    repo_path     TEXT NOT NULL DEFAULT '',
+                    branch_prefix TEXT NOT NULL DEFAULT '',
+                    status        TEXT NOT NULL DEFAULT 'draft',
+                    created_at    TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO features (id, title, description, created_at) VALUES (?, ?, ?, ?)",
+                ("F-OLD", "legacy", "d", datetime.now(UTC).isoformat()),
+            )
+
+        # init_db() must add the new column without touching the existing row.
+        state.init_db()
+
+        with sqlite3.connect(db_path) as conn:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(features)").fetchall()}
+        assert "ultrareview_enabled" in cols
+
+        got = state.get_feature("F-OLD")
+        assert got is not None
+        assert got.ultrareview_enabled is False  # backfilled default
+
+    def test_init_db_is_idempotent_after_migration(self, monkeypatch, tmp_path):
+        """Running init_db() twice must not raise (no duplicate-column error)."""
+        db_path = tmp_path / "idem.db"
+        monkeypatch.setattr("orchestrator.state.STATE_DB", db_path)
+        state.init_db()
+        state.init_db()  # would raise "duplicate column name" if non-idempotent
+        with sqlite3.connect(db_path) as conn:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(features)").fetchall()}
+        assert "ultrareview_enabled" in cols
+
 
 # --------------------------- plans ---------------------------
 

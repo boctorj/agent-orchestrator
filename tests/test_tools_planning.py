@@ -434,6 +434,74 @@ def test_list_features_returns_json_with_status(tmp_state_db):
     assert parsed[0]["status"] == "draft"
 
 
+# --------------------------- ultrareview_enabled (F-007-U-1) ---------------------------
+
+
+def test_load_feature_default_ultrareview_disabled(tmp_state_db):
+    """Opt-in flag must default to False — ultrareview costs measurably."""
+    planning.load_feature(title="t", description="d")
+    assert state.get_feature("F-001").ultrareview_enabled is False
+
+
+def test_load_feature_accepts_ultrareview_enabled_true(tmp_state_db):
+    planning.load_feature(title="t", description="d", ultrareview_enabled=True)
+    assert state.get_feature("F-001").ultrareview_enabled is True
+
+
+def test_load_feature_toggles_ultrareview_on_existing_feature(tmp_state_db):
+    """Toggling the flag on an existing approved feature is metadata-only —
+    it must NOT drop the feature back to draft (mirrors fixing repo_path)."""
+    planning.load_feature(title="t", description="d", repo_path="https://github.com/o/r")
+    planning.save_plan(
+        "F-001",
+        [{"id": "U1", "title": "u", "description": "d", "depends_on": []}],
+    )
+    planning.approve_plan("F-001")
+
+    planning.load_feature(
+        title="t",
+        description="d",
+        id="F-001",
+        repo_path="https://github.com/o/r",
+        ultrareview_enabled=True,
+    )
+    feat = state.get_feature("F-001")
+    assert feat.status == "approved"
+    assert feat.ultrareview_enabled is True
+
+
+def test_list_features_includes_ultrareview_enabled(tmp_state_db):
+    planning.load_feature(title="a", description="d", ultrareview_enabled=True)
+    parsed = json.loads(planning.list_features())
+    assert parsed[0]["ultrareview_enabled"] is True
+
+
+def test_list_features_defaults_ultrareview_to_false_in_output(tmp_state_db):
+    planning.load_feature(title="a", description="d")
+    parsed = json.loads(planning.list_features())
+    assert parsed[0]["ultrareview_enabled"] is False
+
+
+def test_get_plan_surfaces_ultrareview_enabled(tmp_state_db):
+    planning.load_feature(title="a", description="d", ultrareview_enabled=True)
+    planning.save_plan(
+        "F-001",
+        [{"id": "U1", "title": "t", "description": "d", "depends_on": []}],
+    )
+    parsed = json.loads(planning.get_plan("F-001"))
+    assert parsed["ultrareview_enabled"] is True
+
+
+def test_get_plan_defaults_ultrareview_to_false(tmp_state_db):
+    planning.load_feature(title="a", description="d")
+    planning.save_plan(
+        "F-001",
+        [{"id": "U1", "title": "t", "description": "d", "depends_on": []}],
+    )
+    parsed = json.loads(planning.get_plan("F-001"))
+    assert parsed["ultrareview_enabled"] is False
+
+
 # --------------------------- save_plan ---------------------------
 
 
