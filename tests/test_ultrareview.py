@@ -14,6 +14,7 @@ every other test stubs the subprocess seam.
 from __future__ import annotations
 
 import subprocess
+import sys
 
 import pytest
 
@@ -372,24 +373,17 @@ class TestParallelRuns:
 class TestDefaultSpawnArgv:
     """The one test that drives `_default_spawn` directly — confirms the
     invocation mechanism (CLI subcommand) round-trips through `subprocess`
-    with the expected argv. Uses a no-op command (`true`) so no real
-    `claude` binary is required.
+    with the expected argv. Uses ``sys.executable -c ""`` as the binary
+    so the test is portable to every platform where pytest runs (the
+    previous ``/bin/true`` choice was absent on Windows runners and the
+    macOS GitHub-Actions images).
     """
 
-    def test_default_spawn_returns_popen(self, monkeypatch):
-        # Force the binary to /bin/true so the test works on any host.
-        monkeypatch.setenv("ULTRAREVIEW_CLI", "/bin/true")
-        import importlib
-
-        importlib.reload(ultrareview)
-        try:
-            proc = ultrareview._default_spawn(["/bin/true", "ultrareview", "1"])
-            assert isinstance(proc, subprocess.Popen)
-            proc.wait(timeout=5)
-            assert proc.returncode == 0
-        finally:
-            monkeypatch.delenv("ULTRAREVIEW_CLI", raising=False)
-            importlib.reload(ultrareview)
+    def test_default_spawn_returns_popen(self):
+        proc = ultrareview._default_spawn([sys.executable, "-c", ""])
+        assert isinstance(proc, subprocess.Popen)
+        proc.wait(timeout=5)
+        assert proc.returncode == 0
 
 
 # --------------------------- env defaults ---------------------------
