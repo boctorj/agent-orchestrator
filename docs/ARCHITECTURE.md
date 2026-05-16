@@ -360,6 +360,23 @@ pyproject.toml                   Package metadata + ruff + mypy + bandit +
                             │  worker agent to act on a target repo
 ```
 
+**Filesystem-resident state (not in SQLite).** Two surfaces live in the
+orchestrator workdir's git repo rather than `state.db`:
+
+* `features/F-XXX/spec.md` — durable, version-controlled feature design
+  doc seeded by `load_feature` from `orchestrator/feature_spec.py`.
+  Intent / Acceptance / Out-of-scope / Approach / Constraints /
+  Decisions / Open questions. Edited by the lead during planning and
+  preserved across re-invocations (`write_spec_if_missing` is
+  idempotent — see `docs/SPEC-FORMAT.md`). Committed by the lead with
+  `Why:` messages so the git log is the decision history.
+* `features/F-XXX/U-N.md` — per-unit cycle log (F-006 Phase 1, separate
+  unit). Mirrors `unit_events` rows into a human-readable summary
+  alongside the PR description, so post-mortem context survives
+  state.db loss / restore.
+
+Schema reference for both: [`docs/SPEC-FORMAT.md`](SPEC-FORMAT.md).
+
 ### State transitions for `work_units.status`
 
 ```
@@ -923,6 +940,27 @@ BACKLOG.
 them; the prompt hash changes; the next spawn creates a new cached agent
 automatically. No manual reset needed (unless you also change the model or
 network config — those aren't in the hash; use `reset_cached_resources`).
+
+### 11e. Per-feature spec.md and per-unit cycle logs
+
+Two filesystem persistence surfaces sit alongside `state.db` in the
+orchestrator workdir (see §6 for the data-model summary):
+
+* **`features/F-XXX/spec.md`** — feature-level design doc. Seeded on
+  `load_feature` from `orchestrator/feature_spec.py::render_template()`
+  and never overwritten. Schema and `Why:` commit pattern in
+  [`docs/SPEC-FORMAT.md`](SPEC-FORMAT.md). To customize the starter
+  template, edit `render_template()`; existing files on disk are
+  preserved.
+* **`features/F-XXX/U-N.md`** — per-unit cycle log written by
+  `orchestrator/cycle_log.py` (F-006-U-2). Idempotent; can be
+  regenerated from `state.unit_events` + `gh pr view`. The renderer is
+  a pure library — call sites (cycle_review terminal hand-off, manual
+  `regenerate_cycle_log`) are wired in later Phase 1 units.
+
+Adding a new persistent-on-disk artifact follows the same shape:
+write-to-tmp + `Path.replace`, idempotent re-renderer, prefix-rooted
+under `features/F-XXX/`, no escape outside the orchestrator workdir.
 
 ---
 

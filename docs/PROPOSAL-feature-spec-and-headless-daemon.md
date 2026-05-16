@@ -101,26 +101,32 @@ Path: `features/F-XXX/spec.md`. Schema:
 # F-XXX: <title>
 
 ## Intent
-What we're building. Why. Who benefits.
+<feature description, pre-filled from load_feature>
 
 ## Acceptance
-Concrete, testable criteria for "done".
+_TBD — concrete, testable criteria for "done"._
 
 ## Out of scope
-Hard boundary against scope creep.
+_TBD — hard boundary against scope creep._
 
 ## Approach
-High-level design choices, library / framework decisions.
+_TBD — high-level design choices, library / framework decisions._
 
 ## Constraints
-Non-functional requirements (perf, security, compatibility).
+_TBD — non-functional requirements (perf, security, compatibility)._
 
 ## Decisions
-Non-obvious choices with reasoning. Grows over time.
+_TBD — non-obvious choices with reasoning. Grows over time._
 
 ## Open questions
-Things still undecided. Resolved questions move to Decisions.
+_TBD — things still undecided. Resolved questions move to Decisions._
 ```
+
+Every section other than Intent starts as a `_TBD — <hint>._` placeholder
+so the lead can see at a glance what still needs filling in. See
+[`docs/SPEC-FORMAT.md`](SPEC-FORMAT.md) for the canonical reference;
+`orchestrator/feature_spec.py::render_template()` is the source of truth
+for the literal bytes.
 
 **Rules:**
 
