@@ -55,6 +55,9 @@ class _FakeSessions:
     def __init__(self, events: list[SimpleNamespace]) -> None:
         self.events = _FakeEvents(events)
 
+    def retrieve(self, _session_id: str) -> SimpleNamespace:
+        return SimpleNamespace(status="running")
+
 
 class _FakeBeta:
     def __init__(self, events: list[SimpleNamespace]) -> None:
@@ -192,14 +195,18 @@ def test_multiple_agent_messages_are_concatenated(_worker):
     assert result == "part one. part two."
 
 
-def test_send_precedes_stream_subscribe(monkeypatch):
-    """Structural fix: ``_send_and_collect`` must send the user.message
-    BEFORE subscribing to the SSE stream. PR #21's saw_activity gate is
-    only sufficient if the stream stays open after the initial
-    status_idle — but the Anthropic SSE endpoint can emit only that
-    event and CLOSE the connection on a still-idle session, yielding
-    zero events and an empty return. Sending first transitions the
-    session to ``running`` so the stream stays open.
+def test_send_precedes_retrieve_precedes_stream(monkeypatch):
+    """Structural fix: ``_send_and_collect`` must (1) send the user.message,
+    (2) poll ``sessions.retrieve`` until the session leaves ``idle``,
+    (3) subscribe to the SSE stream — in that order.
+
+    PR #21 ignored a spurious initial ``status_idle``. PR #23 sent before
+    stream-open so fresh sessions had time to flip ``idle`` → ``running``.
+    Long-idle resumes broke both: the server's send → state-update window
+    is wider on a session idle for hours, so the SSE endpoint still saw
+    an ``idle`` session at subscribe-time, closed the stream with zero
+    events, and the orchestrator escalated with ``fix_no_marker``
+    (F-006-U-2). The poll closes the race.
     """
     call_order: list[str] = []
 
@@ -221,6 +228,10 @@ def test_send_precedes_stream_subscribe(monkeypatch):
     class _OrderingSessions:
         events = _OrderingEvents()
 
+        def retrieve(self, _session_id: str) -> SimpleNamespace:
+            call_order.append("retrieve")
+            return SimpleNamespace(status="running")
+
     fake = SimpleNamespace(beta=SimpleNamespace(sessions=_OrderingSessions()))
     monkeypatch.setattr(
         "orchestrator.workers.managed_agent.Anthropic",
@@ -230,7 +241,140 @@ def test_send_precedes_stream_subscribe(monkeypatch):
 
     worker._send_and_collect("sess_abc", "go")
 
-    assert call_order == ["send", "stream"], (
-        "user.message must be sent BEFORE the SSE stream is subscribed; "
-        f"got call order: {call_order}"
+    assert call_order == ["send", "retrieve", "stream"], (
+        f"expected send → retrieve(poll for active) → stream; got call order: {call_order}"
+    )
+
+
+def test_wait_for_session_active_polls_until_running(monkeypatch):
+    """Long-idle resume: ``sessions.retrieve`` may return ``idle`` for a
+    beat after ``events.send`` while the server propagates the state
+    transition. Poll until the status flips away from ``idle`` before
+    opening the stream. The F-006-U-2 escalation (session idle ~15h,
+    ``fix_no_marker`` 4s after ``address_review``) is exactly this case.
+    """
+    statuses = iter(["idle", "idle", "running"])
+    retrieve_calls = 0
+
+    class _Sessions:
+        class events:
+            sent: list[dict] = []
+
+            @classmethod
+            def send(cls, session_id: str, *, events: list[dict]) -> None:
+                cls.sent.append({"session_id": session_id, "events": events})
+
+            @staticmethod
+            def stream(_session_id: str) -> _FakeStream:
+                return _FakeStream(
+                    [
+                        _status("running"),
+                        _agent_message("FIX_PUSHED"),
+                        _status("idle"),
+                    ]
+                )
+
+        def retrieve(self, _session_id: str) -> SimpleNamespace:
+            nonlocal retrieve_calls
+            retrieve_calls += 1
+            return SimpleNamespace(status=next(statuses))
+
+    fake = SimpleNamespace(beta=SimpleNamespace(sessions=_Sessions()))
+    monkeypatch.setattr(
+        "orchestrator.workers.managed_agent.Anthropic",
+        lambda *a, **kw: fake,
+    )
+    # Make the poll near-instant so the test doesn't burn wall-clock.
+    monkeypatch.setattr(ManagedAgentWorker, "SESSION_ACTIVE_POLL_INTERVAL", 0.0)
+    monkeypatch.setattr(ManagedAgentWorker, "SESSION_ACTIVE_POLL_TIMEOUT", 1.0)
+
+    worker = ManagedAgentWorker(role="coder")
+    result = worker._send_and_collect("sess_long_idle", "address review comments")
+
+    assert retrieve_calls == 3, (
+        f"expected poll to run until status != 'idle' (3 retrieves: "
+        f"idle, idle, running); got {retrieve_calls}"
+    )
+    assert result == "FIX_PUSHED"
+
+
+def test_wait_for_session_active_times_out_when_status_stays_idle(monkeypatch):
+    """Pathological: ``sessions.retrieve`` never reports a non-idle status.
+    The poll must bail out at the configured timeout rather than hanging
+    forever; the existing stream-open path then runs and the
+    orchestrator's no-marker handler surfaces the stuck session as
+    escalation.
+    """
+    retrieve_calls = 0
+
+    class _Sessions:
+        class events:
+            sent: list[dict] = []
+
+            @classmethod
+            def send(cls, session_id: str, *, events: list[dict]) -> None:
+                cls.sent.append({"session_id": session_id, "events": events})
+
+            @staticmethod
+            def stream(_session_id: str) -> _FakeStream:
+                return _FakeStream([])  # zero events — the original bug shape
+
+        def retrieve(self, _session_id: str) -> SimpleNamespace:
+            nonlocal retrieve_calls
+            retrieve_calls += 1
+            return SimpleNamespace(status="idle")
+
+    fake = SimpleNamespace(beta=SimpleNamespace(sessions=_Sessions()))
+    monkeypatch.setattr(
+        "orchestrator.workers.managed_agent.Anthropic",
+        lambda *a, **kw: fake,
+    )
+    # Tight bounds so the test completes quickly; assert the loop respects them.
+    monkeypatch.setattr(ManagedAgentWorker, "SESSION_ACTIVE_POLL_INTERVAL", 0.0)
+    monkeypatch.setattr(ManagedAgentWorker, "SESSION_ACTIVE_POLL_TIMEOUT", 0.05)
+
+    worker = ManagedAgentWorker(role="coder")
+    result = worker._send_and_collect("sess_stuck", "go")
+
+    assert retrieve_calls >= 1, "poll must call retrieve at least once"
+    assert result == "", (
+        "stuck-idle session should fall through to the empty-stream path "
+        "so the orchestrator's no-marker handler surfaces escalation"
+    )
+
+
+def test_wait_for_session_active_tolerates_retrieve_errors(monkeypatch):
+    """Robustness: ``sessions.retrieve`` raising (network blip, SDK
+    incompatibility) must not bring down ``_send_and_collect``. The poll
+    is best-effort; on error the stream-open path still runs.
+    """
+
+    class _Sessions:
+        class events:
+            sent: list[dict] = []
+
+            @classmethod
+            def send(cls, session_id: str, *, events: list[dict]) -> None:
+                cls.sent.append({"session_id": session_id, "events": events})
+
+            @staticmethod
+            def stream(_session_id: str) -> _FakeStream:
+                return _FakeStream([_status("running"), _agent_message("done"), _status("idle")])
+
+        def retrieve(self, _session_id: str) -> SimpleNamespace:
+            raise RuntimeError("transient SDK failure")
+
+    fake = SimpleNamespace(beta=SimpleNamespace(sessions=_Sessions()))
+    monkeypatch.setattr(
+        "orchestrator.workers.managed_agent.Anthropic",
+        lambda *a, **kw: fake,
+    )
+    monkeypatch.setattr(ManagedAgentWorker, "SESSION_ACTIVE_POLL_INTERVAL", 0.0)
+    monkeypatch.setattr(ManagedAgentWorker, "SESSION_ACTIVE_POLL_TIMEOUT", 1.0)
+
+    worker = ManagedAgentWorker(role="coder")
+    result = worker._send_and_collect("sess_flaky_retrieve", "go")
+
+    assert result == "done", (
+        "retrieve errors must be swallowed; the stream-open path should still execute"
     )

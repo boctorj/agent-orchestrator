@@ -76,6 +76,11 @@ class ManagedAgentWorker:
     Cross-process persistence comes in Stage 2 via the state DB.
     """
 
+    # Bound the poll loop in `_wait_for_session_active`. Class attributes so
+    # tests can monkeypatch them down to near-zero without changing call sites.
+    SESSION_ACTIVE_POLL_TIMEOUT = 10.0
+    SESSION_ACTIVE_POLL_INTERVAL = 0.3
+
     def __init__(self, role: str, *, model: str = DEFAULT_MODEL):
         self.role = role
         self.model = model
@@ -187,15 +192,48 @@ class ManagedAgentWorker:
     def archive(self, session_id: str) -> None:
         self.client.beta.sessions.archive(session_id)
 
+    def _wait_for_session_active(self, session_id: str) -> None:
+        """Poll until the session's status transitions away from ``idle``.
+
+        PR #23 sent the ``user.message`` before opening the SSE stream so
+        fresh sessions had time to flip ``idle`` → ``running`` before the
+        subscribe. That works for brand-new sessions, but on long-idle
+        resumes (session that's been idle for hours) the server-side
+        send → state-update window is longer; the stream can still open
+        against an ``idle`` session, get a zero-event close, and return
+        empty. Symptom: F-006-U-2 went to escalated with
+        ``fix_no_marker`` 4s after ``address_review`` on a session idle
+        ~15h.
+
+        Best-effort: retrieve errors and timeout both fall through to the
+        existing stream-open path so a genuinely stuck session still
+        surfaces as ``coder_no_marker`` / ``fix_no_marker`` rather than
+        hanging this method.
+        """
+        import time
+
+        deadline = time.time() + self.SESSION_ACTIVE_POLL_TIMEOUT
+        while time.time() < deadline:
+            try:
+                session = self.client.beta.sessions.retrieve(session_id)
+            except Exception:  # noqa: BLE001
+                return
+            status = getattr(session, "status", None)
+            if status != "idle":
+                return
+            time.sleep(self.SESSION_ACTIVE_POLL_INTERVAL)
+
     def _send_and_collect(self, session_id: str, msg: str) -> str:
         # Send the user.message BEFORE subscribing to the SSE event stream.
         # PR #21 added a `saw_activity` gate to ignore an initial spurious
-        # `status_idle`, but that wasn't enough: when the stream subscribes
-        # against a still-idle session, the SSE endpoint can emit only the
-        # initial status_idle and CLOSE the connection — leaving the for-
-        # loop with zero events and an empty return. Sending first
-        # transitions the session to `running` so the stream stays open
-        # and delivers agent events as the agent produces them.
+        # `status_idle`. PR #23 then sent the message before opening the
+        # stream so fresh sessions had time to flip to `running`. Both
+        # are necessary but not sufficient on long-idle resumes: the
+        # server-side send → state-update window is wider on a session
+        # that's been idle for hours, the SSE endpoint can still see an
+        # `idle` session at subscribe-time and close the connection with
+        # zero events. After send, poll `sessions.retrieve` until the
+        # status flips away from `idle` before opening the stream.
         # The saw_activity gate stays as defense-in-depth in case the
         # agent finishes between send and stream-open on a very fast task.
         self.client.beta.sessions.events.send(
@@ -207,6 +245,7 @@ class ManagedAgentWorker:
                 }
             ],
         )
+        self._wait_for_session_active(session_id)
         text_parts: list[str] = []
         saw_activity = False
         with self.client.beta.sessions.events.stream(session_id) as stream:
