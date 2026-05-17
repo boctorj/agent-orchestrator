@@ -15,7 +15,7 @@ from pathlib import Path
 import anthropic
 from anthropic import Anthropic
 
-from orchestrator.workers.base import TailMessage, TailResult, TailStatus
+from orchestrator.workers.base import TailMessage, TailResult, TailStatus, _validate_limit
 
 logger = logging.getLogger(__name__)
 
@@ -69,11 +69,18 @@ _MANAGED_STATUS_MAP: dict[str, TailStatus] = {
 def _map_managed_status(raw: str) -> TailStatus:
     """Translate a raw Anthropic session.status into a ``TailStatus``.
 
-    Unknown statuses fall back to ``idle`` so an SDK enum addition can't
-    crash the tool — callers see the raw value via the ``reason`` field
-    on the ``TailResult`` if it's worth surfacing.
+    Unknown statuses fall back to ``running`` — NOT ``idle``. The
+    ``tail_worker`` MCP tool's whole point is to stop the user waiting
+    on a hung worker; misreporting an unknown future state (e.g. a new
+    ``requires_action`` Anthropic ships later) as ``idle`` would tell
+    callers "work finished, safe to archive" when it actually hasn't.
+    ``running`` keeps callers in the wait/poll loop, which is safe.
+
+    The caller is expected to also populate ``TailResult.reason`` with
+    the raw status string whenever this falls back, so observability
+    isn't lost. See ``tail_messages``.
     """
-    return _MANAGED_STATUS_MAP.get(raw, "idle")
+    return _MANAGED_STATUS_MAP.get(raw, "running")
 
 
 def _format_ts(event: object) -> str:
@@ -299,11 +306,19 @@ class ManagedAgentWorker:
              newest events first; we collect up to ``limit`` and reverse
              so the caller sees them chronologically.
 
-        ``NotFoundError`` from ``retrieve`` maps cleanly to
-        ``status='not_found'`` — the only branch where ``messages`` is
-        guaranteed empty. Other API failures bubble up unchanged so the
-        caller sees real outages rather than a silent empty tail.
+        ``NotFoundError`` from ``retrieve`` short-circuits with
+        ``status='not_found'`` and an empty messages list — ``events.list``
+        is NOT called in that branch (no point asking for events on a
+        session the provider doesn't know about). Other API failures
+        bubble up unchanged so the caller sees real outages rather than
+        a silent empty tail.
+
+        ``reason`` is populated whenever the raw provider status is
+        outside the documented enum (today: ``rescheduling | running |
+        idle | terminated``) so observability survives SDK drift, and
+        whenever the mapped status is ``terminated``.
         """
+        _validate_limit(limit)
         try:
             session = self.client.beta.sessions.retrieve(session_id)
         except anthropic.NotFoundError as exc:
@@ -311,8 +326,12 @@ class ManagedAgentWorker:
 
         raw_status = getattr(session, "status", "unknown")
         status = _map_managed_status(raw_status)
+        # Surface the raw status whenever it's worth carrying: terminated
+        # (caller wants the cause) or an unknown SDK value (so observability
+        # of provider-side drift isn't lost). Known mappings (idle/running/
+        # rescheduling) get reason=None on the happy path.
         reason: str | None = None
-        if status == "terminated":
+        if status == "terminated" or raw_status not in _MANAGED_STATUS_MAP:
             reason = f"session.status={raw_status}"
 
         events = self.client.beta.sessions.events.list(

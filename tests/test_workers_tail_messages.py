@@ -154,7 +154,7 @@ class TestManagedAgentTailMessages:
             response=fake_response,  # type: ignore[arg-type]
             body=None,
         )
-        worker, _ = _build_managed_worker(monkeypatch, session=err, events=[])
+        worker, calls = _build_managed_worker(monkeypatch, session=err, events=[])
 
         result = worker.tail_messages("sess_missing")
 
@@ -162,6 +162,12 @@ class TestManagedAgentTailMessages:
         assert result["messages"] == []
         assert result["reason"] is not None
         assert "not found" in result["reason"].lower()
+        # C6: the NotFound branch is the only one with `messages` guaranteed
+        # empty per the docstring contract; assert the short-circuit so a
+        # refactor that moves events.list ahead of retrieve regresses loudly.
+        assert calls.calls == [], (
+            "events.list must NOT be called after retrieve raises NotFoundError"
+        )
 
     def test_rescheduling_status_maps_to_running(self, monkeypatch):
         """A rescheduled session is still in-flight — surface as running."""
@@ -171,6 +177,23 @@ class TestManagedAgentTailMessages:
         result = worker.tail_messages("sess_abc")
 
         assert result["status"] == "running"
+        # rescheduling IS in the known map, so reason stays None
+        assert result["reason"] is None
+
+    def test_unknown_status_maps_to_running_with_reason(self, monkeypatch):
+        """C4: future SDK status values (e.g. ``requires_action``) must
+        NOT silently default to ``idle`` — that tells callers "safe to
+        archive" when the work hasn't finished. Default to ``running``
+        and surface the raw value via ``reason`` so observability is
+        retained.
+        """
+        session = SimpleNamespace(status="requires_action")
+        worker, _ = _build_managed_worker(monkeypatch, session=session, events=[])
+
+        result = worker.tail_messages("sess_abc")
+
+        assert result["status"] == "running"
+        assert result["reason"] == "session.status=requires_action"
 
     def test_non_agent_message_events_are_filtered(self, monkeypatch):
         """``events.list`` is asked for ``types=['agent.message']`` but a
@@ -421,3 +444,283 @@ class TestDockerWorkerTailMessages:
         assert "docker" in captured["argv"][0]
         assert "inspect" in captured["argv"]
         assert "sess-arg" in captured["argv"]
+
+
+# ---------------------------------------------------------------------------
+# C1: docker JSONL must filter to assistant/agent records — no user prompts.
+# ---------------------------------------------------------------------------
+
+
+class TestDockerAssistantOnlyFilter:
+    def test_user_prompts_are_filtered_out(self, docker_worker):
+        """C1: a representative claude-code JSONL with user prompts +
+        assistant replies + tool turns must yield only the assistant
+        replies. Matches the managed-agent backend's
+        ``types=['agent.message']`` semantics."""
+        _write_session_jsonl(
+            docker_worker.home_dir,
+            "sess-mixed",
+            [
+                {
+                    "type": "user",
+                    "timestamp": "2025-01-01T12:00:00Z",
+                    "message": {"role": "user", "content": "please open a PR"},
+                },
+                {
+                    "type": "assistant",
+                    "timestamp": "2025-01-01T12:00:01Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "starting work"}],
+                    },
+                },
+                {
+                    "type": "user",
+                    "timestamp": "2025-01-01T12:00:02Z",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "tool_result", "text": "build ok"}],
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "timestamp": "2025-01-01T12:00:03Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "finished"}],
+                    },
+                },
+            ],
+        )
+        docker_worker.run = lambda *a, **kw: _inspect_proc("running", 0)
+
+        result = docker_worker.tail_messages("sess-mixed")
+
+        assert [m["text"] for m in result["messages"]] == ["starting work", "finished"]
+        assert all(m["role"] == "assistant" for m in result["messages"])
+
+    def test_system_and_tool_records_are_filtered_out(self, docker_worker):
+        """Defensive: shapes other than ``user`` / ``assistant`` (system,
+        tool_use, tool_result) must also drop out."""
+        _write_session_jsonl(
+            docker_worker.home_dir,
+            "sess-tools",
+            [
+                {
+                    "type": "system",
+                    "timestamp": "2025-01-01T12:00:00Z",
+                    "message": {"role": "system", "content": "init"},
+                },
+                {
+                    "type": "tool_use",
+                    "timestamp": "2025-01-01T12:00:01Z",
+                    "message": {"role": "assistant", "content": "calling bash"},
+                },
+                {
+                    "type": "assistant",
+                    "timestamp": "2025-01-01T12:00:02Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "real reply"}],
+                    },
+                },
+            ],
+        )
+        docker_worker.run = lambda *a, **kw: _inspect_proc("running", 0)
+
+        result = docker_worker.tail_messages("sess-tools")
+
+        assert [m["text"] for m in result["messages"]] == ["real reply"]
+
+
+# ---------------------------------------------------------------------------
+# C2: container State.Status mapping for the non-running, non-exited cases.
+# ---------------------------------------------------------------------------
+
+
+class TestDockerContainerStateMapping:
+    @pytest.mark.parametrize(
+        "state,expected_status",
+        [
+            ("created", "terminated"),  # never started — no work to tail
+            ("dead", "terminated"),  # daemon couldn't clean up — won't recover
+            ("removing", "terminated"),  # mid-teardown
+            ("paused", "terminated"),  # suspended; caller shouldn't wait
+            ("restarting", "running"),  # transient
+        ],
+    )
+    def test_non_running_non_exited_states_map_per_table(
+        self, docker_worker, state, expected_status
+    ):
+        """C2: each non-running, non-exited state has a deterministic
+        mapping in the four-value taxonomy. Reason carries the raw
+        container_state so callers can disambiguate."""
+        _write_session_jsonl(docker_worker.home_dir, f"sess-{state}", [])
+        docker_worker.run = lambda *a, **kw: _inspect_proc(state, 0)
+
+        result = docker_worker.tail_messages(f"sess-{state}")
+
+        assert result["status"] == expected_status
+        assert result["reason"] == f"container_state={state}"
+
+    def test_unknown_future_state_defaults_to_terminated(self, docker_worker):
+        """Future Docker versions may add states this code doesn't know
+        about. The fail-safe default is ``terminated`` so callers don't
+        wait forever on an unrecognized state."""
+        _write_session_jsonl(docker_worker.home_dir, "sess-fut", [])
+        docker_worker.run = lambda *a, **kw: _inspect_proc("hypothetical-future-state", 0)
+
+        result = docker_worker.tail_messages("sess-fut")
+
+        assert result["status"] == "terminated"
+        assert result["reason"] == "container_state=hypothetical-future-state"
+
+
+# ---------------------------------------------------------------------------
+# C3: docker inspect failure modes — disambiguate "no such object" from
+# daemon-down / permission-denied / timeout / CLI-missing.
+# ---------------------------------------------------------------------------
+
+
+class TestDockerInspectFailureModes:
+    def test_daemon_down_surfaces_as_terminated_with_reason(self, docker_worker):
+        """``docker inspect`` against a stopped daemon returns non-zero
+        with ``Cannot connect to the Docker daemon`` on stderr. This is
+        an operational outage — surface as ``terminated`` (caller
+        shouldn't wait) with the stderr in ``reason`` so the user
+        knows to start their daemon."""
+        docker_worker.run = lambda *a, **kw: _FakeProc(
+            stdout="",
+            stderr="Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+            returncode=1,
+        )
+
+        result = docker_worker.tail_messages("sess-daemon-down")
+
+        assert result["status"] == "terminated"
+        assert result["reason"] is not None
+        assert "Cannot connect to the Docker daemon" in result["reason"]
+        assert "docker inspect failed" in result["reason"]
+
+    def test_permission_denied_surfaces_as_terminated_with_reason(self, docker_worker):
+        docker_worker.run = lambda *a, **kw: _FakeProc(
+            stdout="",
+            stderr="permission denied while trying to connect to the Docker daemon socket",
+            returncode=1,
+        )
+
+        result = docker_worker.tail_messages("sess-perm")
+
+        assert result["status"] == "terminated"
+        assert "permission denied" in (result["reason"] or "")
+
+    def test_inspect_timeout_surfaces_as_terminated_with_reason(self, docker_worker):
+        """A 10s ``docker inspect`` timeout (slow daemon) raises
+        ``subprocess.TimeoutExpired``. Don't swallow it as
+        ``not_found`` — surface so the user sees the daemon-health
+        problem."""
+        import subprocess
+
+        def fake_run(*a, **kw):
+            raise subprocess.TimeoutExpired(cmd="docker inspect", timeout=10)
+
+        docker_worker.run = fake_run
+
+        result = docker_worker.tail_messages("sess-timeout")
+
+        assert result["status"] == "terminated"
+        assert result["reason"] is not None
+        assert "TimeoutExpired" in result["reason"]
+
+    def test_docker_cli_missing_surfaces_as_terminated_with_reason(self, docker_worker):
+        """``docker`` not on ``$PATH`` raises ``FileNotFoundError``.
+        Surface as terminated with reason."""
+
+        def fake_run(*a, **kw):
+            raise FileNotFoundError("[Errno 2] No such file or directory: 'docker'")
+
+        docker_worker.run = fake_run
+
+        result = docker_worker.tail_messages("sess-no-cli")
+
+        assert result["status"] == "terminated"
+        assert "FileNotFoundError" in (result["reason"] or "")
+
+    def test_no_such_object_stderr_still_maps_to_not_found(self, docker_worker):
+        """Regression: the genuine "container removed by --rm" case
+        must NOT get caught by the new error-surfacing branch."""
+        docker_worker.run = lambda *a, **kw: _FakeProc(
+            stdout="",
+            stderr="Error: No such object: sess-ghost",
+            returncode=1,
+        )
+
+        result = docker_worker.tail_messages("sess-ghost")
+
+        assert result["status"] == "not_found"
+        assert result["reason"] is None
+
+    def test_programmer_errors_propagate(self, docker_worker):
+        """A bug introduced into the runner (e.g. argv shape change)
+        must NOT be silently swallowed as "no container". The narrowed
+        exception handling in ``_inspect_container`` lets non-subprocess
+        errors propagate so the test fails loudly."""
+
+        def fake_run(*a, **kw):
+            raise TypeError("argv must be a list of strings")
+
+        docker_worker.run = fake_run
+
+        with pytest.raises(TypeError, match="argv must be a list of strings"):
+            docker_worker.tail_messages("sess-bug")
+
+
+# ---------------------------------------------------------------------------
+# C5: limit validation must agree across backends.
+# ---------------------------------------------------------------------------
+
+
+class TestLimitValidation:
+    @pytest.mark.parametrize("bad_limit", [0, -1, -100])
+    def test_managed_agent_rejects_non_positive_limit(self, monkeypatch, bad_limit):
+        session = SimpleNamespace(status="running")
+        worker, _ = _build_managed_worker(monkeypatch, session=session, events=[])
+
+        with pytest.raises(ValueError, match="limit must be an int >= 1"):
+            worker.tail_messages("sess_abc", limit=bad_limit)
+
+    @pytest.mark.parametrize("bad_limit", [0, -1, -100])
+    def test_docker_worker_rejects_non_positive_limit(self, docker_worker, bad_limit):
+        with pytest.raises(ValueError, match="limit must be an int >= 1"):
+            docker_worker.tail_messages("sess_abc", limit=bad_limit)
+
+    def test_managed_agent_accepts_limit_of_one(self, monkeypatch):
+        ts = datetime(2025, 1, 1, 12, 0, 0, tzinfo=UTC)
+        events = [_agent_message_event("only one", ts)]
+        session = SimpleNamespace(status="running")
+        worker, _ = _build_managed_worker(monkeypatch, session=session, events=events)
+
+        result = worker.tail_messages("sess_abc", limit=1)
+
+        assert len(result["messages"]) == 1
+
+    def test_docker_worker_accepts_limit_of_one(self, docker_worker):
+        _write_session_jsonl(
+            docker_worker.home_dir,
+            "sess-one",
+            [
+                {
+                    "type": "assistant",
+                    "timestamp": "2025-01-01T12:00:00Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "only one"}],
+                    },
+                }
+            ],
+        )
+        docker_worker.run = lambda *a, **kw: _inspect_proc("running", 0)
+
+        result = docker_worker.tail_messages("sess-one", limit=1)
+
+        assert len(result["messages"]) == 1
