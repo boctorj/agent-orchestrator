@@ -54,21 +54,22 @@ Timeouts
 --------
 
 The CLI's own ``--timeout`` flag defaults to 30 minutes (per the docs).
-The wrapper has two timeout knobs that must be passed the same value
-for the cloud-side and wrapper-side timers to fire together:
+The wrapper exposes a single timeout knob used by both functions, so
+wrapper-side and cloud-side timers always fire together — no built-in
+billing gap on the default call shape:
 
-* :func:`trigger` ``timeout_seconds`` — forwarded as ``--timeout
-  <minutes>`` to the CLI. Defaults to :data:`DEFAULT_TIMEOUT_SECONDS`
-  (1800s = 30 min, the CLI's own default).
-* :func:`wait_for_result` ``timeout`` — wrapper-side SIGKILL cap.
-  Defaults to :data:`SPEC_WAIT_TIMEOUT_SECONDS` (600s; matches the
-  unit description's literal ``timeout=600``).
+* :data:`SPEC_WAIT_TIMEOUT_SECONDS` (default 600s, env-overridable via
+  ``ULTRAREVIEW_TIMEOUT_SECONDS``) is the function-default for both
+  :func:`trigger`'s ``timeout_seconds`` and :func:`wait_for_result`'s
+  ``timeout``. Matches the unit-description literal
+  ``wait_for_result(pr_url, timeout=600)``.
+* :data:`DEFAULT_TIMEOUT_SECONDS` is a back-compat alias for callers
+  that already imported the older two-constant name.
 
-When the two values diverge — e.g. caller uses both defaults — the
-wrapper SIGKILLs at the smaller value but the cloud-side session
-keeps running and billing until the CLI's own timer fires. Real
-callers (cycle_review wiring) should pass the same explicit value to
-both functions.
+Callers can still pass an explicit ``timeout_seconds`` to
+:func:`trigger` and the same value as ``timeout=`` to
+:func:`wait_for_result` — the design accepts caller-tightened caps
+without leaking cloud-side time.
 
 Surface
 -------
@@ -105,22 +106,24 @@ from typing import Any
 
 # --------------------------- defaults ---------------------------
 
-# Wrapper-side wall-clock cap. The unit description names
-# ``wait_for_result(pr_url, timeout=600)`` so the function default
-# matches that literal (see :func:`wait_for_result`); this module
-# constant — overridable via ``ULTRAREVIEW_TIMEOUT_SECONDS`` — is the
-# upper-bound *trigger* default the CLI's own ``--timeout`` flag is
-# pinned to when the caller doesn't override. The CLI's documented
-# default is 30 minutes (per https://code.claude.com/docs/en/ultrareview).
-DEFAULT_TIMEOUT_SECONDS = int(os.getenv("ULTRAREVIEW_TIMEOUT_SECONDS", "1800"))
+# Single source of truth for the timeout, used by BOTH
+# :func:`trigger` (forwarded as ``--timeout <minutes>`` to the CLI)
+# AND :func:`wait_for_result` (wrapper-side SIGKILL cap). Default
+# value 600 matches the unit-description literal
+# ``wait_for_result(pr_url, timeout=600)``; env-overridable via
+# ``ULTRAREVIEW_TIMEOUT_SECONDS`` for callers who want the CLI's
+# documented 30-minute default (set the env to 1800). Keeping
+# one constant means wrapper-side and cloud-side timers always fire
+# together — no built-in billing gap on the default call shape.
+SPEC_WAIT_TIMEOUT_SECONDS = int(os.getenv("ULTRAREVIEW_TIMEOUT_SECONDS", "600"))
 
-# Default for the wrapper-side ``wait_for_result(timeout=...)`` parameter.
-# Matches the unit-description literal ``timeout=600``. Real callers
-# (cycle_review wiring) should pass an explicit value to both
-# :func:`trigger` and :func:`wait_for_result` so wrapper-side and
-# cloud-side timers fire together; this default exists only as a
-# documentation contract.
-SPEC_WAIT_TIMEOUT_SECONDS = 600
+# Back-compat alias retained in ``__all__``. Earlier rounds of this
+# module shipped two distinct constants (``DEFAULT_TIMEOUT_SECONDS``
+# = 1800 + ``SPEC_WAIT_TIMEOUT_SECONDS`` = 600); the split built in a
+# 20-minute cloud-billing gap on the default call shape (reviewer M4).
+# Collapsed to one source of truth; the alias stays so callers that
+# already import ``DEFAULT_TIMEOUT_SECONDS`` don't break.
+DEFAULT_TIMEOUT_SECONDS = SPEC_WAIT_TIMEOUT_SECONDS
 
 # Poll interval while waiting. Long enough that we don't spin the CPU on
 # a multi-minute run, short enough that the orchestrator reacts within
@@ -191,17 +194,27 @@ def trigger(
             wait timeout SIGKILLs the local subprocess while the
             cloud session keeps running (and billing) until the CLI's
             own ``--timeout`` elapses. Defaults to
-            :data:`DEFAULT_TIMEOUT_SECONDS`.
+            :data:`SPEC_WAIT_TIMEOUT_SECONDS` — the same value
+            :func:`wait_for_result` uses, so a default-on-default call
+            keeps both timers aligned (no billing gap).
         spawn: injection point for tests. Takes the argv list and
             returns a Popen-shaped object. Defaults to
             :func:`_default_spawn`.
+
+    Re-trigger semantics:
+        Calling ``trigger`` twice with the same canonical PR URL
+        kills+reaps the prior subprocess via :func:`_kill_and_reap`
+        before spawning the new one. This stops the orphaned local
+        process AND signals the cloud session to terminate (via the
+        CLI's signal-handling) so a retry doesn't leak two parallel
+        billing runs.
 
     Raises:
         ValueError: if ``pr_url`` is not a parseable PR URL.
     """
     canonical, pr_number = _canonical_pr_url(pr_url)
     spawner = spawn if spawn is not None else _default_spawn
-    effective_timeout = DEFAULT_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+    effective_timeout = SPEC_WAIT_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
     argv = [
         ULTRAREVIEW_CLI,
         "ultrareview",
@@ -217,6 +230,14 @@ def trigger(
         "--timeout",
         str(max(1, (effective_timeout + 59) // 60)),
     ]
+    # Re-trigger on the same canonical URL: kill+reap the prior
+    # subprocess before storing the new handle. Earlier rounds let the
+    # prior handle just fall out of the registry, which orphaned both
+    # the local subprocess and the (still-running, still-billing) cloud
+    # session for the rest of the orchestrator's lifetime (reviewer M2).
+    prior = _runs.pop(canonical, None)
+    if prior is not None:
+        _kill_and_reap(prior.process)
     process = spawner(argv)
     _runs[canonical] = _RunHandle(
         canonical_url=canonical,
@@ -317,11 +338,16 @@ def _default_spawn(argv: list[str]) -> subprocess.Popen[str]:
     minute run — is sent to ``DEVNULL`` because (a) we don't surface
     it, and (b) buffering it via PIPE risked a write-side deadlock if
     the chatter exceeded the OS pipe buffer before we drained it.
+    stdin is pinned to ``DEVNULL`` rather than inherited: when the
+    orchestrator runs as the MCP stdio server, the parent's fd 0 IS
+    the JSON-RPC transport, and a child reading from it would either
+    intercept transport bytes or block forever on ``read()``.
     We pass the argv list rather than a shell string so there's no
     shell-injection surface.
     """
     return subprocess.Popen(  # nosec B603 — argv list, no shell; binary path from env
         argv,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
@@ -392,7 +418,18 @@ def _parse_bugs(stdout: str, *, completed: bool) -> list[str]:
         if "bugs" not in data:
             keys = sorted(data.keys())
             return [f"[ultrareview output schema unrecognized: keys={keys}]"]
-        return [_format_bug(b) for b in data.get("bugs", [])]
+        bugs = data["bugs"]
+        if not isinstance(bugs, list):
+            # null / int / str / dict for the ``bugs`` slot is valid JSON
+            # but non-iterable in the format loop — and would propagate
+            # an uncaught TypeError out of ``wait_for_result`` if we
+            # didn't catch it here. Same fail-closed direction as the
+            # missing-key path: surface a schema sentinel.
+            return [
+                f"[ultrareview output schema unrecognized: "
+                f"bugs is {type(bugs).__name__}, expected list]"
+            ]
+        return [_format_bug(b) for b in bugs]
     return [json.dumps(data, sort_keys=True)]
 
 
@@ -419,14 +456,22 @@ def _format_bug(bug: Any) -> str:
 
 
 def _kill_and_reap(process: Any) -> None:
-    """SIGTERM → SIGKILL → wait() the subprocess on timeout.
+    """SIGTERM → SIGKILL → ``communicate()`` the subprocess on timeout.
 
-    The wait() / communicate() step matters: without it a real
-    :class:`subprocess.Popen` would leave a zombie until the handle is
-    garbage-collected, and since ``_runs`` retains handles past
-    :func:`wait_for_result`'s return that could be the orchestrator's
-    full lifetime. Best-effort throughout — a stub that won't honor
-    terminate/kill/wait still gets a clean return contract.
+    The ``communicate()`` step matters for two reasons:
+
+    1. It reaps the zombie — without it a real :class:`subprocess.Popen`
+       would leave one until GC, and since ``_runs`` retains handles
+       past :func:`wait_for_result`'s return that could be the
+       orchestrator's full lifetime.
+    2. It drains the PIPE'd stdout — ``wait()`` alone reaps the zombie
+       but leaves the read-side fd open until the ``Popen`` object is
+       collected, leaking one fd per timeout. ``communicate()`` does
+       both in one call.
+
+    Best-effort throughout — a stub that won't honor
+    ``terminate``/``kill``/``communicate`` still gets a clean return
+    contract.
     """
     with contextlib.suppress(Exception):
         process.terminate()
@@ -435,8 +480,8 @@ def _kill_and_reap(process: Any) -> None:
     with contextlib.suppress(Exception):
         # Short timeout: at this point the process should already be
         # dying (SIGTERM + SIGKILL above). One-second budget reaps the
-        # zombie without blocking the orchestrator.
-        process.wait(timeout=1)
+        # zombie + drains the PIPE without blocking the orchestrator.
+        process.communicate(timeout=1)
 
 
 __all__ = [

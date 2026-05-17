@@ -53,6 +53,7 @@ class FakePopen:
         self.killed = False
         self.terminated = False
         self.waited = False
+        self.communicate_calls = 0
         self.argv: list[str] | None = None
 
     def poll(self) -> int | None:
@@ -64,6 +65,7 @@ class FakePopen:
         return rc
 
     def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+        self.communicate_calls += 1
         return self.stdout_text, self.stderr_text
 
     def terminate(self) -> None:
@@ -204,13 +206,13 @@ class TestTrigger:
     def test_argv_includes_timeout_aligned_with_wrapper(self):
         """The CLI --timeout matches the wrapper-side cap so an early
         wrapper SIGKILL also stops the cloud session (and stops billing).
-        Default = DEFAULT_TIMEOUT_SECONDS / 60."""
+        Per reviewer M4 the default = SPEC_WAIT_TIMEOUT_SECONDS / 60
+        (= 10 by default) — single source of truth, no billing gap."""
         proc = FakePopen([None])
         ultrareview.trigger("https://github.com/o/r/pull/7", spawn=_scripted_spawn(proc))
         assert proc.argv is not None
         idx = proc.argv.index("--timeout")
-        # The value is in minutes; default 1800s → 30 min.
-        assert int(proc.argv[idx + 1]) == ultrareview.DEFAULT_TIMEOUT_SECONDS // 60
+        assert int(proc.argv[idx + 1]) == ultrareview.SPEC_WAIT_TIMEOUT_SECONDS // 60
 
     def test_registers_run_keyed_by_canonical_url(self):
         proc = FakePopen([None])
@@ -234,13 +236,42 @@ class TestTrigger:
         assert r["passed"] is True
 
     def test_re_trigger_replaces_prior_handle(self):
-        """Second trigger for same URL supersedes the first (caller error
-        recovery — don't keep the stale handle around)."""
+        """Second trigger for same URL supersedes the first AND kills+reaps
+        the prior subprocess (per reviewer M2) — previously the older
+        handle just fell out of the registry, orphaning the local
+        process and cloud session."""
         first = FakePopen([None])
         second = FakePopen([None])
         ultrareview.trigger("https://github.com/o/r/pull/7", spawn=_scripted_spawn(first))
         ultrareview.trigger("https://github.com/o/r/pull/7", spawn=_scripted_spawn(second))
         assert ultrareview._runs["https://github.com/o/r/pull/7"].process is second
+        # The prior subprocess must have received SIGTERM/SIGKILL AND
+        # been drained via communicate() so the OS reaps the zombie
+        # and the PIPE fd is released.
+        assert first.terminated or first.killed
+        assert first.communicate_calls >= 1
+
+    def test_re_trigger_swallows_prior_kill_errors(self):
+        """Best-effort cleanup: a stub whose terminate/kill/communicate
+        raises must not crash the new trigger (per reviewer M2's sibling
+        test request)."""
+
+        class DeadProc(FakePopen):
+            def terminate(self) -> None:
+                raise OSError("no such process")
+
+            def kill(self) -> None:
+                raise OSError("no such process")
+
+            def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+                raise OSError("already dead")
+
+        dead = DeadProc([None])
+        alive = FakePopen([None])
+        ultrareview.trigger("https://github.com/o/r/pull/7", spawn=_scripted_spawn(dead))
+        # The second trigger must succeed even though dead's cleanup raises.
+        ultrareview.trigger("https://github.com/o/r/pull/7", spawn=_scripted_spawn(alive))
+        assert ultrareview._runs["https://github.com/o/r/pull/7"].process is alive
 
     def test_rejects_invalid_pr_url(self):
         with pytest.raises(ValueError):
@@ -290,13 +321,15 @@ class TestTrigger:
 
     def test_default_trigger_timeout_uses_module_default(self):
         """Caller omits ``timeout_seconds`` → trigger uses
-        ``DEFAULT_TIMEOUT_SECONDS`` (the CLI's documented 30-min default).
-        Distinct from wait_for_result's 600s spec default."""
+        :data:`SPEC_WAIT_TIMEOUT_SECONDS`, the same value
+        :func:`wait_for_result` defaults to. Per reviewer M4 these are
+        a single constant now (no built-in cloud-billing gap on the
+        default call shape)."""
         proc = FakePopen([None])
         ultrareview.trigger("https://github.com/o/r/pull/7", spawn=_scripted_spawn(proc))
         assert proc.argv is not None
         idx = proc.argv.index("--timeout")
-        assert int(proc.argv[idx + 1]) == ultrareview.DEFAULT_TIMEOUT_SECONDS // 60
+        assert int(proc.argv[idx + 1]) == ultrareview.SPEC_WAIT_TIMEOUT_SECONDS // 60
 
 
 # --------------------------- wait_for_result(): passed ---------------------------
@@ -518,13 +551,19 @@ class TestWaitForResultTimeout:
         assert r["passed"] is False
         # Findings encode the timeout so callers can surface the reason.
         assert any("timeout" in f.lower() for f in r["findings"])
-        # SIGTERM + SIGKILL + wait() — the reap step prevents a zombie.
+        # SIGTERM + SIGKILL + communicate() — per reviewer M3, the reap
+        # step is communicate() (not wait()) so the PIPE'd stdout fd
+        # gets drained instead of leaking until GC.
         assert proc.terminated or proc.killed
-        assert proc.waited, "_kill_and_reap must wait() after kill to reap zombies"
+        assert proc.communicate_calls >= 1, (
+            "_kill_and_reap must communicate() after kill to reap "
+            "zombies AND drain the PIPE fd in one call"
+        )
 
     def test_timeout_swallows_kill_errors(self):
-        """Stubs whose terminate/kill/wait raise must not crash the timeout
-        path."""
+        """Stubs whose terminate/kill/communicate raise must not crash
+        the timeout path (per reviewer M3, BrokenProc overrides
+        communicate now, not wait)."""
 
         class BrokenProc(FakePopen):
             def terminate(self) -> None:
@@ -533,7 +572,7 @@ class TestWaitForResultTimeout:
             def kill(self) -> None:
                 raise PermissionError("denied")
 
-            def wait(self, timeout: float | None = None) -> int:
+            def communicate(self, timeout: float | None = None) -> tuple[str, str]:
                 raise OSError("dead")
 
         proc = BrokenProc([None] * 100)
@@ -697,6 +736,37 @@ class TestFailClosedOnRcZero:
         )
         assert r == {"passed": True, "findings": []}
 
+    @pytest.mark.parametrize(
+        ("bugs_value", "expected_type_name"),
+        [
+            (None, "NoneType"),
+            (42, "int"),
+            ("oops", "str"),
+            ({"nested": "wrong"}, "dict"),
+        ],
+    )
+    def test_rc0_non_list_bugs_value_blocks_merge(self, bugs_value, expected_type_name):
+        """Per reviewer H1 (cycle 3), ``{"bugs": <non-list>}`` is valid
+        JSON but non-iterable. Previous code propagated an uncaught
+        ``TypeError`` out of ``wait_for_result``; now we fail closed
+        with a schema sentinel (same direction as the missing-key
+        path)."""
+        proc = FakePopen([0], stdout=json.dumps({"bugs": bugs_value}))
+        ultrareview.trigger("https://github.com/o/r/pull/9", spawn=_scripted_spawn(proc))
+        clock = FakeClock(step=0)
+        r = ultrareview.wait_for_result(
+            "https://github.com/o/r/pull/9",
+            timeout=10,
+            poll_interval_seconds=1,
+            sleep=clock.sleep,
+            now=clock.now,
+        )
+        assert r["passed"] is False
+        assert len(r["findings"]) == 1
+        assert "schema unrecognized" in r["findings"][0]
+        assert expected_type_name in r["findings"][0]
+        assert "expected list" in r["findings"][0]
+
 
 # --------------------------- default-spawn argv shape ---------------------------
 
@@ -738,6 +808,23 @@ class TestDefaultSpawnArgv:
         # stdout still PIPE'd — bugs.json payload is bounded JSON.
         assert captured["kwargs"].get("stdout") == subprocess.PIPE
 
+    def test_default_spawn_pins_stdin_to_devnull(self, monkeypatch):
+        """Per reviewer M1, stdin must NOT inherit the parent's fd 0.
+        When the orchestrator runs as the MCP stdio server, fd 0 IS
+        the JSON-RPC transport — letting ``claude ultrareview`` read
+        from it would either intercept transport bytes or stall on
+        ``read()``."""
+        captured: dict = {}
+
+        class _PopenSpy:
+            def __init__(self, *args, **kwargs):
+                captured["args"] = args
+                captured["kwargs"] = kwargs
+
+        monkeypatch.setattr(ultrareview.subprocess, "Popen", _PopenSpy)
+        ultrareview._default_spawn(["claude", "ultrareview", "1"])
+        assert captured["kwargs"].get("stdin") == subprocess.DEVNULL
+
 
 # --------------------------- env defaults ---------------------------
 
@@ -758,21 +845,31 @@ def test_env_defaults_override_module_defaults(monkeypatch):
         importlib.reload(ultrareview)
 
 
-def test_default_timeout_matches_cli_default():
-    """Per the canonical docs (https://code.claude.com/docs/en/ultrareview)
-    the CLI's own --timeout defaults to 30 minutes. The wrapper aligns
-    with that — a smaller wrapper default produces false-negative timeouts
-    + cloud-side billing leaks (reviewer H1)."""
+def test_timeout_constants_are_aligned():
+    """Per reviewer M4, the two-constant split that built in a 20-min
+    cloud-billing gap was collapsed: ``DEFAULT_TIMEOUT_SECONDS`` is now
+    an alias for ``SPEC_WAIT_TIMEOUT_SECONDS``. Whatever the env knob
+    resolves them to, the two must stay equal so trigger and
+    wait_for_result share a single source of truth."""
     import importlib
-
-    # Reload with env knob unset to test the hardcoded fallback.
     import os
 
     saved = os.environ.pop("ULTRAREVIEW_TIMEOUT_SECONDS", None)
     try:
         importlib.reload(ultrareview)
-        assert ultrareview.DEFAULT_TIMEOUT_SECONDS == 1800
+        # Default fallback is 600 (the unit-description literal).
+        assert ultrareview.SPEC_WAIT_TIMEOUT_SECONDS == 600
+        # The back-compat alias stays equal to the canonical constant.
+        assert ultrareview.DEFAULT_TIMEOUT_SECONDS == ultrareview.SPEC_WAIT_TIMEOUT_SECONDS
+
+        # Env override flows through both names.
+        os.environ["ULTRAREVIEW_TIMEOUT_SECONDS"] = "1800"
+        importlib.reload(ultrareview)
+        assert ultrareview.SPEC_WAIT_TIMEOUT_SECONDS == 1800
+        assert ultrareview.DEFAULT_TIMEOUT_SECONDS == ultrareview.SPEC_WAIT_TIMEOUT_SECONDS
     finally:
         if saved is not None:
             os.environ["ULTRAREVIEW_TIMEOUT_SECONDS"] = saved
+        else:
+            os.environ.pop("ULTRAREVIEW_TIMEOUT_SECONDS", None)
         importlib.reload(ultrareview)

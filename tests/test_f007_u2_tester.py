@@ -151,15 +151,21 @@ def _clear_runs():
 
 class TestSignatureMatchesSpec:
     """The unit description names ``wait_for_result(pr_url, timeout=600)``
-    as the function signature. PR #28 review M1 (this round) flagged
-    that the prior round's H1 fix silently drifted the signature
-    default to 1800. Resolution: ``DEFAULT_TIMEOUT_SECONDS=1800``
-    stays internal (used by ``trigger`` as the CLI ``--timeout``
-    default — keeps H1's cloud-side billing alignment), while
-    ``wait_for_result``'s param default tracks
-    :data:`SPEC_WAIT_TIMEOUT_SECONDS` (600 — the unit-description
-    literal). Real callers pass explicit timeouts to both functions;
-    these defaults exist as the documentation contract."""
+    as the function signature. Across PR #28 review cycles the timeout
+    model evolved:
+
+    * Cycle 1 (H1): bumped the constant to 1800s to align with the CLI.
+    * Cycle 2 (M1): split into 600 (wait) + 1800 (trigger) constants
+      because the bump silently drifted from the spec literal.
+    * Cycle 3 (M4): collapsed back to a single constant — the two-value
+      split built in a 20-min cloud-billing gap on the default call
+      shape (trigger forwarded ``--timeout 30`` while wait SIGKILLed
+      at 600s, so the cloud session kept running and billing).
+
+    Final shape: ``SPEC_WAIT_TIMEOUT_SECONDS`` is the canonical
+    constant (default 600 = spec literal, env-overridable for callers
+    who want the CLI's 30-min default). ``DEFAULT_TIMEOUT_SECONDS`` is
+    a back-compat alias kept equal to it."""
 
     def test_wait_for_result_default_timeout_matches_spec_literal(self, monkeypatch) -> None:
         # Snapshot the signature against a freshly-reloaded module with
@@ -180,18 +186,19 @@ class TestSignatureMatchesSpec:
         finally:
             importlib.reload(ultrareview)
 
-    def test_default_timeout_constant_matches_cli_default(self, monkeypatch) -> None:
-        """``DEFAULT_TIMEOUT_SECONDS`` is the trigger-side default the
-        CLI's own ``--timeout`` is pinned to — aligned with the CLI's
-        documented 30-min default (reviewer H1 from the prior round).
-        Distinct from the wait-side spec default of 600."""
+    def test_timeout_constants_are_aligned(self, monkeypatch) -> None:
+        """Per M4 there's a single source of truth — both names resolve
+        to the same value so a default-on-default caller doesn't open
+        a cloud-billing gap. Default is 600 (the spec literal)."""
         monkeypatch.delenv("ULTRAREVIEW_TIMEOUT_SECONDS", raising=False)
         import importlib
 
         importlib.reload(ultrareview)
         try:
-            assert ultrareview.DEFAULT_TIMEOUT_SECONDS == 1800
             assert ultrareview.SPEC_WAIT_TIMEOUT_SECONDS == 600
+            assert ultrareview.DEFAULT_TIMEOUT_SECONDS == ultrareview.SPEC_WAIT_TIMEOUT_SECONDS, (
+                "DEFAULT_TIMEOUT_SECONDS must alias SPEC_WAIT_TIMEOUT_SECONDS"
+            )
         finally:
             importlib.reload(ultrareview)
 
