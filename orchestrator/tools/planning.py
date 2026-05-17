@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict
 
-from orchestrator import repo_verify, state
+from orchestrator import feature_spec, repo_verify, state
 from orchestrator.models import Feature, FeatureStatus, WorkUnit
 from orchestrator.tools import mcp
 
@@ -88,6 +88,13 @@ def load_feature(
         )
         state.save_feature(feature)
         msg = f"Updated feature {feature.id} ({path_desc})"
+
+    # Seed `features/<feature_id>/spec.md` from the template. Idempotent —
+    # leaves an existing spec.md untouched, so lead-authored edits survive
+    # repeated `load_feature` calls (e.g. fixing a wrong repo_path). Also
+    # back-fills spec.md for features that pre-date F-006 the first time
+    # they're touched.
+    feature_spec.write_spec_if_missing(feature.id, feature.title, feature.description)
 
     # Surface verification status as a warning so the lead can prompt the
     # user to verify before spawning (rather than discovering at spawn time).

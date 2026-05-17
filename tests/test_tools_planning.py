@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from orchestrator import state
+from orchestrator import feature_spec, state
 from orchestrator.models import Feature
 from orchestrator.tools import planning
 
@@ -72,6 +72,67 @@ def test_load_feature_warns_on_malformed_repo_path(tmp_state_db):
     msg = planning.load_feature(title="t", description="d", repo_path="not a url")
     assert "⚠" in msg
     assert "malformed" in msg
+
+
+# --------- load_feature writes features/<id>/spec.md (F-006) ---------
+
+
+def test_load_feature_writes_spec_md_on_creation(tmp_state_db):
+    planning.load_feature(title="OAuth", description="Add Google OAuth login.")
+    path = feature_spec.spec_path("F-001")
+    assert path.exists()
+    body = path.read_text(encoding="utf-8")
+    assert "# F-001: OAuth" in body
+    assert "Add Google OAuth login." in body
+    # Sanity: every required section from the proposal template is present.
+    for header in (
+        "## Intent",
+        "## Acceptance",
+        "## Out of scope",
+        "## Approach",
+        "## Constraints",
+        "## Decisions",
+        "## Open questions",
+    ):
+        assert header in body
+
+
+def test_load_feature_does_not_overwrite_existing_spec_md(tmp_state_db):
+    """Lead edits during planning must survive a re-call of load_feature
+    (e.g. metadata-only update to fix repo_path)."""
+    planning.load_feature(title="OAuth", description="orig", repo_path="https://github.com/o/r")
+    path = feature_spec.spec_path("F-001")
+    path.write_text("# F-001: OAuth\n\n## Intent\nhand-edited\n", encoding="utf-8")
+
+    planning.load_feature(
+        title="OAuth",
+        description="orig",
+        id="F-001",
+        repo_path="https://github.com/o/r",
+    )
+
+    assert path.read_text(encoding="utf-8") == "# F-001: OAuth\n\n## Intent\nhand-edited\n"
+
+
+def test_load_feature_backfills_spec_md_on_update_when_missing(tmp_state_db):
+    """Features that pre-date F-006 (no spec.md on disk) should get one
+    seeded on the next load_feature touch."""
+    planning.load_feature(title="OAuth", description="d", repo_path="https://github.com/o/r")
+    path = feature_spec.spec_path("F-001")
+    path.unlink()  # simulate pre-F-006 feature: row exists, spec.md doesn't
+    assert not path.exists()
+
+    planning.load_feature(
+        title="OAuth (renamed)",
+        description="d2",
+        id="F-001",
+        repo_path="https://github.com/o/r",
+    )
+
+    assert path.exists()
+    body = path.read_text(encoding="utf-8")
+    assert "# F-001: OAuth (renamed)" in body
+    assert "d2" in body
 
 
 # --------- load_feature update semantics (F-004: preserve approval) ---------
