@@ -599,46 +599,7 @@ class TestStateDrivenRendering:
 
 
 # =============================================================================
-# 9. Pure-library invariant: no runtime caller wired in yet
-# =============================================================================
-
-
-class TestNoRuntimeCallSitesWired:
-    """The unit description is explicit:
-
-    > Pure library + unit tests; no call sites wired in yet, so this
-    > unit does not change runtime behavior.
-
-    This test fails if a future commit accidentally wires
-    ``cycle_log.write_cycle_log`` into ``cycle_review`` (or any other
-    runtime path) inside this same unit. Tester guard against scope
-    creep.
-    """
-
-    def test_no_orchestrator_module_imports_cycle_log_yet(self) -> None:
-        repo_root = Path(__file__).resolve().parents[1]
-        orchestrator_dir = repo_root / "orchestrator"
-        offenders: list[Path] = []
-        for path in orchestrator_dir.rglob("*.py"):
-            if path.name == "cycle_log.py":
-                continue
-            text = path.read_text(encoding="utf-8")
-            # Any import or attribute access on the cycle_log module
-            # would constitute a runtime call-site wiring.
-            if (
-                re.search(r"\bfrom\s+orchestrator\s+import\s+[^\n]*\bcycle_log\b", text)
-                or re.search(r"\bfrom\s+orchestrator\.cycle_log\s+import\b", text)
-                or re.search(r"\bimport\s+orchestrator\.cycle_log\b", text)
-            ):
-                offenders.append(path)
-        assert offenders == [], (
-            "F-006-U-2 ships as a pure library — no orchestrator module "
-            f"should import cycle_log yet; offenders: {offenders}"
-        )
-
-
-# =============================================================================
-# 10. Write-cycle-log refuses orphan unit ids (defensive)
+# 9. Write-cycle-log refuses orphan unit ids (defensive)
 # =============================================================================
 
 

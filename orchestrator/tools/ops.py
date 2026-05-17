@@ -5,8 +5,9 @@ from __future__ import annotations
 import contextlib
 import json
 import sqlite3
+from pathlib import Path
 
-from orchestrator import blocked_hints, github, github_app, repo_verify, state
+from orchestrator import blocked_hints, cycle_log, github, github_app, repo_verify, state
 from orchestrator.agents import ManagedAgentWorker
 from orchestrator.models import ACTIVE_UNIT_STATUSES
 from orchestrator.tools import mcp, need_github_token
@@ -58,6 +59,22 @@ def check_unit_pr(unit_id: str) -> str:
             cycle_number=unit_state.review_round,
             summary=f"PR #{unit_state.pr_number} merged at {pr_state.get('merged_at')}",
         )
+        # Post-merge SHA backfill — the one and only edit allowed after
+        # the cycle log has been finalized at terminal review state (see
+        # proposal § "Per-unit cycle log"). ``merge_commit_sha`` diverges
+        # from ``head_sha`` for squash- and rebase-merge strategies, so
+        # we capture it here from the freshly-confirmed merge. Best-effort
+        # — a missing ``gh``, non-repo workdir, or disk error must not
+        # block ``check_unit_pr`` from returning the merged state.
+        merge_sha = pr_state.get("merge_commit_sha")
+        if merge_sha:
+            with contextlib.suppress(Exception):
+                cycle_log.write_cycle_log(
+                    unit_id,
+                    base_dir=Path(state.STATE_DB).parent,
+                    merge_commit_sha=merge_sha,
+                    commit_message=f"cycle-log: backfill merge SHA for {unit_id}",
+                )
 
     # Re-read after potential touch_unit above to surface latest status
     refreshed = state.get_unit_state(unit_id)

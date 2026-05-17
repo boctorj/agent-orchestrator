@@ -181,6 +181,7 @@ def write_cycle_log(
     run: SubprocessRunner | None = None,
     pr_info: dict[str, Any] | None = None,
     review_threads: list[dict[str, Any]] | None = None,
+    merge_commit_sha: str | None = None,
     commit_message: str | None = None,
 ) -> Path:
     """Render + persist ``features/F-XXX/U-N.md`` and auto-commit locally.
@@ -197,6 +198,12 @@ def write_cycle_log(
       5. ``git add`` + commit under ``orchestrator-bot`` identity. Never
          pushes — push policy is operator-driven (see proposal §
          "Persistence and commit strategy").
+
+    ``merge_commit_sha`` is the post-merge backfill knob: ``check_unit_pr``
+    re-invokes this writer once it confirms the PR has merged, supplying
+    ``mergeCommit.oid`` so the finalized log records the commit on main.
+    This is the only post-finalization edit allowed (proposal § "Per-unit
+    cycle log" rule on immutability).
 
     Returns the resolved absolute path to the written file.
     """
@@ -219,7 +226,12 @@ def write_cycle_log(
         review_threads = fetch_review_threads(feature.repo_path, unit_state.pr_number, run=runner)
 
     # 3. render
-    markdown = render_cycle_log(unit_id, pr_info=pr_info, review_threads=review_threads)
+    markdown = render_cycle_log(
+        unit_id,
+        pr_info=pr_info,
+        review_threads=review_threads,
+        merge_commit_sha=merge_commit_sha,
+    )
 
     # 4. atomic write
     _atomic_write(target, markdown)
