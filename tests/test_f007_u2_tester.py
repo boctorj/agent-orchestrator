@@ -151,11 +151,16 @@ def _clear_runs():
 
 class TestSignatureMatchesSpec:
     """The unit description names ``wait_for_result(pr_url, timeout=600)``
-    as the function signature. Even with env-driven runtime overrides,
-    the *signature default* must read 600 — otherwise a fresh reader of
-    the source can't tell what the documented contract is."""
+    as the function signature. After PR #28 reviewer H1 (research against
+    https://code.claude.com/docs/en/ultrareview), the documented CLI
+    ``--timeout`` default is **30 minutes**, not 10 — a 600s wrapper
+    cap was below typical run time and SIGKILLed legitimate reviews
+    while their cloud-side session kept running and billing. The
+    wrapper default was bumped to 1800s so the wrapper-side cap
+    matches the CLI-side ``--timeout`` we forward; these signature
+    tests track the corrected number."""
 
-    def test_wait_for_result_default_timeout_is_600(self, monkeypatch) -> None:
+    def test_wait_for_result_default_timeout_matches_cli_default(self, monkeypatch) -> None:
         # Snapshot the signature against a freshly-reloaded module with
         # the env knob explicitly unset, so a developer who happens to
         # have ULTRAREVIEW_TIMEOUT_SECONDS set in their shell doesn't
@@ -167,20 +172,21 @@ class TestSignatureMatchesSpec:
         try:
             sig = inspect.signature(ultrareview.wait_for_result)
             default = sig.parameters["timeout"].default
-            assert default == 600, (
-                f"unit description names timeout=600 as the documented "
-                f"default; signature reads timeout={default!r}"
+            assert default == 1800, (
+                f"wrapper-side timeout must align with the CLI's documented "
+                f"30-min --timeout default (reviewer H1); signature reads "
+                f"timeout={default!r}"
             )
         finally:
             importlib.reload(ultrareview)
 
-    def test_default_timeout_constant_is_600_without_env(self, monkeypatch) -> None:
+    def test_default_timeout_constant_matches_cli_default(self, monkeypatch) -> None:
         monkeypatch.delenv("ULTRAREVIEW_TIMEOUT_SECONDS", raising=False)
         import importlib
 
         importlib.reload(ultrareview)
         try:
-            assert ultrareview.DEFAULT_TIMEOUT_SECONDS == 600
+            assert ultrareview.DEFAULT_TIMEOUT_SECONDS == 1800
         finally:
             importlib.reload(ultrareview)
 
@@ -436,7 +442,18 @@ class TestDefaultSpawnNoShell:
 
 
 class TestFindingsParsing:
+    """Per PR #28 review M1, the CLI is invoked with ``--json`` so stdout
+    is the raw ``bugs.json`` payload (a JSON object/list of bug entries),
+    not human-formatted lines. Findings are rendered as
+    ``path:line — summary`` strings; these tests pin order, defaults
+    for missing fields, and the stderr-never-folded-in invariant."""
+
     PR = "https://github.com/o/r/pull/2"
+
+    def _bugs_json(self, *entries: dict[str, Any]) -> str:
+        import json as _json
+
+        return _json.dumps({"bugs": list(entries)})
 
     def _wait(self, stdout: str, stderr: str = "") -> dict[str, Any]:
         proc = _FakePopen([0], stdout=stdout, stderr=stderr)
@@ -451,37 +468,49 @@ class TestFindingsParsing:
         )
 
     def test_order_is_preserved(self) -> None:
-        r = self._wait("first finding\nsecond finding\nthird finding\n")
-        assert r["findings"] == ["first finding", "second finding", "third finding"]
-
-    def test_crlf_line_endings(self) -> None:
-        """Windows runners' subprocess output uses \\r\\n; `splitlines()`
-        handles it but the strip step must clean up any residual \\r."""
-        r = self._wait("alpha\r\nbeta\r\ngamma\r\n")
-        assert r["findings"] == ["alpha", "beta", "gamma"], (
-            f"CRLF line endings must be normalised; got {r['findings']!r}"
+        r = self._wait(
+            self._bugs_json(
+                {"path": "a.py", "line": 1, "summary": "first"},
+                {"path": "b.py", "line": 2, "summary": "second"},
+                {"path": "c.py", "line": 3, "summary": "third"},
+            )
         )
+        assert r["findings"] == [
+            "a.py:1 — first",
+            "b.py:2 — second",
+            "c.py:3 — third",
+        ]
+
+    def test_top_level_list_payload(self) -> None:
+        """The bugs.json schema may also be a top-level list."""
+        import json as _json
+
+        r = self._wait(_json.dumps([{"path": "x.py", "line": 7, "summary": "bare-list"}]))
+        assert r["findings"] == ["x.py:7 — bare-list"]
 
     def test_stderr_never_folded_into_findings(self) -> None:
         """Anthropic's CLI sends progress chatter and the live-session
         URL to stderr; only stdout carries the finding payload. A
         regression that concatenates stderr would pollute the digest."""
         r = self._wait(
-            stdout="actual finding\n",
+            stdout=self._bugs_json({"path": "p.py", "line": 1, "summary": "actual finding"}),
             stderr="https://claude.ai/sessions/abc\nprogress: 50%\n",
         )
-        assert r["findings"] == ["actual finding"]
+        assert r["findings"] == ["p.py:1 — actual finding"]
         for finding in r["findings"]:
             assert "progress" not in finding
             assert "claude.ai/sessions" not in finding
 
-    def test_lone_whitespace_lines_dropped(self) -> None:
-        r = self._wait("real\n   \n\t\nalso-real\n")
-        assert r["findings"] == ["real", "also-real"]
+    def test_missing_summary_field_falls_back_to_message(self) -> None:
+        """Schema is research-preview; ``message`` is a plausible
+        alternative for the human-readable summary."""
+        r = self._wait(self._bugs_json({"path": "a.py", "line": 5, "message": "alt"}))
+        assert r["findings"] == ["a.py:5 — alt"]
 
-    def test_leading_trailing_whitespace_stripped_per_line(self) -> None:
-        r = self._wait("  indented finding  \n\treal\t\n")
-        assert r["findings"] == ["indented finding", "real"]
+    def test_missing_path_and_line_render_as_unknown(self) -> None:
+        """A defective bug entry shouldn't crash the renderer."""
+        r = self._wait(self._bugs_json({"summary": "naked"}))
+        assert r["findings"] == ["?:? — naked"]
 
 
 # ---------------------------------------------------------------------------
@@ -673,7 +702,10 @@ class TestArgvElementsAreStrings:
         assert all(isinstance(tok, str) for tok in proc.argv), (
             f"argv elements must all be strings; got {proc.argv!r}"
         )
-        assert proc.argv[-1] == "42"
+        # The PR number is the 3rd token (after the binary path and the
+        # `ultrareview` subcommand). Flags such as ``--json`` /
+        # ``--timeout`` come after it.
+        assert proc.argv[2] == "42"
 
 
 # ---------------------------------------------------------------------------
@@ -684,7 +716,12 @@ class TestArgvElementsAreStrings:
 
 
 class TestDefaultSpawnPipeShape:
-    def test_pipes_stdout_and_stderr(self, monkeypatch) -> None:
+    def test_pipes_stdout_devnulls_stderr(self, monkeypatch) -> None:
+        """Per PR #28 review C3, stderr → DEVNULL avoids a pipe-buffer
+        deadlock on long runs (the CLI emits progress chatter + the
+        live-session URL to stderr over 5-30 min). stdout stays PIPE'd
+        because the bugs.json payload is bounded and we need to
+        read it."""
         captured: dict[str, Any] = {}
 
         class _PopenSpy:
@@ -695,7 +732,7 @@ class TestDefaultSpawnPipeShape:
         monkeypatch.setattr(ultrareview.subprocess, "Popen", _PopenSpy)
         ultrareview._default_spawn(["claude", "ultrareview", "1"])
         assert captured["kwargs"].get("stdout") == subprocess.PIPE
-        assert captured["kwargs"].get("stderr") == subprocess.PIPE
+        assert captured["kwargs"].get("stderr") == subprocess.DEVNULL
 
     def test_text_mode_for_string_findings(self, monkeypatch) -> None:
         captured: dict[str, Any] = {}

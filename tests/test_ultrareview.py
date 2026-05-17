@@ -5,14 +5,23 @@ so each test drives the polling loop through a scripted sequence of
 "process state" snapshots without burning wall-clock time or touching the
 real `claude` CLI.
 
-The transport choice this module pins down — the `claude ultrareview <PR>`
-CLI subcommand documented for CI/script use — is exercised end-to-end via
-the default `_default_spawn` only in the dedicated argv-construction test;
-every other test stubs the subprocess seam.
+The transport choice this module pins down — the `claude ultrareview <N>
+--json --timeout <m>` CLI subcommand documented for CI/script use — is
+exercised end-to-end via the default `_default_spawn` only in the
+dedicated argv-construction test; every other test stubs the subprocess
+seam.
+
+Exit-code semantics (covered here per F-007-U-2 review C1+C2): per
+https://code.claude.com/docs/en/ultrareview the CLI exits ``0`` when the
+review completes — **with or without bugs** — and ``1`` only when the
+review fails to launch / errors / hits its own timeout. The gate
+therefore computes ``passed = (rc == 0 AND len(bugs) == 0)``; tests
+below pin both the rc==0+bugs and the rc==1+launch-failed cases.
 """
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 
@@ -43,6 +52,7 @@ class FakePopen:
         self.stderr_text = stderr
         self.killed = False
         self.terminated = False
+        self.waited = False
         self.argv: list[str] | None = None
 
     def poll(self) -> int | None:
@@ -63,6 +73,10 @@ class FakePopen:
     def kill(self) -> None:
         self.killed = True
         self._returncode = -9
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.waited = True
+        return self._returncode or 0
 
     @property
     def returncode(self) -> int | None:
@@ -96,6 +110,11 @@ def _scripted_spawn(proc: FakePopen):
     return _spawn
 
 
+def _bugs_json(*entries: dict) -> str:
+    """Wrap one or more bug entries in the bugs.json envelope."""
+    return json.dumps({"bugs": list(entries)})
+
+
 @pytest.fixture(autouse=True)
 def _clear_registry():
     """Wipe the module-level run registry between tests."""
@@ -104,27 +123,34 @@ def _clear_registry():
     ultrareview._runs.clear()
 
 
-# --------------------------- pr-url parsing ---------------------------
+# --------------------------- pr-url canonicalization ---------------------------
 
 
-class TestParsePrUrl:
+class TestCanonicalPrUrl:
     def test_canonical_url(self):
-        assert ultrareview._parse_pr_url("https://github.com/o/r/pull/42") == ("o", "r", 42)
+        canonical, n = ultrareview._canonical_pr_url("https://github.com/o/r/pull/42")
+        assert canonical == "https://github.com/o/r/pull/42"
+        assert n == 42
 
-    def test_trailing_slash(self):
-        assert ultrareview._parse_pr_url("https://github.com/o/r/pull/42/") == ("o", "r", 42)
+    def test_trailing_slash_normalized(self):
+        canonical, n = ultrareview._canonical_pr_url("https://github.com/o/r/pull/42/")
+        assert canonical == "https://github.com/o/r/pull/42"
+        assert n == 42
 
-    def test_files_suffix_tolerated(self):
-        """Real-world PR URLs sometimes carry /files or /commits suffixes."""
-        assert ultrareview._parse_pr_url("https://github.com/o/r/pull/42/files") == ("o", "r", 42)
+    def test_files_suffix_normalized(self):
+        """Real-world PR URLs sometimes carry /files or /commits suffixes —
+        the canonical form must strip them so the registry key is stable."""
+        canonical, n = ultrareview._canonical_pr_url("https://github.com/o/r/pull/42/files")
+        assert canonical == "https://github.com/o/r/pull/42"
+        assert n == 42
 
     def test_rejects_non_pr_url(self):
         with pytest.raises(ValueError):
-            ultrareview._parse_pr_url("https://github.com/o/r")
+            ultrareview._canonical_pr_url("https://github.com/o/r")
 
     def test_rejects_garbage(self):
         with pytest.raises(ValueError):
-            ultrareview._parse_pr_url("not-a-url")
+            ultrareview._canonical_pr_url("not-a-url")
 
 
 # --------------------------- trigger() ---------------------------
@@ -135,16 +161,54 @@ class TestTrigger:
         proc = FakePopen([None])
         ultrareview.trigger("https://github.com/o/r/pull/7", spawn=_scripted_spawn(proc))
         assert proc.argv is not None
-        # Pinned transport: the `claude ultrareview <N>` CLI subcommand,
-        # documented at https://code.claude.com/docs/en/ultrareview.
-        assert proc.argv[-2:] == ["ultrareview", "7"]
+        # Pinned transport: the `claude ultrareview <N> --json --timeout <m>`
+        # CLI subcommand, documented at
+        # https://code.claude.com/docs/en/ultrareview.
         assert proc.argv[0].endswith("claude")
+        assert proc.argv[1] == "ultrareview"
+        assert proc.argv[2] == "7"
+        assert "--json" in proc.argv
+        assert "--timeout" in proc.argv
 
-    def test_registers_run_keyed_by_pr_url(self):
+    def test_argv_includes_json_flag(self):
+        """--json switches the CLI to emit raw bugs.json instead of a
+        human-formatted report — the gate needs structured data."""
+        proc = FakePopen([None])
+        ultrareview.trigger("https://github.com/o/r/pull/7", spawn=_scripted_spawn(proc))
+        assert proc.argv is not None
+        assert "--json" in proc.argv
+
+    def test_argv_includes_timeout_aligned_with_wrapper(self):
+        """The CLI --timeout matches the wrapper-side cap so an early
+        wrapper SIGKILL also stops the cloud session (and stops billing).
+        Default = DEFAULT_TIMEOUT_SECONDS / 60."""
+        proc = FakePopen([None])
+        ultrareview.trigger("https://github.com/o/r/pull/7", spawn=_scripted_spawn(proc))
+        assert proc.argv is not None
+        idx = proc.argv.index("--timeout")
+        # The value is in minutes; default 1800s → 30 min.
+        assert int(proc.argv[idx + 1]) == ultrareview.DEFAULT_TIMEOUT_SECONDS // 60
+
+    def test_registers_run_keyed_by_canonical_url(self):
         proc = FakePopen([None])
         ultrareview.trigger("https://github.com/o/r/pull/7", spawn=_scripted_spawn(proc))
         assert "https://github.com/o/r/pull/7" in ultrareview._runs
         assert ultrareview._runs["https://github.com/o/r/pull/7"].process is proc
+
+    def test_trigger_and_wait_canonicalize_url_consistently(self):
+        """Trigger with one spelling, wait with another — same PR, same run.
+        Pins the Copilot-flagged consistency between the two callsites."""
+        proc = FakePopen([0], stdout=_bugs_json())
+        ultrareview.trigger("https://github.com/o/r/pull/7/files", spawn=_scripted_spawn(proc))
+        clock = FakeClock(step=0)
+        r = ultrareview.wait_for_result(
+            "https://github.com/o/r/pull/7/",
+            timeout=10,
+            poll_interval_seconds=1,
+            sleep=clock.sleep,
+            now=clock.now,
+        )
+        assert r["passed"] is True
 
     def test_re_trigger_replaces_prior_handle(self):
         """Second trigger for same URL supersedes the first (caller error
@@ -175,12 +239,13 @@ class TestTrigger:
             importlib.reload(ultrareview)
 
 
-# --------------------------- wait_for_result(): happy path ---------------------------
+# --------------------------- wait_for_result(): passed ---------------------------
 
 
 class TestWaitForResultPass:
-    def test_immediate_pass_with_no_findings(self):
-        proc = FakePopen([0], stdout="No bugs found.\n")
+    def test_immediate_pass_with_empty_bugs(self):
+        """Clean review: rc==0 + empty bugs list → passed=True, no findings."""
+        proc = FakePopen([0], stdout=_bugs_json())
         ultrareview.trigger("https://github.com/o/r/pull/1", spawn=_scripted_spawn(proc))
         clock = FakeClock(step=0)
         r = ultrareview.wait_for_result(
@@ -190,11 +255,11 @@ class TestWaitForResultPass:
             sleep=clock.sleep,
             now=clock.now,
         )
-        assert r == {"passed": True, "findings": ["No bugs found."]}
+        assert r == {"passed": True, "findings": []}
         assert clock.slept == []
 
     def test_pending_then_pass(self):
-        proc = FakePopen([None, None, 0], stdout="line one\nline two\n")
+        proc = FakePopen([None, None, 0], stdout=_bugs_json())
         ultrareview.trigger("https://github.com/o/r/pull/1", spawn=_scripted_spawn(proc))
         clock = FakeClock(step=1)
         r = ultrareview.wait_for_result(
@@ -204,12 +269,13 @@ class TestWaitForResultPass:
             sleep=clock.sleep,
             now=clock.now,
         )
-        assert r["passed"] is True
-        assert r["findings"] == ["line one", "line two"]
+        assert r == {"passed": True, "findings": []}
         # 2 sleeps before the third poll returned 0
         assert len(clock.slept) == 2
 
     def test_blank_stdout_yields_empty_findings(self):
+        """Empty stdout on rc==0 is treated as a clean review (no bugs.json
+        emitted at all → no bugs reported). Defensive against CLI changes."""
         proc = FakePopen([0], stdout="\n   \n")
         ultrareview.trigger("https://github.com/o/r/pull/1", spawn=_scripted_spawn(proc))
         clock = FakeClock(step=0)
@@ -223,15 +289,41 @@ class TestWaitForResultPass:
         assert r == {"passed": True, "findings": []}
 
 
-# --------------------------- wait_for_result(): failure ---------------------------
+# --------------------------- wait_for_result(): bugs-found path ---------------------------
 
 
-class TestWaitForResultFail:
-    def test_nonzero_exit_marks_failed(self):
-        proc = FakePopen(
-            [1],
-            stdout="bug: race in auth.py:42\nbug: SQL injection in db.py:99\n",
+class TestWaitForResultBugsFound:
+    """The case the F-007 gate exists to catch: review completed (rc==0)
+    AND bugs.json is non-empty. Reviewer C1+C2 flagged the previous
+    implementation as a no-op for exactly this case."""
+
+    def test_rc0_with_bugs_marks_failed(self):
+        bugs = _bugs_json(
+            {"path": "auth.py", "line": 42, "summary": "race in token refresh"},
+            {"path": "db.py", "line": 99, "summary": "unparameterized SQL"},
         )
+        proc = FakePopen([0], stdout=bugs)
+        ultrareview.trigger("https://github.com/o/r/pull/9", spawn=_scripted_spawn(proc))
+        clock = FakeClock(step=0)
+        r = ultrareview.wait_for_result(
+            "https://github.com/o/r/pull/9",
+            timeout=60,
+            poll_interval_seconds=1,
+            sleep=clock.sleep,
+            now=clock.now,
+        )
+        assert r["passed"] is False, (
+            "rc==0 with non-empty bugs.json is the bug-found-but-review-completed "
+            "case — gate MUST block ready-to-merge here"
+        )
+        assert len(r["findings"]) == 2
+        assert "auth.py:42 — race in token refresh" in r["findings"]
+        assert "db.py:99 — unparameterized SQL" in r["findings"]
+
+    def test_top_level_list_bugs_payload(self):
+        """The bugs.json schema may also surface as a top-level list."""
+        bugs = json.dumps([{"path": "x.py", "line": 1, "summary": "bug"}])
+        proc = FakePopen([0], stdout=bugs)
         ultrareview.trigger("https://github.com/o/r/pull/9", spawn=_scripted_spawn(proc))
         clock = FakeClock(step=0)
         r = ultrareview.wait_for_result(
@@ -242,14 +334,100 @@ class TestWaitForResultFail:
             now=clock.now,
         )
         assert r["passed"] is False
-        assert r["findings"] == [
-            "bug: race in auth.py:42",
-            "bug: SQL injection in db.py:99",
-        ]
+        assert r["findings"] == ["x.py:1 — bug"]
 
-    def test_negative_exit_marks_failed(self):
-        """Signal-killed subprocess (e.g. SIGTERM) is a fail, not a pass."""
-        proc = FakePopen([-9], stdout="")
+    def test_bug_with_alternative_summary_field(self):
+        bugs = _bugs_json({"path": "a.py", "line": 3, "message": "alt-field"})
+        proc = FakePopen([0], stdout=bugs)
+        ultrareview.trigger("https://github.com/o/r/pull/9", spawn=_scripted_spawn(proc))
+        clock = FakeClock(step=0)
+        r = ultrareview.wait_for_result(
+            "https://github.com/o/r/pull/9",
+            timeout=60,
+            poll_interval_seconds=1,
+            sleep=clock.sleep,
+            now=clock.now,
+        )
+        assert r["findings"] == ["a.py:3 — alt-field"]
+
+    def test_non_dict_bug_entry_renders_via_str(self):
+        """Defensive: a bug entry that's a bare string (unexpected
+        schema) shouldn't crash the renderer."""
+        bugs = json.dumps({"bugs": ["legacy bare string"]})
+        proc = FakePopen([0], stdout=bugs)
+        ultrareview.trigger("https://github.com/o/r/pull/9", spawn=_scripted_spawn(proc))
+        clock = FakeClock(step=0)
+        r = ultrareview.wait_for_result(
+            "https://github.com/o/r/pull/9",
+            timeout=60,
+            poll_interval_seconds=1,
+            sleep=clock.sleep,
+            now=clock.now,
+        )
+        assert r["findings"] == ["legacy bare string"]
+        assert r["passed"] is False
+
+    def test_top_level_json_neither_dict_nor_list(self):
+        """JSON that parses to a primitive (number / bare string) is
+        surfaced as a single finding so the operator can debug."""
+        proc = FakePopen([0], stdout='"unexpected-shape"')
+        ultrareview.trigger("https://github.com/o/r/pull/9", spawn=_scripted_spawn(proc))
+        clock = FakeClock(step=0)
+        r = ultrareview.wait_for_result(
+            "https://github.com/o/r/pull/9",
+            timeout=60,
+            poll_interval_seconds=1,
+            sleep=clock.sleep,
+            now=clock.now,
+        )
+        assert r["passed"] is False
+        assert len(r["findings"]) == 1
+
+
+# --------------------------- wait_for_result(): launch-failed (rc != 0) ---------------------------
+
+
+class TestWaitForResultLaunchFailed:
+    """Per the docs, rc != 0 means the review never produced a verdict —
+    launch failure, remote session error, or CLI-side timeout. Distinct
+    semantic from "bugs found"; both end up passed=False but the gate's
+    user-facing message should be able to tell them apart."""
+
+    def test_rc1_with_empty_stdout(self):
+        proc = FakePopen([1], stdout="")
+        ultrareview.trigger("https://github.com/o/r/pull/9", spawn=_scripted_spawn(proc))
+        clock = FakeClock(step=0)
+        r = ultrareview.wait_for_result(
+            "https://github.com/o/r/pull/9",
+            timeout=60,
+            poll_interval_seconds=1,
+            sleep=clock.sleep,
+            now=clock.now,
+        )
+        assert r["passed"] is False
+        assert r["findings"] == []
+
+    def test_rc1_with_error_text_surfaces_as_finding(self):
+        """If the CLI prints an error banner to stdout, we surface it so
+        the operator sees what happened (parseable JSON would have been
+        treated as bugs; non-JSON falls back to a single finding entry)."""
+        proc = FakePopen([1], stdout="ERROR: remote session crashed (id abc123)")
+        ultrareview.trigger("https://github.com/o/r/pull/9", spawn=_scripted_spawn(proc))
+        clock = FakeClock(step=0)
+        r = ultrareview.wait_for_result(
+            "https://github.com/o/r/pull/9",
+            timeout=60,
+            poll_interval_seconds=1,
+            sleep=clock.sleep,
+            now=clock.now,
+        )
+        assert r["passed"] is False
+        assert any("crashed" in f for f in r["findings"])
+
+    def test_rc130_signal_marks_failed(self):
+        """Per docs, code 130 = SIGINT (Ctrl-C). Same family as rc==1
+        from the gate's POV: review never produced a verdict."""
+        proc = FakePopen([130], stdout="")
         ultrareview.trigger("https://github.com/o/r/pull/9", spawn=_scripted_spawn(proc))
         clock = FakeClock(step=0)
         r = ultrareview.wait_for_result(
@@ -266,7 +444,7 @@ class TestWaitForResultFail:
 
 
 class TestWaitForResultTimeout:
-    def test_timeout_kills_process_and_returns_failed(self):
+    def test_timeout_kills_and_reaps_process(self):
         proc = FakePopen([None] * 100)  # never finishes
         ultrareview.trigger("https://github.com/o/r/pull/5", spawn=_scripted_spawn(proc))
         clock = FakeClock(step=5)
@@ -280,12 +458,13 @@ class TestWaitForResultTimeout:
         assert r["passed"] is False
         # Findings encode the timeout so callers can surface the reason.
         assert any("timeout" in f.lower() for f in r["findings"])
-        # We must hand the process a SIGTERM/SIGKILL so it doesn't outlive
-        # the orchestrator — otherwise a stuck `claude` would leak forever.
+        # SIGTERM + SIGKILL + wait() — the reap step prevents a zombie.
         assert proc.terminated or proc.killed
+        assert proc.waited, "_kill_and_reap must wait() after kill to reap zombies"
 
     def test_timeout_swallows_kill_errors(self):
-        """Stubs whose terminate/kill raise must not crash the timeout path."""
+        """Stubs whose terminate/kill/wait raise must not crash the timeout
+        path."""
 
         class BrokenProc(FakePopen):
             def terminate(self) -> None:
@@ -293,6 +472,9 @@ class TestWaitForResultTimeout:
 
             def kill(self) -> None:
                 raise PermissionError("denied")
+
+            def wait(self, timeout: float | None = None) -> int:
+                raise OSError("dead")
 
         proc = BrokenProc([None] * 100)
         ultrareview.trigger("https://github.com/o/r/pull/4", spawn=_scripted_spawn(proc))
@@ -306,9 +488,9 @@ class TestWaitForResultTimeout:
         )
         assert r["passed"] is False
 
-    def test_timeout_uses_default_when_unset(self, monkeypatch):
+    def test_timeout_uses_default_when_unset(self):
         """`timeout=None` falls back to module default."""
-        proc = FakePopen([0], stdout="ok")
+        proc = FakePopen([0], stdout=_bugs_json())
         ultrareview.trigger("https://github.com/o/r/pull/1", spawn=_scripted_spawn(proc))
         clock = FakeClock(step=0)
         r = ultrareview.wait_for_result(
@@ -341,8 +523,8 @@ class TestWaitForResultMissing:
 
 class TestParallelRuns:
     def test_multiple_pr_urls_tracked_independently(self):
-        a = FakePopen([0], stdout="A: clean\n")
-        b = FakePopen([1], stdout="B: bug in core.py\n")
+        a = FakePopen([0], stdout=_bugs_json())
+        b = FakePopen([0], stdout=_bugs_json({"path": "core.py", "line": 1, "summary": "B"}))
         ultrareview.trigger("https://github.com/o/r/pull/1", spawn=_scripted_spawn(a))
         ultrareview.trigger("https://github.com/o/r/pull/2", spawn=_scripted_spawn(b))
 
@@ -363,27 +545,49 @@ class TestParallelRuns:
         )
         assert ra["passed"] is True
         assert rb["passed"] is False
-        assert ra["findings"] == ["A: clean"]
-        assert rb["findings"] == ["B: bug in core.py"]
+        assert ra["findings"] == []
+        assert rb["findings"] == ["core.py:1 — B"]
 
 
 # --------------------------- default-spawn argv shape ---------------------------
 
 
 class TestDefaultSpawnArgv:
-    """The one test that drives `_default_spawn` directly — confirms the
-    invocation mechanism (CLI subcommand) round-trips through `subprocess`
-    with the expected argv. Uses ``sys.executable -c ""`` as the binary
-    so the test is portable to every platform where pytest runs (the
-    previous ``/bin/true`` choice was absent on Windows runners and the
-    macOS GitHub-Actions images).
+    """Smoke-check `_default_spawn` against a real subprocess.
+
+    Every other test stubs the spawn seam; this one drives the real
+    :func:`subprocess.Popen` so we catch regressions in the argv /
+    kwargs shape (PIPE for stdout, DEVNULL for stderr, text mode).
+    Uses ``sys.executable -c ""`` rather than a hardcoded binary so it
+    works on Linux, macOS, and Windows runners.
     """
 
     def test_default_spawn_returns_popen(self):
         proc = ultrareview._default_spawn([sys.executable, "-c", ""])
-        assert isinstance(proc, subprocess.Popen)
-        proc.wait(timeout=5)
-        assert proc.returncode == 0
+        try:
+            assert isinstance(proc, subprocess.Popen)
+            proc.wait(timeout=10)
+            assert proc.returncode == 0
+        finally:
+            # Drain pipes so the OS reclaims the fds even if asserts fail.
+            proc.communicate()
+
+    def test_default_spawn_uses_devnull_for_stderr(self, monkeypatch):
+        """stderr=DEVNULL prevents the pipe-buffer deadlock on long runs —
+        Copilot flagged that progress chatter over 5-30 min could exceed
+        the OS pipe buffer if we PIPE+don't-drain stderr."""
+        captured: dict = {}
+
+        class _PopenSpy:
+            def __init__(self, *args, **kwargs):
+                captured["args"] = args
+                captured["kwargs"] = kwargs
+
+        monkeypatch.setattr(ultrareview.subprocess, "Popen", _PopenSpy)
+        ultrareview._default_spawn(["claude", "ultrareview", "1"])
+        assert captured["kwargs"].get("stderr") == subprocess.DEVNULL
+        # stdout still PIPE'd — bugs.json payload is bounded JSON.
+        assert captured["kwargs"].get("stdout") == subprocess.PIPE
 
 
 # --------------------------- env defaults ---------------------------
@@ -402,4 +606,24 @@ def test_env_defaults_override_module_defaults(monkeypatch):
     finally:
         monkeypatch.delenv("ULTRAREVIEW_TIMEOUT_SECONDS", raising=False)
         monkeypatch.delenv("ULTRAREVIEW_POLL_INTERVAL", raising=False)
+        importlib.reload(ultrareview)
+
+
+def test_default_timeout_matches_cli_default():
+    """Per the canonical docs (https://code.claude.com/docs/en/ultrareview)
+    the CLI's own --timeout defaults to 30 minutes. The wrapper aligns
+    with that — a smaller wrapper default produces false-negative timeouts
+    + cloud-side billing leaks (reviewer H1)."""
+    import importlib
+
+    # Reload with env knob unset to test the hardcoded fallback.
+    import os
+
+    saved = os.environ.pop("ULTRAREVIEW_TIMEOUT_SECONDS", None)
+    try:
+        importlib.reload(ultrareview)
+        assert ultrareview.DEFAULT_TIMEOUT_SECONDS == 1800
+    finally:
+        if saved is not None:
+            os.environ["ULTRAREVIEW_TIMEOUT_SECONDS"] = saved
         importlib.reload(ultrareview)
