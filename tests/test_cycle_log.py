@@ -547,6 +547,75 @@ class TestWriteCycleLog:
         with pytest.raises(ValueError, match="no work_units row"):
             cycle_log.write_cycle_log("F-099-U-1", base_dir=tmp_path, run=FakeRunner())
 
+    def test_returns_resolved_absolute_path(self, tmp_path: Path, tmp_state_db: Path) -> None:
+        """write_cycle_log must return an absolute path (Copilot review #3249520148)."""
+        _seed(pr_number=None)
+        rel_base = Path("./" + tmp_path.name)
+        # Run from tmp_path.parent so the relative ``./<name>`` resolves to tmp_path.
+        import os
+
+        prev = Path.cwd()
+        try:
+            os.chdir(tmp_path.parent)
+            target = cycle_log.write_cycle_log("F-007-U-2", base_dir=rel_base, run=FakeRunner())
+        finally:
+            os.chdir(prev)
+        assert target.is_absolute()
+
+    def test_does_not_commit_when_git_errors(self, tmp_path: Path, tmp_state_db: Path) -> None:
+        """git diff rc != 1 (e.g. 128 from a non-repo) must skip commit, not proceed.
+
+        Copilot review #3249520130 — previously any non-zero rc was treated
+        as "has staged changes" which would issue a spurious commit attempt.
+        """
+        _seed(pr_number=None)
+        runner = FakeRunner()
+        runner.register(("git", "diff", "--cached"), FakeProc(returncode=128, stderr="not a repo"))
+
+        cycle_log.write_cycle_log("F-007-U-2", base_dir=tmp_path, run=runner)
+
+        assert not any(c[:1] == ["git"] and "commit" in c for c in runner.calls), (
+            "rc=128 from git diff must not trigger a commit"
+        )
+
+
+class TestDefensiveFetch:
+    """Defensive parsing for the GitHub mirroring (Copilot review on PR #26).
+
+    parse_repo_url ValueError handling + GraphQL shape coercion.
+    """
+
+    def test_fetch_pr_info_returns_empty_on_malformed_repo_url(self) -> None:
+        # ``parse_repo_url`` raises ValueError on a non-GitHub URL.
+        info = cycle_log.fetch_pr_info("not-a-github-url", 42, run=FakeRunner())
+        assert info == {}
+
+    def test_fetch_review_threads_returns_empty_on_malformed_repo_url(self) -> None:
+        threads = cycle_log.fetch_review_threads("not-a-github-url", 42, run=FakeRunner())
+        assert threads == []
+
+    def test_fetch_review_threads_handles_non_dict_json_root(self) -> None:
+        runner = FakeRunner()
+        runner.register(("gh", "api", "graphql"), FakeProc(returncode=0, stdout="[1, 2, 3]"))
+        assert cycle_log.fetch_review_threads("https://github.com/o/r", 1, run=runner) == []
+
+    def test_fetch_review_threads_handles_nodes_null(self) -> None:
+        runner = FakeRunner()
+        payload = json.dumps(
+            {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": None}}}}}
+        )
+        runner.register(("gh", "api", "graphql"), FakeProc(returncode=0, stdout=payload))
+        assert cycle_log.fetch_review_threads("https://github.com/o/r", 1, run=runner) == []
+
+    def test_fetch_review_threads_handles_missing_pull_request_key(self) -> None:
+        runner = FakeRunner()
+        # data.repository present but no pullRequest key
+        runner.register(
+            ("gh", "api", "graphql"),
+            FakeProc(returncode=0, stdout=json.dumps({"data": {"repository": {}}})),
+        )
+        assert cycle_log.fetch_review_threads("https://github.com/o/r", 1, run=runner) == []
+
 
 class TestRegenerateCycleLog:
     def test_writes_when_file_missing(self, tmp_path: Path, tmp_state_db: Path) -> None:

@@ -1,4 +1,4 @@
-"""Per-unit cycle log writer.
+"""Per-unit cycle log writer — public API.
 
 Renders ``features/F-XXX/U-N.md`` from ``unit_events`` rows plus GitHub
 data mirrored via ``gh pr view`` (PR description + ``headRefOid``) and a
@@ -10,6 +10,14 @@ This module is a pure library: no MCP tool registers it, no caller in
 ``write_cycle_log`` into ``cycle_review``'s terminal branches and expose
 ``regenerate_cycle_log`` as an MCP tool.
 
+The gh-mirroring (`cycle_log_gh.py`) and markdown rendering
+(`cycle_log_render.py`) live in sibling modules so the I/O and the
+formatting can be exercised independently. This module owns paths,
+atomic write, local commit, and the orchestrating ``write_cycle_log`` /
+``regenerate_cycle_log`` entry points. Public names from the siblings
+are re-exported here so callers and tests can keep using
+``from orchestrator import cycle_log`` followed by ``cycle_log.X``.
+
 See ``docs/PROPOSAL-feature-spec-and-headless-daemon.md`` § "Per-unit
 cycle log" for the schema and the "Persistence and commit strategy"
 section for the local-only commit policy.
@@ -18,21 +26,21 @@ section for the local-only commit policy.
 from __future__ import annotations
 
 import contextlib
-import json
-import subprocess  # nosec B404 — invoking `gh` / `git` is the whole point of this module
-from collections.abc import Callable
+import subprocess  # nosec B404 — invoking `git` is the whole point of the commit step
 from pathlib import Path
 from typing import Any
 
 from orchestrator import state
-from orchestrator.github import parse_repo_url
-from orchestrator.models import WorkUnit
-
-# Subprocess runner shape callers can swap in for tests. Real
-# ``subprocess.run`` has an overloaded signature; for our purposes
-# anything that accepts argv + kwargs and returns an object with
-# ``.returncode`` / ``.stdout`` / ``.stderr`` qualifies.
-SubprocessRunner = Callable[..., Any]
+from orchestrator.cycle_log_gh import (
+    SubprocessRunner,
+    fetch_pr_info,
+    fetch_review_threads,
+)
+from orchestrator.cycle_log_render import (
+    _feature_id_from_unit_id,
+    _unit_basename,
+    render_cycle_log,
+)
 
 # Auto-commit identity for cycle-log writes. Matches the per-command
 # pattern used by coder/tester worker commits — distinct from the human
@@ -40,52 +48,8 @@ SubprocessRunner = Callable[..., Any]
 COMMIT_USER_NAME = "orchestrator-bot"
 COMMIT_USER_EMAIL = "agent@orchestrator"
 
-# GraphQL for review-thread mirroring. Mirrors the snippet documented in
-# ``orchestrator/prompts/coder.md`` so coder agents and the cycle-log
-# writer query the same shape.
-_REVIEW_THREADS_QUERY = """\
-query($owner:String!, $repo:String!, $pr:Int!) {
-  repository(owner:$owner, name:$repo) {
-    pullRequest(number:$pr) {
-      reviewThreads(first:100) {
-        nodes {
-          id
-          isResolved
-          isOutdated
-          comments(first:1) {
-            nodes {
-              databaseId
-              path
-              line
-              body
-              url
-              author { login }
-            }
-          }
-        }
-      }
-    }
-  }
-}
-"""
-
 
 # --------------------------- paths ---------------------------
-
-
-def _unit_basename(unit_id: str) -> str:
-    """Return ``U-N`` from ``F-XXX-U-N``. Falls back to the raw id."""
-    parts = unit_id.rsplit("-", 2)
-    if len(parts) >= 2 and parts[-2] == "U":
-        return f"U-{parts[-1]}"
-    return unit_id
-
-
-def _feature_id_from_unit_id(unit_id: str) -> str:
-    """Best-effort: derive ``F-XXX`` from ``F-XXX-U-N``."""
-    if "-U-" in unit_id:
-        return unit_id.split("-U-", 1)[0]
-    return unit_id
 
 
 def feature_dir(feature_id: str, *, base_dir: Path | None = None) -> Path:
@@ -121,334 +85,6 @@ def cycle_log_path(
     return fdir / f"{_unit_basename(unit_id)}.md"
 
 
-# --------------------------- GitHub mirroring ---------------------------
-
-
-def _run_gh(
-    argv: list[str],
-    *,
-    run: SubprocessRunner,
-    cwd: str | None = None,
-) -> tuple[int, str, str]:
-    """Invoke ``gh`` and return ``(returncode, stdout, stderr)``.
-
-    Errors are returned to the caller (never raised) — the cycle log is
-    written best-effort so a transient GitHub outage doesn't lose the
-    state-driven cycle history we have on disk.
-    """
-    try:
-        proc = run(
-            argv,
-            capture_output=True,
-            text=True,
-            check=False,
-            cwd=cwd,
-        )
-    except FileNotFoundError as exc:
-        return 127, "", str(exc)
-    return (
-        getattr(proc, "returncode", 1),
-        getattr(proc, "stdout", "") or "",
-        getattr(proc, "stderr", "") or "",
-    )
-
-
-def fetch_pr_info(
-    repo_url: str,
-    pr_number: int,
-    *,
-    run: SubprocessRunner | None = None,
-) -> dict[str, Any]:
-    """Mirror the PR description + head SHA via ``gh pr view``.
-
-    Returns a dict with ``title``, ``body``, ``headRefOid`` — or an empty
-    dict if ``gh`` fails / returns non-JSON. Pass ``run`` from tests to
-    avoid invoking the real CLI.
-    """
-    runner = run if run is not None else subprocess.run
-    owner, repo = parse_repo_url(repo_url)
-    code, out, _ = _run_gh(
-        [
-            "gh",
-            "pr",
-            "view",
-            str(pr_number),
-            "--repo",
-            f"{owner}/{repo}",
-            "--json",
-            "title,body,headRefOid",
-        ],
-        run=runner,
-    )
-    if code != 0 or not out.strip():
-        return {}
-    try:
-        data = json.loads(out)
-    except json.JSONDecodeError:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def fetch_review_threads(
-    repo_url: str,
-    pr_number: int,
-    *,
-    run: SubprocessRunner | None = None,
-) -> list[dict[str, Any]]:
-    """Mirror review threads via the GraphQL ``reviewThreads`` query.
-
-    Returns a list of ``{id, isResolved, isOutdated, path, line, body,
-    url, author}`` dicts (the first comment of each thread, which carries
-    the original finding). Empty list on transport / parse error.
-    """
-    runner = run if run is not None else subprocess.run
-    owner, repo = parse_repo_url(repo_url)
-    code, out, _ = _run_gh(
-        [
-            "gh",
-            "api",
-            "graphql",
-            "-f",
-            f"query={_REVIEW_THREADS_QUERY}",
-            "-F",
-            f"owner={owner}",
-            "-F",
-            f"repo={repo}",
-            "-F",
-            f"pr={pr_number}",
-        ],
-        run=runner,
-    )
-    if code != 0 or not out.strip():
-        return []
-    try:
-        payload = json.loads(out)
-    except json.JSONDecodeError:
-        return []
-
-    nodes = (
-        payload.get("data", {})
-        .get("repository", {})
-        .get("pullRequest", {})
-        .get("reviewThreads", {})
-        .get("nodes", [])
-    )
-    threads: list[dict[str, Any]] = []
-    for node in nodes:
-        comments = (node.get("comments") or {}).get("nodes") or []
-        first = comments[0] if comments else {}
-        threads.append(
-            {
-                "id": node.get("id"),
-                "isResolved": bool(node.get("isResolved")),
-                "isOutdated": bool(node.get("isOutdated")),
-                "path": first.get("path"),
-                "line": first.get("line"),
-                "body": first.get("body", ""),
-                "url": first.get("url", ""),
-                "author": (first.get("author") or {}).get("login", ""),
-            }
-        )
-    return threads
-
-
-# --------------------------- rendering ---------------------------
-
-
-# Map state-event types to the worker / outcome label used in the cycle
-# history headings. Events not in this map are skipped (e.g. ``spawn_*``
-# events are scheduler chatter, not cycle outcomes).
-_EVENT_HEADINGS: dict[str, str] = {
-    "pr_opened": "coder: PR opened",
-    "coder_blocked": "coder: BLOCKED",
-    "coder_no_marker": "coder: NO_MARKER",
-    "coder_resume_error": "coder: ERROR",
-    "tests_pass": "tester: TESTS_PASS",  # nosec B105 — heading label, not a credential
-    "tester_bug_found": "tester: BUG_FOUND",
-    "tester_blocked": "tester: BLOCKED",
-    "tester_error": "tester: ERROR",
-    "reviewer_recommend_merge": "reviewer: REVIEW_RECOMMEND_MERGE",
-    "reviewer_request_changes": "reviewer: REVIEW_REQUEST_CHANGES",
-    "reviewer_comment": "reviewer: REVIEW_COMMENT",
-    "reviewer_blocked": "reviewer: BLOCKED",
-    "reviewer_error": "reviewer: ERROR",
-    "fix_pushed": "coder fix: FIX_PUSHED",
-    "coder_blocked_on_fix": "coder fix: BLOCKED",
-}
-
-
-def _lookup_unit(unit_id: str, feature_id: str) -> WorkUnit | None:
-    plan = state.get_plan(feature_id)
-    if plan is None:
-        return None
-    return next((u for u in plan.units if u.id == unit_id), None)
-
-
-def _render_pr_section(
-    pr_info: dict[str, Any],
-    pr_number: int | None,
-    repo_url: str,
-    unit_status: str,
-    status_ts: str = "",
-) -> list[str]:
-    lines = ["## PR"]
-    if pr_number and repo_url:
-        try:
-            owner, repo = parse_repo_url(repo_url)
-            lines.append(f"#{pr_number} · https://github.com/{owner}/{repo}/pull/{pr_number}")
-        except ValueError:
-            lines.append(f"#{pr_number}")
-    elif pr_number:
-        lines.append(f"#{pr_number}")
-    else:
-        lines.append("_no PR opened_")
-    status_line = f"Status: {unit_status}"
-    if status_ts:
-        # Match the proposal § "Per-unit cycle log" example: `Status: merged
-        # (2026-05-15 14:32 UTC)`. ``last_activity`` is already UTC ISO-8601
-        # so we surface it verbatim and tag the timezone.
-        status_line += f" ({status_ts} UTC)"
-    lines.append(status_line)
-    head_sha = pr_info.get("headRefOid") or ""
-    lines.append(f"PR head SHA: {head_sha or '_unknown_'}")
-    return lines
-
-
-def _render_pr_description(pr_info: dict[str, Any]) -> list[str]:
-    body = (pr_info.get("body") or "").rstrip()
-    lines = ["## Coder's PR description (verbatim, as of last capture)"]
-    lines.append(body if body else "_unavailable_")
-    return lines
-
-
-def _render_cycle_history(
-    events: list[dict[str, Any]],
-    *,
-    unit_status: str = "",
-) -> list[str]:
-    rendered: list[dict[str, Any]] = []
-    for ev in events:
-        heading = _EVENT_HEADINGS.get(ev["event_type"])
-        if heading is None:
-            continue
-        rendered.append(
-            {
-                "cycle": ev.get("cycle_number") if ev.get("cycle_number") is not None else 0,
-                "heading": heading,
-                "summary": (ev.get("summary") or "").strip(),
-            }
-        )
-
-    cycle_count = max((r["cycle"] for r in rendered), default=0)
-    # "cap-3 hit" ⇔ the unit was escalated *because* the cap was reached.
-    # A unit that runs 3 cycles and is approved on cycle 3 has
-    # ``cycle_count == 3`` but the cap was NOT hit — see the proposal §
-    # "Per-unit cycle log" example, which renders that case as
-    # `3 cycles · cap-3 not hit`. The execution-side enforcement at
-    # ``review_round >= CAP_3`` only escalates when the *next* fix would
-    # exceed the cap, so unit_status is the authoritative signal.
-    cap_hit = unit_status == "escalated" and cycle_count >= 3
-    lines = ["## Cycle history"]
-    lines.append(f"{cycle_count} cycles · " + ("cap-3 hit" if cap_hit else "cap-3 not hit"))
-    if not rendered:
-        lines.append("")
-        lines.append("_no cycle events recorded_")
-        return lines
-
-    for entry in rendered:
-        lines.append("")
-        lines.append(f"### Cycle {entry['cycle']} — {entry['heading']}")
-        summary = entry["summary"] or "_no summary recorded_"
-        lines.append(f"- {summary}")
-    return lines
-
-
-_REVIEW_TIER_PREFIX = ("🔴", "🟠", "🟡", "🔵")
-
-
-def _tier_marker(body: str) -> str:
-    """Return the leading tier emoji if the comment starts with one."""
-    stripped = body.lstrip()
-    for marker in _REVIEW_TIER_PREFIX:
-        if stripped.startswith(marker):
-            return marker
-    return ""
-
-
-def _excerpt(body: str, limit: int = 160) -> str:
-    """Single-line, length-capped excerpt for the threads index."""
-    flat = " ".join(body.split())
-    return flat if len(flat) <= limit else flat[: limit - 1].rstrip() + "…"
-
-
-def _render_review_threads(threads: list[dict[str, Any]]) -> list[str]:
-    lines = ["## Review threads"]
-    if not threads:
-        lines.append("_no review threads_")
-        return lines
-    for t in threads:
-        marker = _tier_marker(t.get("body", ""))
-        path = t.get("path") or "(general)"
-        line_no = t.get("line")
-        loc = f"{path}:{line_no}" if line_no else path
-        url = t.get("url") or ""
-        excerpt = _excerpt(t.get("body", ""))
-        status_bits = []
-        if t.get("isResolved"):
-            status_bits.append("resolved")
-        if t.get("isOutdated"):
-            status_bits.append("outdated")
-        status = f" [{', '.join(status_bits)}]" if status_bits else ""
-        prefix = f"{marker} " if marker else ""
-        bullet = f"- {prefix}{loc}{status} — {excerpt}"
-        if url:
-            bullet += f" ({url})"
-        lines.append(bullet)
-    return lines
-
-
-def render_cycle_log(
-    unit_id: str,
-    *,
-    pr_info: dict[str, Any] | None = None,
-    review_threads: list[dict[str, Any]] | None = None,
-) -> str:
-    """Render the cycle-log markdown for ``unit_id`` from current state.
-
-    ``pr_info`` and ``review_threads`` come from ``fetch_pr_info`` /
-    ``fetch_review_threads`` in normal operation; pass them in directly
-    for tests or for an offline regenerate.
-    """
-    pr_info = pr_info or {}
-    review_threads = review_threads or []
-
-    unit_state = state.get_unit_state(unit_id)
-    feature_id = unit_state.feature_id if unit_state else _feature_id_from_unit_id(unit_id)
-    feature = state.get_feature(feature_id)
-    unit = _lookup_unit(unit_id, feature_id)
-
-    title = unit.title if unit else (pr_info.get("title") or "")
-    header = f"# {unit_id}" + (f" — {title}" if title else "")
-
-    blocks: list[list[str]] = [
-        [header],
-        _render_pr_section(
-            pr_info,
-            unit_state.pr_number if unit_state else None,
-            feature.repo_path if feature else "",
-            unit_state.status if unit_state else "unknown",
-            status_ts=unit_state.last_activity if unit_state else "",
-        ),
-        _render_pr_description(pr_info),
-        _render_cycle_history(
-            state.list_events(unit_id) if unit_state else [],
-            unit_status=unit_state.status if unit_state else "",
-        ),
-        _render_review_threads(review_threads),
-    ]
-    return "\n\n".join("\n".join(block) for block in blocks) + "\n"
-
-
 # --------------------------- writing + committing ---------------------------
 
 
@@ -479,10 +115,13 @@ def _git_commit_local(
     if getattr(add, "returncode", 1) != 0:
         return False
 
-    # `git diff --cached --quiet -- <file>` exits 0 when nothing to
-    # commit, 1 when there are staged changes. Avoid a no-op commit
-    # (regenerate on unchanged input is allowed and must not pollute
-    # history).
+    # ``git diff --cached --quiet -- <file>`` exit codes:
+    #   0   nothing staged (idempotent regenerate — return False)
+    #   1   staged changes present (proceed to commit)
+    #   128 git error (non-repo, corrupt index, ...) — treat as no-op.
+    # Treat *only* rc==1 as "has changes"; anything else (including the
+    # historical "treat non-zero as has-changes" bug this comment
+    # replaces) is a fail-safe no-op.
     diff = run(
         ["git", "diff", "--cached", "--quiet", "--", str(target)],
         cwd=str(cwd),
@@ -490,7 +129,7 @@ def _git_commit_local(
         text=True,
         check=False,
     )
-    if getattr(diff, "returncode", 0) == 0:
+    if getattr(diff, "returncode", -1) != 1:
         return False
 
     commit = run(
@@ -559,7 +198,7 @@ def write_cycle_log(
          pushes — push policy is operator-driven (see proposal §
          "Persistence and commit strategy").
 
-    Returns the absolute path to the written file.
+    Returns the resolved absolute path to the written file.
     """
     runner = run if run is not None else subprocess.run
 
@@ -590,7 +229,7 @@ def write_cycle_log(
     message = commit_message or f"cycle-log: {unit_id}"
     _git_commit_local(target, cwd=cwd, run=runner, message=message)
 
-    return target
+    return target.resolve()
 
 
 def regenerate_cycle_log(

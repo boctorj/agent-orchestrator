@@ -1,0 +1,235 @@
+"""Markdown rendering for per-unit cycle logs.
+
+Split out from ``orchestrator/cycle_log.py`` so the rendering can be
+tested in isolation from gh / subprocess / filesystem (see PR #26
+review on file length and test ergonomics). Pure function: given the
+state-derived events + mirrored GitHub data, produces the markdown
+string. ``orchestrator.cycle_log`` re-exports ``render_cycle_log`` for
+back-compat with existing callers and tests.
+
+Schema reference: ``docs/PROPOSAL-feature-spec-and-headless-daemon.md``
+§ "Per-unit cycle log".
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from orchestrator import state
+from orchestrator.github import parse_repo_url
+from orchestrator.models import WorkUnit
+
+
+def _unit_basename(unit_id: str) -> str:
+    """Return ``U-N`` from ``F-XXX-U-N``. Falls back to the raw id."""
+    parts = unit_id.rsplit("-", 2)
+    if len(parts) >= 2 and parts[-2] == "U":
+        return f"U-{parts[-1]}"
+    return unit_id
+
+
+def _feature_id_from_unit_id(unit_id: str) -> str:
+    """Best-effort: derive ``F-XXX`` from ``F-XXX-U-N``."""
+    if "-U-" in unit_id:
+        return unit_id.split("-U-", 1)[0]
+    return unit_id
+
+
+# Map state-event types to the worker / outcome label used in the cycle
+# history headings. Events not in this map are skipped (e.g. ``spawn_*``
+# events are scheduler chatter, not cycle outcomes).
+_EVENT_HEADINGS: dict[str, str] = {
+    "pr_opened": "coder: PR opened",
+    "coder_blocked": "coder: BLOCKED",
+    "coder_no_marker": "coder: NO_MARKER",
+    "coder_resume_error": "coder: ERROR",
+    "tests_pass": "tester: TESTS_PASS",  # nosec B105 — heading label, not a credential
+    "tester_bug_found": "tester: BUG_FOUND",
+    "tester_blocked": "tester: BLOCKED",
+    "tester_error": "tester: ERROR",
+    "reviewer_recommend_merge": "reviewer: REVIEW_RECOMMEND_MERGE",
+    "reviewer_request_changes": "reviewer: REVIEW_REQUEST_CHANGES",
+    "reviewer_comment": "reviewer: REVIEW_COMMENT",
+    "reviewer_blocked": "reviewer: BLOCKED",
+    "reviewer_error": "reviewer: ERROR",
+    "fix_pushed": "coder fix: FIX_PUSHED",
+    "coder_blocked_on_fix": "coder fix: BLOCKED",
+}
+
+
+_REVIEW_TIER_PREFIX = ("🔴", "🟠", "🟡", "🔵")
+
+
+def _lookup_unit(unit_id: str, feature_id: str) -> WorkUnit | None:
+    plan = state.get_plan(feature_id)
+    if plan is None:
+        return None
+    return next((u for u in plan.units if u.id == unit_id), None)
+
+
+def _render_pr_section(
+    pr_info: dict[str, Any],
+    pr_number: int | None,
+    repo_url: str,
+    unit_status: str,
+    status_ts: str = "",
+) -> list[str]:
+    lines = ["## PR"]
+    if pr_number and repo_url:
+        try:
+            owner, repo = parse_repo_url(repo_url)
+            lines.append(f"#{pr_number} · https://github.com/{owner}/{repo}/pull/{pr_number}")
+        except ValueError:
+            lines.append(f"#{pr_number}")
+    elif pr_number:
+        lines.append(f"#{pr_number}")
+    else:
+        lines.append("_no PR opened_")
+    status_line = f"Status: {unit_status}"
+    if status_ts:
+        # Match the proposal § "Per-unit cycle log" example: `Status: merged
+        # (2026-05-15 14:32 UTC)`. ``last_activity`` is already UTC ISO-8601
+        # so we surface it verbatim and tag the timezone.
+        status_line += f" ({status_ts} UTC)"
+    lines.append(status_line)
+    head_sha = pr_info.get("headRefOid") or ""
+    lines.append(f"PR head SHA: {head_sha or '_unknown_'}")
+    return lines
+
+
+def _render_pr_description(pr_info: dict[str, Any]) -> list[str]:
+    body = (pr_info.get("body") or "").rstrip()
+    lines = ["## Coder's PR description (verbatim, as of last capture)"]
+    lines.append(body if body else "_unavailable_")
+    return lines
+
+
+def _render_cycle_history(
+    events: list[dict[str, Any]],
+    *,
+    unit_status: str = "",
+) -> list[str]:
+    rendered: list[dict[str, Any]] = []
+    for ev in events:
+        heading = _EVENT_HEADINGS.get(ev["event_type"])
+        if heading is None:
+            continue
+        rendered.append(
+            {
+                "cycle": ev.get("cycle_number") if ev.get("cycle_number") is not None else 0,
+                "heading": heading,
+                "summary": (ev.get("summary") or "").strip(),
+            }
+        )
+
+    cycle_count = max((r["cycle"] for r in rendered), default=0)
+    # "cap-3 hit" ⇔ the unit was escalated *because* the cap was reached.
+    # A unit that runs 3 cycles and is approved on cycle 3 has
+    # ``cycle_count == 3`` but the cap was NOT hit — see the proposal §
+    # "Per-unit cycle log" example, which renders that case as
+    # `3 cycles · cap-3 not hit`. The execution-side enforcement at
+    # ``review_round >= CAP_3`` only escalates when the *next* fix would
+    # exceed the cap, so unit_status is the authoritative signal.
+    cap_hit = unit_status == "escalated" and cycle_count >= 3
+    lines = ["## Cycle history"]
+    lines.append(f"{cycle_count} cycles · " + ("cap-3 hit" if cap_hit else "cap-3 not hit"))
+    if not rendered:
+        lines.append("")
+        lines.append("_no cycle events recorded_")
+        return lines
+
+    for entry in rendered:
+        lines.append("")
+        lines.append(f"### Cycle {entry['cycle']} — {entry['heading']}")
+        summary = entry["summary"] or "_no summary recorded_"
+        lines.append(f"- {summary}")
+    return lines
+
+
+def _tier_marker(body: str) -> str:
+    """Return the leading tier emoji if the comment starts with one."""
+    stripped = body.lstrip()
+    for marker in _REVIEW_TIER_PREFIX:
+        if stripped.startswith(marker):
+            return marker
+    return ""
+
+
+def _excerpt(body: str, limit: int = 160) -> str:
+    """Single-line, length-capped excerpt for the threads index."""
+    flat = " ".join(body.split())
+    return flat if len(flat) <= limit else flat[: limit - 1].rstrip() + "…"
+
+
+def _render_review_threads(threads: list[dict[str, Any]]) -> list[str]:
+    lines = ["## Review threads"]
+    if not threads:
+        lines.append("_no review threads_")
+        return lines
+    for t in threads:
+        marker = _tier_marker(t.get("body", ""))
+        path = t.get("path") or "(general)"
+        line_no = t.get("line")
+        loc = f"{path}:{line_no}" if line_no else path
+        url = t.get("url") or ""
+        excerpt = _excerpt(t.get("body", ""))
+        status_bits = []
+        if t.get("isResolved"):
+            status_bits.append("resolved")
+        if t.get("isOutdated"):
+            status_bits.append("outdated")
+        status = f" [{', '.join(status_bits)}]" if status_bits else ""
+        prefix = f"{marker} " if marker else ""
+        bullet = f"- {prefix}{loc}{status} — {excerpt}"
+        if url:
+            bullet += f" ({url})"
+        lines.append(bullet)
+    return lines
+
+
+def render_cycle_log(
+    unit_id: str,
+    *,
+    pr_info: dict[str, Any] | None = None,
+    review_threads: list[dict[str, Any]] | None = None,
+) -> str:
+    """Render the cycle-log markdown for ``unit_id`` from current state.
+
+    ``pr_info`` and ``review_threads`` come from
+    ``orchestrator.cycle_log_gh.fetch_pr_info`` /
+    ``fetch_review_threads`` in normal operation; pass them in directly
+    for tests or for an offline regenerate.
+    """
+    pr_info = pr_info or {}
+    review_threads = review_threads or []
+
+    unit_state = state.get_unit_state(unit_id)
+    feature_id = unit_state.feature_id if unit_state else _feature_id_from_unit_id(unit_id)
+    feature = state.get_feature(feature_id)
+    unit = _lookup_unit(unit_id, feature_id)
+
+    title = unit.title if unit else (pr_info.get("title") or "")
+    header = f"# {unit_id}" + (f" — {title}" if title else "")
+
+    blocks: list[list[str]] = [
+        [header],
+        _render_pr_section(
+            pr_info,
+            unit_state.pr_number if unit_state else None,
+            feature.repo_path if feature else "",
+            unit_state.status if unit_state else "unknown",
+            status_ts=unit_state.last_activity if unit_state else "",
+        ),
+        _render_pr_description(pr_info),
+        _render_cycle_history(
+            state.list_events(unit_id) if unit_state else [],
+            unit_status=unit_state.status if unit_state else "",
+        ),
+        _render_review_threads(review_threads),
+    ]
+    return "\n\n".join("\n".join(block) for block in blocks) + "\n"
+
+
+__all__ = [
+    "render_cycle_log",
+]
