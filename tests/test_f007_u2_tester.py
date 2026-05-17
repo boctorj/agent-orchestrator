@@ -151,16 +151,17 @@ def _clear_runs():
 
 class TestSignatureMatchesSpec:
     """The unit description names ``wait_for_result(pr_url, timeout=600)``
-    as the function signature. After PR #28 reviewer H1 (research against
-    https://code.claude.com/docs/en/ultrareview), the documented CLI
-    ``--timeout`` default is **30 minutes**, not 10 — a 600s wrapper
-    cap was below typical run time and SIGKILLed legitimate reviews
-    while their cloud-side session kept running and billing. The
-    wrapper default was bumped to 1800s so the wrapper-side cap
-    matches the CLI-side ``--timeout`` we forward; these signature
-    tests track the corrected number."""
+    as the function signature. PR #28 review M1 (this round) flagged
+    that the prior round's H1 fix silently drifted the signature
+    default to 1800. Resolution: ``DEFAULT_TIMEOUT_SECONDS=1800``
+    stays internal (used by ``trigger`` as the CLI ``--timeout``
+    default — keeps H1's cloud-side billing alignment), while
+    ``wait_for_result``'s param default tracks
+    :data:`SPEC_WAIT_TIMEOUT_SECONDS` (600 — the unit-description
+    literal). Real callers pass explicit timeouts to both functions;
+    these defaults exist as the documentation contract."""
 
-    def test_wait_for_result_default_timeout_matches_cli_default(self, monkeypatch) -> None:
+    def test_wait_for_result_default_timeout_matches_spec_literal(self, monkeypatch) -> None:
         # Snapshot the signature against a freshly-reloaded module with
         # the env knob explicitly unset, so a developer who happens to
         # have ULTRAREVIEW_TIMEOUT_SECONDS set in their shell doesn't
@@ -172,21 +173,25 @@ class TestSignatureMatchesSpec:
         try:
             sig = inspect.signature(ultrareview.wait_for_result)
             default = sig.parameters["timeout"].default
-            assert default == 1800, (
-                f"wrapper-side timeout must align with the CLI's documented "
-                f"30-min --timeout default (reviewer H1); signature reads "
-                f"timeout={default!r}"
+            assert default == 600, (
+                f"wait_for_result default tracks the unit-description literal "
+                f"(timeout=600); signature reads timeout={default!r}"
             )
         finally:
             importlib.reload(ultrareview)
 
     def test_default_timeout_constant_matches_cli_default(self, monkeypatch) -> None:
+        """``DEFAULT_TIMEOUT_SECONDS`` is the trigger-side default the
+        CLI's own ``--timeout`` is pinned to — aligned with the CLI's
+        documented 30-min default (reviewer H1 from the prior round).
+        Distinct from the wait-side spec default of 600."""
         monkeypatch.delenv("ULTRAREVIEW_TIMEOUT_SECONDS", raising=False)
         import importlib
 
         importlib.reload(ultrareview)
         try:
             assert ultrareview.DEFAULT_TIMEOUT_SECONDS == 1800
+            assert ultrareview.SPEC_WAIT_TIMEOUT_SECONDS == 600
         finally:
             importlib.reload(ultrareview)
 
@@ -243,7 +248,11 @@ class TestReturnShape:
         )
 
     def test_pass_shape_is_exact(self) -> None:
-        r = self._wait(_FakePopen([0], stdout="ok\n"))
+        # Per H1 (this round): use a bugs.json envelope, not bare "ok",
+        # so the "pass" name reflects the actual passing path
+        # (rc==0 + parseable + zero bugs) rather than the fail-closed
+        # sentinel path.
+        r = self._wait(_FakePopen([0], stdout='{"bugs": []}'))
         assert set(r.keys()) == {"passed", "findings"}, (
             f"return dict must have exactly two keys; got {sorted(r.keys())!r}"
         )
@@ -257,7 +266,10 @@ class TestReturnShape:
         assert set(r.keys()) == {"passed", "findings"}
 
     def test_passed_is_real_bool_on_pass(self) -> None:
-        r = self._wait(_FakePopen([0], stdout="ok"))
+        # Per H1 (this round): the actual passing case is a parseable
+        # bugs.json envelope with no entries — not bare "ok" stdout
+        # (which now correctly fails closed as a sentinel finding).
+        r = self._wait(_FakePopen([0], stdout='{"bugs": []}'))
         # `bool` is a subclass of `int`; assertion must be strict.
         assert r["passed"] is True
         assert type(r["passed"]) is bool, (
@@ -270,7 +282,7 @@ class TestReturnShape:
         assert type(r["passed"]) is bool
 
     def test_findings_is_real_list_not_tuple(self) -> None:
-        r = self._wait(_FakePopen([0], stdout="a\nb\n"))
+        r = self._wait(_FakePopen([0], stdout='{"bugs": []}'))
         assert type(r["findings"]) is list, (
             f"`findings` must be a list (callers mutate / append); got {type(r['findings'])!r}"
         )
@@ -287,7 +299,7 @@ class TestReturnShape:
         """The module captures stderr internally but must NOT surface it
         as a public key. Adding it later is a non-breaking change; having
         it accidentally already is a confusing public contract."""
-        r = self._wait(_FakePopen([0], stdout="ok", stderr="progress: 12%\n"))
+        r = self._wait(_FakePopen([0], stdout='{"bugs": []}', stderr="progress: 12%\n"))
         assert "stderr" not in r
         assert "elapsed" not in r
         assert "returncode" not in r

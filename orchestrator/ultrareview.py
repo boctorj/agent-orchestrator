@@ -45,17 +45,30 @@ found nothing." ``rc != 0`` means "the review never produced a
 verdict" — also ``passed = False``, but for a different reason. The
 caller (cycle_review) treats both as "do not emit ready-to-merge."
 
+The gate **fails closed**: rc==0 with stdout we can't parse (non-JSON,
+or JSON without the expected ``bugs`` key) flips ``passed`` to False
+via a sentinel finding. Schema drift / CLI variants should block
+ready-to-merge, not silently endorse it. See :func:`_parse_bugs`.
+
 Timeouts
 --------
 
 The CLI's own ``--timeout`` flag defaults to 30 minutes (per the docs).
-We default the wrapper to match (:data:`DEFAULT_TIMEOUT_SECONDS` =
-1800) and forward ``--timeout <minutes>`` to the CLI at trigger time
-so an early wrapper SIGKILL also stops the cloud-side session (which
-would otherwise keep running — and billing — until the CLI's own timer
-fires). A caller that wants a tighter local cap can still pass a
-smaller ``timeout=`` to :func:`wait_for_result`; the wrapper-side
-SIGKILL fires first in that case.
+The wrapper has two timeout knobs that must be passed the same value
+for the cloud-side and wrapper-side timers to fire together:
+
+* :func:`trigger` ``timeout_seconds`` — forwarded as ``--timeout
+  <minutes>`` to the CLI. Defaults to :data:`DEFAULT_TIMEOUT_SECONDS`
+  (1800s = 30 min, the CLI's own default).
+* :func:`wait_for_result` ``timeout`` — wrapper-side SIGKILL cap.
+  Defaults to :data:`SPEC_WAIT_TIMEOUT_SECONDS` (600s; matches the
+  unit description's literal ``timeout=600``).
+
+When the two values diverge — e.g. caller uses both defaults — the
+wrapper SIGKILLs at the smaller value but the cloud-side session
+keeps running and billing until the CLI's own timer fires. Real
+callers (cycle_review wiring) should pass the same explicit value to
+both functions.
 
 Surface
 -------
@@ -92,13 +105,22 @@ from typing import Any
 
 # --------------------------- defaults ---------------------------
 
-# Total wall-clock cap on one ultrareview run. Aligned with the CLI's
-# own ``--timeout`` default of 30 minutes (per
-# https://code.claude.com/docs/en/ultrareview) so wrapper-side and
-# cloud-side timers fire together; the previous 600s default was below
-# typical run time and SIGKILLed the wrapper while the cloud session
-# kept running (and billing) until the CLI's own 30-min timer.
+# Wrapper-side wall-clock cap. The unit description names
+# ``wait_for_result(pr_url, timeout=600)`` so the function default
+# matches that literal (see :func:`wait_for_result`); this module
+# constant — overridable via ``ULTRAREVIEW_TIMEOUT_SECONDS`` — is the
+# upper-bound *trigger* default the CLI's own ``--timeout`` flag is
+# pinned to when the caller doesn't override. The CLI's documented
+# default is 30 minutes (per https://code.claude.com/docs/en/ultrareview).
 DEFAULT_TIMEOUT_SECONDS = int(os.getenv("ULTRAREVIEW_TIMEOUT_SECONDS", "1800"))
+
+# Default for the wrapper-side ``wait_for_result(timeout=...)`` parameter.
+# Matches the unit-description literal ``timeout=600``. Real callers
+# (cycle_review wiring) should pass an explicit value to both
+# :func:`trigger` and :func:`wait_for_result` so wrapper-side and
+# cloud-side timers fire together; this default exists only as a
+# documentation contract.
+SPEC_WAIT_TIMEOUT_SECONDS = 600
 
 # Poll interval while waiting. Long enough that we don't spin the CPU on
 # a multi-minute run, short enough that the orchestrator reacts within
@@ -109,7 +131,11 @@ DEFAULT_POLL_INTERVAL_SECONDS = int(os.getenv("ULTRAREVIEW_POLL_INTERVAL", "5"))
 # install; override via env for sandboxed deployments or test stubs.
 ULTRAREVIEW_CLI = os.getenv("ULTRAREVIEW_CLI", "claude")
 
-_PR_URL_RE = re.compile(r"^https?://github\.com/([\w.-]+)/([\w.-]+?)/pull/(\d+)(?:/|$)")
+# Tolerates trailing slash, path suffixes (``/files``, ``/commits``),
+# query strings (``?w=1``), and fragments (``#issuecomment-…``). The
+# captured PR number is enough; whatever follows it is URL structural
+# noise the canonicalizer drops.
+_PR_URL_RE = re.compile(r"^https?://github\.com/([\w.-]+)/([\w.-]+?)/pull/(\d+)(?:[/?#]|$)")
 
 
 # --------------------------- internal state ---------------------------
@@ -144,6 +170,7 @@ _runs: dict[str, _RunHandle] = {}
 def trigger(
     pr_url: str,
     *,
+    timeout_seconds: int | None = None,
     spawn: Callable[[list[str]], Any] | None = None,
 ) -> None:
     """Start an ultrareview run for the PR identified by ``pr_url``.
@@ -154,8 +181,17 @@ def trigger(
 
     Args:
         pr_url: full ``https://github.com/owner/repo/pull/N`` URL.
-            Trailing slashes and ``/files``-style suffixes are
-            tolerated; the registry is keyed on a canonical form.
+            Trailing slashes, path suffixes (``/files``), query strings
+            (``?w=1``), and fragments are tolerated; the registry is
+            keyed on a canonical form.
+        timeout_seconds: the *same* timeout the caller will eventually
+            pass to :func:`wait_for_result`. Forwarded as
+            ``--timeout <minutes>`` so wrapper-side and cloud-side
+            timers fire together — without this, a caller-tightened
+            wait timeout SIGKILLs the local subprocess while the
+            cloud session keeps running (and billing) until the CLI's
+            own ``--timeout`` elapses. Defaults to
+            :data:`DEFAULT_TIMEOUT_SECONDS`.
         spawn: injection point for tests. Takes the argv list and
             returns a Popen-shaped object. Defaults to
             :func:`_default_spawn`.
@@ -165,6 +201,7 @@ def trigger(
     """
     canonical, pr_number = _canonical_pr_url(pr_url)
     spawner = spawn if spawn is not None else _default_spawn
+    effective_timeout = DEFAULT_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
     argv = [
         ULTRAREVIEW_CLI,
         "ultrareview",
@@ -175,9 +212,10 @@ def trigger(
         "--json",
         # Align the CLI's internal timer with the wrapper-side cap so
         # an early wrapper SIGKILL also stops the cloud session and
-        # stops billing. Minutes, per the CLI's flag spec.
+        # stops billing. Minutes, per the CLI's flag spec — rounded up
+        # so sub-minute caller timeouts still produce a valid value.
         "--timeout",
-        str(max(1, DEFAULT_TIMEOUT_SECONDS // 60)),
+        str(max(1, (effective_timeout + 59) // 60)),
     ]
     process = spawner(argv)
     _runs[canonical] = _RunHandle(
@@ -189,7 +227,7 @@ def trigger(
 
 def wait_for_result(
     pr_url: str,
-    timeout: int | None = DEFAULT_TIMEOUT_SECONDS,
+    timeout: int | None = SPEC_WAIT_TIMEOUT_SECONDS,
     *,
     poll_interval_seconds: int | None = None,
     sleep: Callable[[float], None] = time.sleep,
@@ -200,9 +238,11 @@ def wait_for_result(
     Args:
         pr_url: same URL passed to :func:`trigger` (URL-spelling
             tolerated — canonicalized to match the registry).
-        timeout: seconds to wait before giving up. ``None`` uses
-            :data:`DEFAULT_TIMEOUT_SECONDS` (30 min — matches the
-            CLI's own default).
+        timeout: seconds to wait before giving up. Defaults to
+            :data:`SPEC_WAIT_TIMEOUT_SECONDS` (600 — the unit-description
+            literal). Pass ``None`` to use the same value internally.
+            For aligned wrapper/cloud timers, pass the same value to
+            :func:`trigger` via its ``timeout_seconds`` kwarg.
         poll_interval_seconds: poll cadence. Defaults to env /
             :data:`DEFAULT_POLL_INTERVAL_SECONDS`.
         sleep / now: injection points for tests.
@@ -211,11 +251,13 @@ def wait_for_result(
         ``{"passed": bool, "findings": list[str]}`` where:
 
         * ``passed`` is ``True`` iff the subprocess exited 0 *and* the
-          parsed ``bugs.json`` payload contained zero bugs.
+          parsed ``bugs.json`` payload contained zero bugs. The gate
+          fails *closed* on rc==0 with unparseable / schema-drifted
+          stdout — see :func:`_parse_bugs`.
         * ``findings`` is a list of human-rendered bug entries
-          (``"path:line — summary"``). Empty on a clean review and on
-          timeouts (where the synthetic ``"[timeout after Ns]"`` entry
-          is the only contents).
+          (``"path:line — summary"``). Carries sentinel entries on
+          schema drift (``"[ultrareview …]"``) and on timeout
+          (``"[timeout after Ns]"``).
 
     Raises:
         RuntimeError: if no prior :func:`trigger` was issued for this URL.
@@ -225,7 +267,7 @@ def wait_for_result(
     if handle is None:
         raise RuntimeError(f"no ultrareview run registered for {pr_url!r}; call trigger() first")
 
-    timeout_seconds = DEFAULT_TIMEOUT_SECONDS if timeout is None else timeout
+    timeout_seconds = SPEC_WAIT_TIMEOUT_SECONDS if timeout is None else timeout
     poll = DEFAULT_POLL_INTERVAL_SECONDS if poll_interval_seconds is None else poll_interval_seconds
 
     start = now()
@@ -303,19 +345,32 @@ def _interpret(returncode: int, stdout: str) -> dict[str, Any]:
 def _parse_bugs(stdout: str, *, completed: bool) -> list[str]:
     """Render the ``bugs.json`` payload on stdout into a list of findings.
 
-    Returns one human-readable string per bug entry. The ``completed``
-    flag carries the rc==0 bit so we handle the two failure modes
-    differently:
+    The gate **fails closed** on the rc==0 path: a buggy PR whose
+    ultrareview run produces unparseable or schema-drifted stdout
+    surfaces a sentinel finding, which flips
+    :func:`_interpret`'s ``passed`` bit to ``False``. That's the
+    direction a safety gate must default to — endorsing a merge based
+    on output we couldn't read is the case this module exists to
+    prevent.
 
-    * ``completed=True`` (rc == 0): the CLI is supposed to emit
-      ``bugs.json`` because we passed ``--json``. If stdout is empty or
-      unparseable, treat as "no parseable bugs" so a CLI-variant
-      mismatch doesn't accidentally flip the gate to ``passed=False``.
-    * ``completed=False`` (rc != 0): the review never produced a
-      verdict. ``passed`` is already False via the rc half of
-      :func:`_interpret`'s decision; surface any stdout text as a
-      finding entry so the operator sees what happened (rate-limit
-      banner, session crash message, etc.).
+    Three rc==0 branches:
+
+    * **Empty stdout** → ``[]``. The CLI shipping no bugs.json at all
+      is the only "trust the completion bit" path; ``passed=True``
+      lands here.
+    * **Non-JSON stdout** → one sentinel finding wrapping the raw
+      output (``"[ultrareview output not parseable as JSON: …]"``).
+      The operator sees what the CLI actually emitted so they can
+      decide what to do.
+    * **JSON dict without the ``bugs`` key** → one sentinel finding
+      (``"[ultrareview output schema unrecognized: keys=…]"``). The
+      research-preview schema may rename ``bugs`` to ``findings`` /
+      ``results`` / etc.; we'd rather block and surface the schema
+      than silently treat a missing key as "no bugs."
+
+    On the rc != 0 path (``completed=False``) the gate is already
+    closed via rc; non-JSON output is still surfaced as a finding so
+    operators see error banners.
     """
     text = stdout.strip()
     if not text:
@@ -323,16 +378,22 @@ def _parse_bugs(stdout: str, *, completed: bool) -> list[str]:
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        return [] if completed else [text]
+        if not completed:
+            return [text]
+        # Truncate the raw text so a huge non-JSON dump doesn't
+        # balloon the surfaced finding — the operator just needs
+        # enough context to debug.
+        snippet = text if len(text) <= 500 else text[:500] + "…"
+        return [f"[ultrareview output not parseable as JSON: {snippet}]"]
 
+    if isinstance(data, list):
+        return [_format_bug(b) for b in data]
     if isinstance(data, dict):
-        bugs = data.get("bugs", [])
-    elif isinstance(data, list):
-        bugs = data
-    else:
-        return [json.dumps(data, sort_keys=True)]
-
-    return [_format_bug(b) for b in bugs]
+        if "bugs" not in data:
+            keys = sorted(data.keys())
+            return [f"[ultrareview output schema unrecognized: keys={keys}]"]
+        return [_format_bug(b) for b in data.get("bugs", [])]
+    return [json.dumps(data, sort_keys=True)]
 
 
 def _format_bug(bug: Any) -> str:
@@ -381,6 +442,7 @@ def _kill_and_reap(process: Any) -> None:
 __all__ = [
     "DEFAULT_POLL_INTERVAL_SECONDS",
     "DEFAULT_TIMEOUT_SECONDS",
+    "SPEC_WAIT_TIMEOUT_SECONDS",
     "ULTRAREVIEW_CLI",
     "trigger",
     "wait_for_result",

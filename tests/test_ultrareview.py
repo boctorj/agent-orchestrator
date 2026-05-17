@@ -152,6 +152,29 @@ class TestCanonicalPrUrl:
         with pytest.raises(ValueError):
             ultrareview._canonical_pr_url("not-a-url")
 
+    def test_query_string_normalized(self):
+        """GitHub's UI hands users URLs like ``…/pull/42?w=1`` (whitespace
+        diff toggle); the canonicalizer must strip the query string."""
+        canonical, n = ultrareview._canonical_pr_url("https://github.com/o/r/pull/42?w=1")
+        assert canonical == "https://github.com/o/r/pull/42"
+        assert n == 42
+
+    def test_fragment_normalized(self):
+        """``…/pull/42#issuecomment-1234`` is the form deep-linking a
+        specific comment hands you."""
+        canonical, n = ultrareview._canonical_pr_url(
+            "https://github.com/o/r/pull/42#issuecomment-1234"
+        )
+        assert canonical == "https://github.com/o/r/pull/42"
+        assert n == 42
+
+    def test_path_then_query_normalized(self):
+        canonical, n = ultrareview._canonical_pr_url(
+            "https://github.com/o/r/pull/42/files?diff=split"
+        )
+        assert canonical == "https://github.com/o/r/pull/42"
+        assert n == 42
+
 
 # --------------------------- trigger() ---------------------------
 
@@ -237,6 +260,43 @@ class TestTrigger:
         finally:
             monkeypatch.delenv("ULTRAREVIEW_CLI", raising=False)
             importlib.reload(ultrareview)
+
+    def test_caller_supplied_timeout_forwarded_to_cli(self):
+        """Per M2: a caller-tightened ``timeout_seconds`` must flow into
+        the CLI's ``--timeout`` so wrapper-side SIGKILL and cloud-side
+        cap fire together (no billing leak)."""
+        proc = FakePopen([None])
+        ultrareview.trigger(
+            "https://github.com/o/r/pull/7",
+            timeout_seconds=120,  # 2 minutes
+            spawn=_scripted_spawn(proc),
+        )
+        assert proc.argv is not None
+        idx = proc.argv.index("--timeout")
+        assert int(proc.argv[idx + 1]) == 2
+
+    def test_caller_supplied_sub_minute_timeout_rounds_up(self):
+        """Sub-minute caller timeouts still produce a valid ``--timeout``;
+        rounding up means the CLI doesn't kill earlier than the wrapper."""
+        proc = FakePopen([None])
+        ultrareview.trigger(
+            "https://github.com/o/r/pull/7",
+            timeout_seconds=30,
+            spawn=_scripted_spawn(proc),
+        )
+        assert proc.argv is not None
+        idx = proc.argv.index("--timeout")
+        assert int(proc.argv[idx + 1]) == 1
+
+    def test_default_trigger_timeout_uses_module_default(self):
+        """Caller omits ``timeout_seconds`` → trigger uses
+        ``DEFAULT_TIMEOUT_SECONDS`` (the CLI's documented 30-min default).
+        Distinct from wait_for_result's 600s spec default."""
+        proc = FakePopen([None])
+        ultrareview.trigger("https://github.com/o/r/pull/7", spawn=_scripted_spawn(proc))
+        assert proc.argv is not None
+        idx = proc.argv.index("--timeout")
+        assert int(proc.argv[idx + 1]) == ultrareview.DEFAULT_TIMEOUT_SECONDS // 60
 
 
 # --------------------------- wait_for_result(): passed ---------------------------
@@ -547,6 +607,95 @@ class TestParallelRuns:
         assert rb["passed"] is False
         assert ra["findings"] == []
         assert rb["findings"] == ["core.py:1 — B"]
+
+
+# --------------------------- fail-closed: schema drift / unparseable JSON ---------------------------
+
+
+class TestFailClosedOnRcZero:
+    """Per reviewer H1 (this round), the safety gate must fail *closed*
+    on rc==0 when stdout is unparseable or schema-drifted. Endorsing
+    a merge based on output we couldn't read is exactly the case this
+    module exists to prevent."""
+
+    def test_rc0_with_non_json_stdout_blocks_merge(self):
+        """A CLI error banner / non-JSON dump on rc==0 must surface as
+        a sentinel finding so ``passed`` flips to False."""
+        proc = FakePopen([0], stdout="ERROR: CLI failed to emit bugs.json\n")
+        ultrareview.trigger("https://github.com/o/r/pull/9", spawn=_scripted_spawn(proc))
+        clock = FakeClock(step=0)
+        r = ultrareview.wait_for_result(
+            "https://github.com/o/r/pull/9",
+            timeout=10,
+            poll_interval_seconds=1,
+            sleep=clock.sleep,
+            now=clock.now,
+        )
+        assert r["passed"] is False, (
+            "rc==0 + unparseable stdout must NOT be treated as 'no bugs' — "
+            "the gate has to fail closed, not silently endorse"
+        )
+        assert len(r["findings"]) == 1
+        assert "not parseable" in r["findings"][0]
+        assert "ERROR" in r["findings"][0]
+
+    def test_rc0_with_schema_drift_blocks_merge(self):
+        """If the bugs.json schema renames ``bugs`` to ``findings`` /
+        ``results`` / etc., the gate must NOT treat the missing key as
+        ``len(bugs) == 0``."""
+        drifted = json.dumps({"findings": [{"path": "x.py", "line": 1, "summary": "hidden bug"}]})
+        proc = FakePopen([0], stdout=drifted)
+        ultrareview.trigger("https://github.com/o/r/pull/9", spawn=_scripted_spawn(proc))
+        clock = FakeClock(step=0)
+        r = ultrareview.wait_for_result(
+            "https://github.com/o/r/pull/9",
+            timeout=10,
+            poll_interval_seconds=1,
+            sleep=clock.sleep,
+            now=clock.now,
+        )
+        assert r["passed"] is False, (
+            "rc==0 + JSON dict missing 'bugs' key must NOT silently flip "
+            "passed=True; surface the schema mismatch so it can be debugged"
+        )
+        assert len(r["findings"]) == 1
+        assert "schema unrecognized" in r["findings"][0]
+        assert "findings" in r["findings"][0]  # the actual key found
+
+    def test_rc0_with_huge_non_json_truncates(self):
+        """A non-JSON dump 10x the size of the snippet cap doesn't
+        balloon the surfaced finding."""
+        huge = "X" * 5000
+        proc = FakePopen([0], stdout=huge)
+        ultrareview.trigger("https://github.com/o/r/pull/9", spawn=_scripted_spawn(proc))
+        clock = FakeClock(step=0)
+        r = ultrareview.wait_for_result(
+            "https://github.com/o/r/pull/9",
+            timeout=10,
+            poll_interval_seconds=1,
+            sleep=clock.sleep,
+            now=clock.now,
+        )
+        assert r["passed"] is False
+        # One finding entry; truncated with an ellipsis marker.
+        assert len(r["findings"]) == 1
+        assert "…" in r["findings"][0]
+        assert len(r["findings"][0]) < 1000
+
+    def test_rc0_empty_stdout_still_passes(self):
+        """Empty stdout is the ONE 'trust the completion bit' path —
+        the CLI may not emit bugs.json at all on a clean review."""
+        proc = FakePopen([0], stdout="")
+        ultrareview.trigger("https://github.com/o/r/pull/9", spawn=_scripted_spawn(proc))
+        clock = FakeClock(step=0)
+        r = ultrareview.wait_for_result(
+            "https://github.com/o/r/pull/9",
+            timeout=10,
+            poll_interval_seconds=1,
+            sleep=clock.sleep,
+            now=clock.now,
+        )
+        assert r == {"passed": True, "findings": []}
 
 
 # --------------------------- default-spawn argv shape ---------------------------
