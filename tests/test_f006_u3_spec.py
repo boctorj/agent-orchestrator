@@ -124,6 +124,138 @@ def _seed_coded_unit(
     )
 
 
+def _stub_tests_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub spawn_tester to return TESTS_PASS and record the matching
+    state events the real implementation would record.
+
+    cycle_review's terminal hook re-renders from ``state.list_events``;
+    a stub that returned JSON without persisting events would leave the
+    cycle log empty and our content assertions would never fire.
+    """
+
+    def _spawn_tester(feature_id: str, unit_id: str) -> str:
+        unit_state = state.get_unit_state(unit_id)
+        state.touch_unit(unit_id, status="in_ci")
+        state.record_event(
+            unit_id,
+            unit_state.feature_id if unit_state else feature_id,
+            "tests_pass",
+            source="tester",
+            cycle_number=unit_state.review_round if unit_state else 0,
+            summary="All tests pass",
+        )
+        return json.dumps({"unit_id": unit_id, "outcome": "TESTS_PASS", "session_id": "t"})
+
+    monkeypatch.setattr(execution, "spawn_tester", _spawn_tester)
+
+
+def _stub_tester_blocked(monkeypatch: pytest.MonkeyPatch, reason: str = "spec ambiguous") -> None:
+    def _spawn_tester(feature_id: str, unit_id: str) -> str:
+        unit_state = state.get_unit_state(unit_id)
+        state.touch_unit(unit_id, status="escalated", error=f"Tester BLOCKED: {reason}")
+        state.record_event(
+            unit_id,
+            unit_state.feature_id if unit_state else feature_id,
+            "tester_blocked",
+            source="tester",
+            cycle_number=unit_state.review_round if unit_state else 0,
+            summary=reason,
+        )
+        return f"BLOCKED — tester for U: {reason}"
+
+    monkeypatch.setattr(execution, "spawn_tester", _spawn_tester)
+
+
+def _stub_tester_bug_then_pass(monkeypatch: pytest.MonkeyPatch, bug: str = "x") -> None:
+    """Tester returns BUG_FOUND on every call (cap-3 driver)."""
+
+    def _spawn_tester(feature_id: str, unit_id: str) -> str:
+        unit_state = state.get_unit_state(unit_id)
+        state.record_event(
+            unit_id,
+            unit_state.feature_id if unit_state else feature_id,
+            "tester_bug_found",
+            source="tester",
+            cycle_number=unit_state.review_round if unit_state else 0,
+            summary=bug,
+        )
+        return json.dumps({"unit_id": unit_id, "outcome": "BUG_FOUND", "bug": bug})
+
+    monkeypatch.setattr(execution, "spawn_tester", _spawn_tester)
+
+
+def _stub_reviewer_recommend_merge(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _spawn_reviewer(feature_id: str, unit_id: str) -> str:
+        unit_state = state.get_unit_state(unit_id)
+        state.touch_unit(unit_id, status="in_ci")
+        state.record_event(
+            unit_id,
+            unit_state.feature_id if unit_state else feature_id,
+            "reviewer_recommend_merge",
+            source="reviewer",
+            cycle_number=unit_state.review_round if unit_state else 0,
+            summary="endorsed",
+        )
+        return json.dumps({"unit_id": unit_id, "outcome": "REVIEW_RECOMMEND_MERGE", "reason": "OK"})
+
+    monkeypatch.setattr(execution, "spawn_reviewer", _spawn_reviewer)
+
+
+def _stub_reviewer_comment(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _spawn_reviewer(feature_id: str, unit_id: str) -> str:
+        unit_state = state.get_unit_state(unit_id)
+        state.touch_unit(unit_id, status="in_ci")
+        state.record_event(
+            unit_id,
+            unit_state.feature_id if unit_state else feature_id,
+            "reviewer_comment",
+            source="reviewer",
+            cycle_number=unit_state.review_round if unit_state else 0,
+            summary="Comment-only review",
+        )
+        return json.dumps({"unit_id": unit_id, "outcome": "REVIEW_COMMENT"})
+
+    monkeypatch.setattr(execution, "spawn_reviewer", _spawn_reviewer)
+
+
+def _stub_reviewer_blocked(
+    monkeypatch: pytest.MonkeyPatch, reason: str = "cannot reach repo"
+) -> None:
+    def _spawn_reviewer(feature_id: str, unit_id: str) -> str:
+        unit_state = state.get_unit_state(unit_id)
+        state.touch_unit(unit_id, status="escalated", error=f"Reviewer BLOCKED: {reason}")
+        state.record_event(
+            unit_id,
+            unit_state.feature_id if unit_state else feature_id,
+            "reviewer_blocked",
+            source="reviewer",
+            cycle_number=unit_state.review_round if unit_state else 0,
+            summary=reason,
+        )
+        return f"BLOCKED — reviewer for U: {reason}"
+
+    monkeypatch.setattr(execution, "spawn_reviewer", _spawn_reviewer)
+
+
+def _stub_address_review_fix_pushed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub address_review to mimic FIX_PUSHED + the matching state event."""
+
+    def _address_review(unit_id: str, source: str, feedback: str) -> str:
+        round_num = state.increment_review_round(unit_id)
+        unit_state = state.get_unit_state(unit_id)
+        state.record_event(
+            unit_id,
+            unit_state.feature_id if unit_state else "",
+            "fix_pushed",
+            source="coder",
+            cycle_number=round_num,
+            summary="Fix committed and pushed",
+        )
+        return json.dumps({"outcome": "FIX_PUSHED", "cycle": round_num})
+
+    monkeypatch.setattr(execution, "address_review", _address_review)
+
+
 @pytest.fixture(autouse=True)
 def _ci_green(monkeypatch: pytest.MonkeyPatch) -> None:
     """All CI gates pass synchronously — the cycle log machinery is what
@@ -204,25 +336,20 @@ class TestTerminalReviewRecommendMerge:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         _seed_coded_unit()
-        monkeypatch.setattr(
-            execution,
-            "spawn_tester",
-            lambda f, u: json.dumps({"unit_id": u, "outcome": "TESTS_PASS"}),
-        )
-        monkeypatch.setattr(
-            execution,
-            "spawn_reviewer",
-            lambda f, u: json.dumps(
-                {"unit_id": u, "outcome": "REVIEW_RECOMMEND_MERGE", "reason": "OK"}
-            ),
-        )
+        _stub_tests_pass(monkeypatch)
+        _stub_reviewer_recommend_merge(monkeypatch)
 
         execution.cycle_review("F-001", "F-001-U-1")
 
         log_path = tmp_state_db.parent / "features" / "F-001" / "U-1.md"
         assert log_path.is_file(), "cycle log must exist after REVIEW_RECOMMEND_MERGE terminal"
         body = log_path.read_text(encoding="utf-8")
+        # Content reflects the terminal that fired (L2): header +
+        # cycle-history heading for the reviewer's recommend-merge
+        # outcome + tester pass.
         assert body.startswith("# F-001-U-1"), body[:80]
+        assert "reviewer: REVIEW_RECOMMEND_MERGE" in body
+        assert "tester: TESTS_PASS" in body
 
 
 # =============================================================================
@@ -239,21 +366,18 @@ class TestTerminalReviewComment:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         _seed_coded_unit()
-        monkeypatch.setattr(
-            execution,
-            "spawn_tester",
-            lambda f, u: json.dumps({"unit_id": u, "outcome": "TESTS_PASS"}),
-        )
-        monkeypatch.setattr(
-            execution,
-            "spawn_reviewer",
-            lambda f, u: json.dumps({"unit_id": u, "outcome": "REVIEW_COMMENT"}),
-        )
+        _stub_tests_pass(monkeypatch)
+        _stub_reviewer_comment(monkeypatch)
 
         execution.cycle_review("F-001", "F-001-U-1")
 
         log_path = tmp_state_db.parent / "features" / "F-001" / "U-1.md"
         assert log_path.is_file(), "cycle log must exist after REVIEW_COMMENT terminal"
+        body = log_path.read_text(encoding="utf-8")
+        assert "reviewer: REVIEW_COMMENT" in body
+        # Status row reflects the in_ci terminal (reviewer-comment is a
+        # success branch — unit stays in_ci awaiting merge).
+        assert "Status: in_ci" in body
 
 
 # =============================================================================
@@ -274,16 +398,18 @@ class TestEscalationTerminals:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         _seed_coded_unit()
-        monkeypatch.setattr(
-            execution,
-            "spawn_tester",
-            lambda f, u: "BLOCKED — tester for U: spec ambiguous",
-        )
+        _stub_tester_blocked(monkeypatch, reason="spec ambiguous")
 
         execution.cycle_review("F-001", "F-001-U-1")
 
         log_path = tmp_state_db.parent / "features" / "F-001" / "U-1.md"
         assert log_path.is_file(), "cycle log must exist after tester-blocked escalation"
+        body = log_path.read_text(encoding="utf-8")
+        # Content reflects the escalated terminal — status row carries
+        # ``escalated`` and the tester's BLOCKED event lands in cycle
+        # history.
+        assert "Status: escalated" in body
+        assert "tester: BLOCKED" in body
 
     def test_reviewer_blocked_writes_cycle_log(
         self,
@@ -293,21 +419,17 @@ class TestEscalationTerminals:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         _seed_coded_unit()
-        monkeypatch.setattr(
-            execution,
-            "spawn_tester",
-            lambda f, u: json.dumps({"unit_id": u, "outcome": "TESTS_PASS"}),
-        )
-        monkeypatch.setattr(
-            execution,
-            "spawn_reviewer",
-            lambda f, u: "BLOCKED — reviewer for U: cannot reach repo",
-        )
+        _stub_tests_pass(monkeypatch)
+        _stub_reviewer_blocked(monkeypatch)
 
         execution.cycle_review("F-001", "F-001-U-1")
 
         log_path = tmp_state_db.parent / "features" / "F-001" / "U-1.md"
         assert log_path.is_file(), "cycle log must exist after reviewer-blocked escalation"
+        body = log_path.read_text(encoding="utf-8")
+        assert "Status: escalated" in body
+        assert "reviewer: BLOCKED" in body
+        assert "tester: TESTS_PASS" in body  # tester ran cleanly before reviewer blocked
 
     def test_cap_3_escalation_writes_cycle_log(
         self,
@@ -317,23 +439,24 @@ class TestEscalationTerminals:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         _seed_coded_unit()
-        monkeypatch.setattr(
-            execution,
-            "spawn_tester",
-            lambda f, u: json.dumps({"unit_id": u, "outcome": "BUG_FOUND", "bug": "x"}),
-        )
-
-        def fake_address_review(uid: str, src: str, fb: str) -> str:
-            state.increment_review_round(uid)
-            return json.dumps({"outcome": "FIX_PUSHED", "cycle": 1})
-
-        monkeypatch.setattr(execution, "address_review", fake_address_review)
+        _stub_tester_bug_then_pass(monkeypatch, bug="x")
+        _stub_address_review_fix_pushed(monkeypatch)
 
         out = execution.cycle_review("F-001", "F-001-U-1")
         parsed = json.loads(out)
         assert parsed["outcome"] == "escalated"
         log_path = tmp_state_db.parent / "features" / "F-001" / "U-1.md"
         assert log_path.is_file(), "cycle log must exist after cap-3 escalation"
+        body = log_path.read_text(encoding="utf-8")
+        # cap-3 escalation: ≥3 fix cycles, BUG_FOUND + FIX_PUSHED events.
+        # Note: unit status stays at the value the stubs set (in_ci here);
+        # the escalation flag lives in ``cycle_review``'s return JSON
+        # rather than ``work_units.status`` since cycle_review never
+        # writes status="escalated" itself — its callers (spawn_tester /
+        # spawn_reviewer BLOCKED paths) do. Cap-3 escalation is a pure
+        # cycle_review-level outcome and the stubs control state.
+        assert "tester: BUG_FOUND" in body
+        assert "coder fix: FIX_PUSHED" in body
 
 
 # =============================================================================
@@ -757,3 +880,223 @@ class TestCycleLogWriterIsolation:
         assert parsed["outcome"] == "approved_awaiting_merge", (
             "cycle_review must still terminate cleanly when the cycle-log writer raises"
         )
+
+
+# =============================================================================
+# 9. H1 regression — null→populated merge_commit_sha race must catch up
+# =============================================================================
+
+
+class TestMergeShaRaceCatchUp:
+    """GitHub populates ``merge_commit_sha`` asynchronously after a merge.
+    The first ``check_unit_pr`` after a merge can see ``merged=True`` with
+    ``merge_commit_sha=None``; a poll seconds later catches the populated
+    value. Before the H1 fix the second poll was gated out by the
+    ``unit_state.status != 'done'`` precondition and the backfill silently
+    failed forever.
+    """
+
+    def test_second_poll_backfills_when_sha_arrives_after_status_flip(
+        self,
+        tmp_state_db: Path,
+        with_github_token: None,
+        _stub_subprocess: _Runner,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _seed_feature()
+        state.upsert_unit_state(
+            WorkUnitState(
+                unit_id="F-001-U-1",
+                feature_id="F-001",
+                status="in_ci",
+                pr_number=42,
+                coder_session_id="sesn",
+            )
+        )
+
+        pr_state_seq = iter(
+            [
+                # Poll 1 — merged but SHA still null.
+                {
+                    "state": "closed",
+                    "merged": True,
+                    "merged_at": "2026-05-15T14:32:00Z",
+                    "head_sha": "abc",
+                    "merge_commit_sha": None,
+                },
+                # Poll 2 — SHA now populated.
+                {
+                    "state": "closed",
+                    "merged": True,
+                    "merged_at": "2026-05-15T14:32:00Z",
+                    "head_sha": "abc",
+                    "merge_commit_sha": "ff00aa11bb22",
+                },
+            ]
+        )
+        monkeypatch.setattr(
+            "orchestrator.tools.ops.github.get_pr_state",
+            lambda url, pr: next(pr_state_seq),
+        )
+        monkeypatch.setattr(
+            "orchestrator.tools.ops.github.get_pr_check_runs",
+            lambda url, pr: {"total": 0, "conclusion_counts": {}, "runs": []},
+        )
+
+        ops.check_unit_pr("F-001-U-1")  # poll 1 — status flips, no SHA
+        ops.check_unit_pr("F-001-U-1")  # poll 2 — SHA arrives, backfill runs
+
+        log_path = tmp_state_db.parent / "features" / "F-001" / "U-1.md"
+        body = log_path.read_text(encoding="utf-8")
+        assert "Merge commit SHA: ff00aa11bb22" in body, (
+            f"H1 regression — second poll must catch up when SHA populates.\nGot:\n{body}"
+        )
+
+    def test_status_flip_event_recorded_exactly_once_across_polls(
+        self,
+        tmp_state_db: Path,
+        with_github_token: None,
+        _stub_subprocess: _Runner,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The ``merged`` event records on the first merged poll. Later
+        polls must not re-record it (would duplicate the unit_events row);
+        only the backfill retries.
+        """
+        _seed_feature()
+        state.upsert_unit_state(
+            WorkUnitState(
+                unit_id="F-001-U-1",
+                feature_id="F-001",
+                status="in_ci",
+                pr_number=42,
+                coder_session_id="sesn",
+            )
+        )
+        monkeypatch.setattr(
+            "orchestrator.tools.ops.github.get_pr_state",
+            lambda url, pr: {
+                "state": "closed",
+                "merged": True,
+                "merged_at": "2026-05-15T14:32:00Z",
+                "head_sha": "abc",
+                "merge_commit_sha": "deadbeef",
+            },
+        )
+        monkeypatch.setattr(
+            "orchestrator.tools.ops.github.get_pr_check_runs",
+            lambda url, pr: {"total": 0, "conclusion_counts": {}, "runs": []},
+        )
+
+        ops.check_unit_pr("F-001-U-1")
+        ops.check_unit_pr("F-001-U-1")
+        ops.check_unit_pr("F-001-U-1")
+
+        events = state.list_events("F-001-U-1")
+        merged_events = [ev for ev in events if ev["event_type"] == "merged"]
+        assert len(merged_events) == 1, (
+            f"merged event must record exactly once; got {len(merged_events)}"
+        )
+
+
+# =============================================================================
+# 10. M1 — regenerate_cycle_log preserves the backfilled merge SHA
+# =============================================================================
+
+
+class TestRegeneratePreservesMergeSha:
+    """``regenerate_cycle_log`` is the recovery tool for the case where
+    the automated backfill missed (e.g. H1 race before the fix, or a
+    write crash). It must NOT silently strip an already-backfilled
+    ``Merge commit SHA`` line — that would be a second post-finalization
+    edit, breaking the proposal's "only edit allowed" invariant.
+
+    Recovery stays offline-capable: read the SHA from the existing
+    on-disk file rather than re-fetching from gh.
+    """
+
+    def test_regenerate_keeps_existing_merge_sha_line(
+        self, tmp_state_db: Path, tmp_path: Path
+    ) -> None:
+        from orchestrator import cycle_log as cycle_log_module
+        from orchestrator.models import Feature, WorkUnit
+
+        state.save_feature(
+            Feature(
+                id="F-200",
+                title="t",
+                description="d",
+                repo_path="https://github.com/o/r",
+            )
+        )
+        state.save_plan(
+            "F-200",
+            [WorkUnit(id="F-200-U-1", feature_id="F-200", title="u", description="")],
+        )
+        state.upsert_unit_state(
+            WorkUnitState(
+                unit_id="F-200-U-1",
+                feature_id="F-200",
+                status="done",
+                pr_number=None,
+            )
+        )
+
+        target = tmp_path / "features" / "F-200" / "U-1.md"
+        target.parent.mkdir(parents=True)
+        # Simulate a previously-backfilled cycle log with the SHA line.
+        target.write_text(
+            "# F-200-U-1\n\n## PR\n_no PR opened_\nStatus: done\n"
+            "PR head SHA: _unknown_\nMerge commit SHA: cafef00d1234\n\n"
+            "## Cycle history\n0 cycles · cap-3 not hit\n",
+            encoding="utf-8",
+        )
+
+        cycle_log_module.regenerate_cycle_log("F-200-U-1", base_dir=tmp_path)
+
+        body = target.read_text(encoding="utf-8")
+        assert "Merge commit SHA: cafef00d1234" in body, (
+            f"regenerate must preserve the backfilled merge SHA;\n{body}"
+        )
+
+    def test_regenerate_on_orphan_log_does_not_invent_a_sha(
+        self, tmp_state_db: Path, tmp_path: Path
+    ) -> None:
+        """Orphan recovery (no file on disk) has nothing to preserve —
+        the regenerated log must not have a Merge commit SHA line.
+        """
+        from orchestrator import cycle_log as cycle_log_module
+        from orchestrator.models import Feature, WorkUnit
+
+        state.save_feature(
+            Feature(id="F-201", title="t", description="d", repo_path="https://github.com/o/r"),
+        )
+        state.save_plan(
+            "F-201",
+            [WorkUnit(id="F-201-U-1", feature_id="F-201", title="u", description="")],
+        )
+        state.upsert_unit_state(
+            WorkUnitState(
+                unit_id="F-201-U-1",
+                feature_id="F-201",
+                status="in_ci",
+                pr_number=None,
+            )
+        )
+
+        cycle_log_module.regenerate_cycle_log("F-201-U-1", base_dir=tmp_path)
+
+        body = (tmp_path / "features" / "F-201" / "U-1.md").read_text(encoding="utf-8")
+        assert "Merge commit SHA" not in body, (
+            "orphan recovery must not invent a merge SHA out of nowhere"
+        )
+
+
+# =============================================================================
+# 11. L1 — _cycle_log_base_dir was lifted to the public cycle_log surface
+# =============================================================================
+
+
+class TestPublicBaseDirHelper:
+    def test_cycle_log_base_dir_is_public(self, tmp_state_db: Path) -> None:
+        assert cycle_log.cycle_log_base_dir() == Path(state.STATE_DB).parent

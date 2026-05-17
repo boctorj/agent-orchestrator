@@ -228,14 +228,15 @@ class TestBaseDirAnchor:
         )
 
     def test_helper_returns_state_db_parent(self, tmp_state_db: Path) -> None:
-        """The private helper that materializes the anchor must point at
+        """The public helper that materializes the anchor must point at
         STATE_DB.parent verbatim. Pinning the helper directly catches a
         refactor that swaps it for ``Path.cwd()`` even if no visible
         cycle_review call would surface the regression in CI.
         """
-        # _cycle_log_base_dir is a private helper but it's load-bearing for
-        # cycle_log isolation in tests + for production correctness.
-        assert execution._cycle_log_base_dir() == Path(state.STATE_DB).parent
+        # Lifted from a private execution.py helper to public
+        # cycle_log.cycle_log_base_dir during reviewer cycle 0 (L1):
+        # both ops.py and execution.py share this anchor.
+        assert cycle_log.cycle_log_base_dir() == Path(state.STATE_DB).parent
 
 
 # =============================================================================
@@ -438,37 +439,153 @@ class TestCheckUnitPrBackfillSemantics:
             f"writer must not be invoked while PR is still open; got {write_calls!r}"
         )
 
-    def test_backfill_runs_only_once_across_repeated_polls(
+    def test_backfill_idempotent_at_file_layer_across_repeated_polls(
+        self,
+        tmp_state_db: Path,
+        with_github_token: None,
+        _runner: _Runner,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Proposal: the backfill ends up as ``the only post-finalization
+        edit`` — meaning the file ends up with the SHA *once*. The
+        operational invariant lives at the file-content layer, not at the
+        writer-call-count layer (``_git_commit_local`` already short-
+        circuits on no-op renders via ``git diff --cached --quiet``).
+
+        Pinning call count here was the H1 lockout: it prevented the
+        retry that catches GitHub's null→populated ``merge_commit_sha``
+        race (see ``TestBackfillRaceRecovery`` below).
+        """
+        _seed(status="in_ci")
+        self._seed_merged_responder(monkeypatch, merge_sha="d00ddeeb")
+
+        ops.check_unit_pr("F-700-U-2")
+        ops.check_unit_pr("F-700-U-2")
+        ops.check_unit_pr("F-700-U-2")
+
+        log_path = tmp_state_db.parent / "features" / "F-700" / "U-2.md"
+        body = log_path.read_text(encoding="utf-8")
+        # Exactly one merge-SHA line regardless of how many times we polled.
+        assert body.count("Merge commit SHA: d00ddeeb") == 1, (
+            f"file must end up with the SHA exactly once across repeated polls;\n{body}"
+        )
+        assert body.count("Merge commit SHA:") == 1, (
+            "no stray Merge commit SHA lines from an interim render"
+        )
+
+
+# =============================================================================
+# D2. H1 regression — null→populated merge_commit_sha race must catch up
+# =============================================================================
+
+
+class TestBackfillRaceRecovery:
+    """GitHub's REST API populates ``merge_commit_sha`` asynchronously —
+    the first ``check_unit_pr`` after a merge can see ``merged=True``
+    with a still-null SHA. A subsequent poll (seconds later) must
+    successfully backfill once the SHA arrives. Without the H1 fix this
+    silently fails: the first poll flips status→done and the second
+    poll's backfill branch is gated out.
+    """
+
+    def test_second_poll_with_populated_sha_backfills_after_null_first_poll(
+        self,
+        tmp_state_db: Path,
+        with_github_token: None,
+        _runner: _Runner,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _seed(status="in_ci")
+
+        # First poll: merged but SHA still null (transient race).
+        # Second poll: SHA now populated.
+        pr_states = iter(
+            [
+                {
+                    "state": "closed",
+                    "merged": True,
+                    "merged_at": "2026-05-15T14:32:00Z",
+                    "head_sha": "headsha",
+                    "merge_commit_sha": None,
+                },
+                {
+                    "state": "closed",
+                    "merged": True,
+                    "merged_at": "2026-05-15T14:32:00Z",
+                    "head_sha": "headsha",
+                    "merge_commit_sha": "abc123def456",
+                },
+            ]
+        )
+        monkeypatch.setattr(
+            "orchestrator.tools.ops.github.get_pr_state",
+            lambda url, pr: next(pr_states),
+        )
+        monkeypatch.setattr(
+            "orchestrator.tools.ops.github.get_pr_check_runs",
+            lambda url, pr: {"total": 0, "conclusion_counts": {}, "runs": []},
+        )
+
+        # Poll 1 — SHA missing, status flips to done, NO backfill yet.
+        ops.check_unit_pr("F-700-U-2")
+        log_path = tmp_state_db.parent / "features" / "F-700" / "U-2.md"
+        # No cycle-log file written by check_unit_pr on a null SHA — the
+        # backfill is the *only* file write check_unit_pr performs.
+        if log_path.is_file():
+            body_after_poll1 = log_path.read_text(encoding="utf-8")
+            assert "Merge commit SHA" not in body_after_poll1
+
+        # Poll 2 — SHA arrives, backfill must run and the file ends up
+        # with the merge SHA line.
+        ops.check_unit_pr("F-700-U-2")
+        body = log_path.read_text(encoding="utf-8")
+        assert "Merge commit SHA: abc123def456" in body, (
+            f"H1 race regression — the second poll must catch up when the SHA arrives.\n"
+            f"Got file body:\n{body}"
+        )
+
+    def test_status_flip_event_not_re_recorded_on_repeated_merged_polls(
         self,
         tmp_state_db: Path,
         with_github_token: None,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The proposal calls out the backfill as ``the only
-        post-finalization edit`` — i.e. exactly one. A second
-        ``check_unit_pr`` after the unit has already been flipped to
-        ``done`` must not redo it (the unit_status != 'done' guard
-        rides on the first-transition gate).
+        """The status flip and the ``merged`` event happen on the first
+        merged poll. Subsequent polls must not re-record the merged
+        event (the unit_events row would duplicate). Only the backfill
+        retries.
         """
         _seed(status="in_ci")
-        self._seed_merged_responder(monkeypatch, merge_sha="d00ddeeb")
-
-        write_count: dict[str, int] = {"n": 0}
-
-        def spy(*a: Any, **k: Any) -> Path:
-            write_count["n"] += 1
-            return Path("/dev/null")
-
-        monkeypatch.setattr("orchestrator.tools.ops.cycle_log.write_cycle_log", spy)
+        monkeypatch.setattr(
+            "orchestrator.tools.ops.github.get_pr_state",
+            lambda url, pr: {
+                "state": "closed",
+                "merged": True,
+                "merged_at": "2026-05-15T14:32:00Z",
+                "head_sha": "headsha",
+                "merge_commit_sha": "1234abcd",
+            },
+        )
+        monkeypatch.setattr(
+            "orchestrator.tools.ops.github.get_pr_check_runs",
+            lambda url, pr: {"total": 0, "conclusion_counts": {}, "runs": []},
+        )
+        # Suppress real writer side effects; we're asserting on
+        # unit_events, not on the on-disk log.
+        monkeypatch.setattr(
+            "orchestrator.tools.ops.cycle_log.write_cycle_log",
+            lambda *a, **k: Path("/dev/null"),
+        )
 
         ops.check_unit_pr("F-700-U-2")
-        assert write_count["n"] == 1, "first poll must trigger the backfill exactly once"
-
-        # Second poll on the now-merged unit: writer should NOT run again.
         ops.check_unit_pr("F-700-U-2")
-        assert write_count["n"] == 1, (
-            f"second poll on an already-done unit must not re-invoke the backfill writer; "
-            f"got {write_count['n']} total invocations"
+        ops.check_unit_pr("F-700-U-2")
+
+        merged_events = [
+            ev for ev in state.list_events("F-700-U-2") if ev["event_type"] == "merged"
+        ]
+        assert len(merged_events) == 1, (
+            f"merged event must record exactly once across polls; got {len(merged_events)}"
         )
 
 

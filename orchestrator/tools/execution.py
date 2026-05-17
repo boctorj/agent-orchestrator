@@ -10,7 +10,6 @@ from __future__ import annotations
 import contextlib
 import json
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from orchestrator import ci_wait, cycle_log, github, ntfy, state
@@ -713,18 +712,6 @@ def _record_step(ctx: CycleContext, name: str, result_json_str: str) -> dict:
     return r
 
 
-def _cycle_log_base_dir() -> Path:
-    """Resolve ``features/`` parent for cycle-log writes.
-
-    Anchored to ``state.STATE_DB.parent`` rather than ``Path.cwd()`` so
-    tests (which monkeypatch ``state.STATE_DB`` to a tmp file) get an
-    isolated tmp tree, and so production callers don't depend on whatever
-    the caller's CWD happens to be. Matches the
-    ``orchestrator.feature_spec.features_root`` anchor.
-    """
-    return Path(state.STATE_DB).parent
-
-
 def _write_cycle_log_safe(unit_id: str) -> None:
     """Render + commit the per-unit cycle log; swallow every failure.
 
@@ -736,7 +723,7 @@ def _write_cycle_log_safe(unit_id: str) -> None:
     runs strictly before any merge.
     """
     with contextlib.suppress(Exception):
-        cycle_log.write_cycle_log(unit_id, base_dir=_cycle_log_base_dir())
+        cycle_log.write_cycle_log(unit_id, base_dir=cycle_log.cycle_log_base_dir())
 
 
 def _pr_url_for(feature_id: str, unit_state: WorkUnitState | None) -> str | None:
