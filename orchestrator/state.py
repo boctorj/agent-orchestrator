@@ -64,12 +64,24 @@ def _migrate_features_ultrareview(conn: sqlite3.Connection) -> None:
     so new columns won't appear in pre-existing state.db files without an
     explicit ALTER. SQLite has no `ADD COLUMN IF NOT EXISTS`, so we probe
     `PRAGMA table_info` first to keep the migration idempotent.
+
+    Race-safe: if two processes call `init_db()` concurrently (e.g.
+    `orchestrator doctor` while the MCP server is starting), both may
+    observe the column as missing and race the ALTER. The second one
+    raises `OperationalError: duplicate column name`, which we catch
+    and treat as success — the desired post-condition (column exists)
+    holds regardless of which racer won.
     """
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(features)").fetchall()}
-    if "ultrareview_enabled" not in cols:
+    if "ultrareview_enabled" in cols:
+        return
+    try:
         conn.execute(
             "ALTER TABLE features ADD COLUMN ultrareview_enabled INTEGER NOT NULL DEFAULT 0"
         )
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e).lower():
+            raise
 
 
 def init_db() -> None:
@@ -279,6 +291,36 @@ def get_plan(feature_id: str) -> Plan | None:
         status=row["status"],
         approved_at=row["approved_at"],
     )
+
+
+def get_plan_with_ultrareview(feature_id: str) -> tuple[Plan, bool] | None:
+    """Like `get_plan`, but JOINs the parent feature's `ultrareview_enabled`.
+
+    Saves a round-trip vs. `get_plan() + get_feature()` for callers that
+    need both. The parent row is guaranteed to exist (FK CASCADE on
+    `plans → features`), so the JOIN can't yield a half-row.
+    """
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT p.units_json, p.status, p.approved_at,
+                   f.ultrareview_enabled
+            FROM plans p
+            JOIN features f ON f.id = p.feature_id
+            WHERE p.feature_id = ?
+            """,
+            (feature_id,),
+        ).fetchone()
+    if not row:
+        return None
+    units = [WorkUnit(**u) for u in json.loads(row["units_json"])]
+    plan = Plan(
+        feature_id=feature_id,
+        units=units,
+        status=row["status"],
+        approved_at=row["approved_at"],
+    )
+    return plan, bool(row["ultrareview_enabled"])
 
 
 def approve_plan(feature_id: str) -> str:

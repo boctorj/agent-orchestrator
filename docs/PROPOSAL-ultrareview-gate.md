@@ -64,13 +64,19 @@ A single feature-level boolean: `ultrareview_enabled`. Default `False`.
 
 ### How the flag gets set
 
-- **Lead → `load_feature(title, description, ..., ultrareview_enabled=False)`.**
+- **Lead → `load_feature(title, description, ..., ultrareview_enabled=...)`.**
   The lead asks the user during feature breakdown: "this feature looks
   load-bearing — turn on ultrareview for it?" and passes the answer to
   `load_feature`.
 - **Toggling later** is a metadata-only update — calling `load_feature`
   with the same `id` and a different `ultrareview_enabled` value
   preserves plan approval (same rule as fixing a wrong `repo_path`).
+- **Omitting the argument on an update preserves the prior value**, not
+  resets it. The parameter is sentinel-defaulted (`bool | None = None`)
+  so callers fixing an unrelated field — the canonical "I set
+  repo_path wrong, let me re-call load_feature" path — don't silently
+  clobber a previously-enabled flag. Explicit `True` / `False` still
+  set the flag normally.
 - **No env-level kill switch in F-007-U-1.** Per-feature granularity is
   the whole point. A later unit may add a `cycle_review(..., force_no_ultrareview=True)`
   override for emergencies.

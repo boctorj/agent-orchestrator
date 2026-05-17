@@ -17,7 +17,7 @@ def load_feature(
     id: str = "",
     repo_path: str = "",
     branch_prefix: str = "",
-    ultrareview_enabled: bool = False,
+    ultrareview_enabled: bool | None = None,
 ) -> str:
     """Record a feature. `repo_path` should be a GitHub URL for Stage 3+.
 
@@ -27,10 +27,18 @@ def load_feature(
     any subsequent spawn against the feature WILL be blocked until the
     user runs `verify_repo(<url>)`.
 
-    `ultrareview_enabled` is an opt-in feature-level flag (default
-    False) that turns on the `/ultrareview` terminal gate after our
-    reviewer endorses. Off by default because ultrareview costs
-    measurably per cycle. See docs/PROPOSAL-ultrareview-gate.md.
+    `ultrareview_enabled` is an opt-in feature-level flag for the
+    `/ultrareview` terminal gate after our reviewer endorses. Off by
+    default because ultrareview costs measurably per cycle. See
+    docs/PROPOSAL-ultrareview-gate.md.
+
+    The default is `None` (sentinel for "caller did not specify") rather
+    than `False`, so a metadata-only update on an existing feature
+    preserves the prior flag value when the caller omits the argument —
+    fixing a wrong `repo_path` on an ultrareview-enabled feature won't
+    silently disable the gate. On creation, an omitted flag means False.
+    Pass `True` / `False` explicitly to set the flag; pass nothing to
+    preserve.
 
     Update semantics: calling load_feature with an `id` that already
     exists is treated as a metadata update, not a re-creation. If the
@@ -53,7 +61,7 @@ def load_feature(
             description=description,
             repo_path=repo_path,
             branch_prefix=branch_prefix,
-            ultrareview_enabled=ultrareview_enabled,
+            ultrareview_enabled=bool(ultrareview_enabled),
         )
         state.save_feature(feature)
         msg = f"Loaded feature {feature.id}: {feature.title}"
@@ -85,6 +93,14 @@ def load_feature(
             new_status = existing.status
             path_desc = "metadata updated"
 
+        # Sentinel-preserve: an omitted ultrareview_enabled means "leave it
+        # as-is" rather than "set to False" — otherwise a metadata-only
+        # update silently drops a previously-enabled flag (the canonical
+        # "fix a wrong repo_path" path in the proposal).
+        new_ultrareview = (
+            existing.ultrareview_enabled if ultrareview_enabled is None else ultrareview_enabled
+        )
+
         feature = Feature(
             id=existing.id,
             title=title,
@@ -93,7 +109,7 @@ def load_feature(
             branch_prefix=branch_prefix,
             status=new_status,
             created_at=existing.created_at,
-            ultrareview_enabled=ultrareview_enabled,
+            ultrareview_enabled=new_ultrareview,
         )
         state.save_feature(feature)
         msg = f"Updated feature {feature.id} ({path_desc})"
@@ -166,16 +182,16 @@ def save_plan(feature_id: str, units: list[dict]) -> str:
 
 @mcp.tool()
 def get_plan(feature_id: str) -> str:
-    plan = state.get_plan(feature_id)
-    if not plan:
+    result = state.get_plan_with_ultrareview(feature_id)
+    if result is None:
         return f"No plan exists for {feature_id} yet."
-    feature = state.get_feature(feature_id)
+    plan, ultrareview_enabled = result
     return json.dumps(
         {
             "feature_id": plan.feature_id,
             "status": plan.status,
             "approved_at": plan.approved_at,
-            "ultrareview_enabled": feature.ultrareview_enabled if feature else False,
+            "ultrareview_enabled": ultrareview_enabled,
             "units": [asdict(u) for u in plan.units],
         },
         indent=2,
