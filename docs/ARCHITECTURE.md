@@ -99,8 +99,9 @@ boundaries.
 │   │                        parallel_units(_global)               │    │
 │   │  tools/observability.py — get_unit_status, unit_history,     │    │
 │   │                            unit_cost, show_dashboard         │    │
-│   │  tools/ops.py — check_unit_pr, list_in_flight, resume_unit,  │    │
-│   │                 hello_world_test, reset_cached_resources     │    │
+│   │  tools/ops.py — check_unit_pr, reconcile_unit_pr,            │    │
+│   │                 list_in_flight, resume_unit, hello_world_test,│    │
+│   │                 reset_cached_resources                       │    │
 │   └──────────────────────────────────────────────────────────────┘    │
 │                                                                        │
 │   state.py    — SQLite (state.db)                                      │
@@ -250,9 +251,9 @@ orchestrator/
 │   ├── observability.py         7 tools: get_unit_status, list_units,
 │   │                            unit_history, unit_summary, unit_cost,
 │   │                            feature_cost, show_dashboard
-│   └── ops.py                   5 tools: hello_world_test, check_unit_pr,
-│                                list_in_flight, resume_unit,
-│                                reset_cached_resources
+│   └── ops.py                   6 tools: hello_world_test, check_unit_pr,
+│                                reconcile_unit_pr, list_in_flight,
+│                                resume_unit, reset_cached_resources
 └── prompts/
     ├── coder.md                 system prompt for coder Managed Agent
     ├── tester.md                system prompt for tester Managed Agent
@@ -271,7 +272,7 @@ pyproject.toml                   Package metadata + ruff + mypy + bandit +
                                  pytest + coverage configs
 ```
 
-**Total: 23 MCP tools across 6 modules; 17 Python modules; ~3000 LOC.**
+**Total: 24 MCP tools across 6 modules; 17 Python modules; ~3000 LOC.**
 
 ---
 
@@ -411,7 +412,7 @@ Schema reference for both: [`docs/SPEC-FORMAT.md`](SPEC-FORMAT.md).
        │           │  REVIEW_COMMENT or REVIEW_REQUEST_CHANGES
        └───────────┤  (changes: increment review_round, fix, retry)
                    │
-                   │  human merges on github.com + check_unit_pr called
+                   │  human merges on github.com + reconcile_unit_pr called
                    ▼
               ┌─────────┐
               │  done   │   (terminal success)
@@ -467,8 +468,9 @@ Lead → orchestrator:  cycle_review(F-001, F-001-U-1)
 Lead → You:           "✅ F-001-U-1 → PR #N, awaiting your merge"
 You → github.com:     click merge
 You → Lead:           "merged"
-Lead → orchestrator:  check_unit_pr(F-001-U-1)
-                      → state flips to 'done'
+Lead → orchestrator:  reconcile_unit_pr(F-001-U-1)
+                      → state flips to 'done' (check_unit_pr remains
+                        a side-effect-free poll)
 Lead → orchestrator:  next_ready_units_all()
                       → [F-001-U-2, F-001-U-3]  (if 1 unblocked them)
 Lead → orchestrator:  parallel_units_global([{F-001, U-2}, {F-001, U-3}])
@@ -806,7 +808,7 @@ See `SECURITY.md` for the full threat model + reporting policy.
 | `ntfy.py` | 96% | push helpers + no-op path |
 | `tools/observability.py` | 100% | thin wrappers |
 | `tools/planning.py` | 100% | feature/plan tools |
-| `tools/ops.py` | 97% | hello_world, check_unit_pr, list_in_flight, resume_unit |
+| `tools/ops.py` | 94% | hello_world, check_unit_pr, reconcile_unit_pr, list_in_flight, resume_unit |
 | `tools/scheduling.py` | 97% | DAG + parallel |
 | `tools/execution.py` | 91% | cycle_review state machine |
 | `dashboard.py` | 93% | rich panels + markdown |
