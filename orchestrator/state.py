@@ -57,19 +57,53 @@ def _connect() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+def _migrate_features_ultrareview(conn: sqlite3.Connection) -> None:
+    """Add `ultrareview_enabled` to `features` for DBs created pre-F-007.
+
+    `CREATE TABLE IF NOT EXISTS` is a no-op when the table already exists,
+    so new columns won't appear in pre-existing state.db files without an
+    explicit ALTER. SQLite has no `ADD COLUMN IF NOT EXISTS`, so we probe
+    `PRAGMA table_info` first to keep the migration idempotent.
+
+    Race-safe: if two processes call `init_db()` concurrently (e.g.
+    `orchestrator doctor` while the MCP server is starting), both may
+    observe the column as missing and race the ALTER. The second one
+    raises `OperationalError: duplicate column name`, which we catch
+    and treat as success — the desired post-condition (column exists)
+    holds regardless of which racer won.
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(features)").fetchall()}
+    if "ultrareview_enabled" in cols:
+        return
+    try:
+        conn.execute(
+            "ALTER TABLE features ADD COLUMN ultrareview_enabled INTEGER NOT NULL DEFAULT 0"
+        )
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e).lower():
+            raise
+
+
 def init_db() -> None:
-    """Create tables if they don't exist. Idempotent."""
+    """Create tables if they don't exist, then apply column migrations.
+
+    Idempotent — safe to call repeatedly. The migration step is what
+    upgrades existing state.db files when new columns are added to
+    already-shipped tables (CREATE TABLE IF NOT EXISTS doesn't touch
+    existing schemas).
+    """
     with _connect() as conn:
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS features (
-                id            TEXT PRIMARY KEY,
-                title         TEXT NOT NULL,
-                description   TEXT NOT NULL,
-                repo_path     TEXT NOT NULL DEFAULT '',
-                branch_prefix TEXT NOT NULL DEFAULT '',
-                status        TEXT NOT NULL DEFAULT 'draft',
-                created_at    TEXT NOT NULL
+                id                  TEXT PRIMARY KEY,
+                title               TEXT NOT NULL,
+                description         TEXT NOT NULL,
+                repo_path           TEXT NOT NULL DEFAULT '',
+                branch_prefix       TEXT NOT NULL DEFAULT '',
+                status              TEXT NOT NULL DEFAULT 'draft',
+                created_at          TEXT NOT NULL,
+                ultrareview_enabled INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS plans (
@@ -137,6 +171,7 @@ def init_db() -> None:
             );
             """
         )
+        _migrate_features_ultrareview(conn)
 
 
 # --------------------------- features ---------------------------
@@ -148,14 +183,18 @@ def save_feature(feature: Feature) -> None:
     with _connect() as conn:
         conn.execute(
             """
-            INSERT INTO features (id, title, description, repo_path, branch_prefix, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO features (
+                id, title, description, repo_path, branch_prefix, status,
+                created_at, ultrareview_enabled
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 title=excluded.title,
                 description=excluded.description,
                 repo_path=excluded.repo_path,
                 branch_prefix=excluded.branch_prefix,
-                status=excluded.status
+                status=excluded.status,
+                ultrareview_enabled=excluded.ultrareview_enabled
             """,
             (
                 feature.id,
@@ -165,20 +204,41 @@ def save_feature(feature: Feature) -> None:
                 feature.branch_prefix,
                 feature.status,
                 feature.created_at,
+                1 if feature.ultrareview_enabled else 0,
             ),
         )
+
+
+def _feature_from_row(row: sqlite3.Row) -> Feature:
+    """Build a `Feature` from a `features` row, coercing int→bool flags.
+
+    SQLite stores `ultrareview_enabled` as INTEGER (0/1); the dataclass
+    declares it as `bool`. `Feature(**dict(row))` would propagate the int,
+    breaking `is True`/`is False` checks. Centralize the coercion here so
+    add-a-column edits only touch one place (mirrors `_verified_repo_from_row`).
+    """
+    return Feature(
+        id=row["id"],
+        title=row["title"],
+        description=row["description"],
+        repo_path=row["repo_path"],
+        branch_prefix=row["branch_prefix"],
+        status=row["status"],
+        created_at=row["created_at"],
+        ultrareview_enabled=bool(row["ultrareview_enabled"]),
+    )
 
 
 def get_feature(feature_id: str) -> Feature | None:
     with _connect() as conn:
         row = conn.execute("SELECT * FROM features WHERE id = ?", (feature_id,)).fetchone()
-    return Feature(**dict(row)) if row else None
+    return _feature_from_row(row) if row else None
 
 
 def list_features() -> list[Feature]:
     with _connect() as conn:
         rows = conn.execute("SELECT * FROM features ORDER BY created_at").fetchall()
-    return [Feature(**dict(r)) for r in rows]
+    return [_feature_from_row(r) for r in rows]
 
 
 def next_feature_id() -> str:
@@ -231,6 +291,36 @@ def get_plan(feature_id: str) -> Plan | None:
         status=row["status"],
         approved_at=row["approved_at"],
     )
+
+
+def get_plan_with_ultrareview(feature_id: str) -> tuple[Plan, bool] | None:
+    """Like `get_plan`, but JOINs the parent feature's `ultrareview_enabled`.
+
+    Saves a round-trip vs. `get_plan() + get_feature()` for callers that
+    need both. The parent row is guaranteed to exist (FK CASCADE on
+    `plans → features`), so the JOIN can't yield a half-row.
+    """
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT p.units_json, p.status, p.approved_at,
+                   f.ultrareview_enabled
+            FROM plans p
+            JOIN features f ON f.id = p.feature_id
+            WHERE p.feature_id = ?
+            """,
+            (feature_id,),
+        ).fetchone()
+    if not row:
+        return None
+    units = [WorkUnit(**u) for u in json.loads(row["units_json"])]
+    plan = Plan(
+        feature_id=feature_id,
+        units=units,
+        status=row["status"],
+        approved_at=row["approved_at"],
+    )
+    return plan, bool(row["ultrareview_enabled"])
 
 
 def approve_plan(feature_id: str) -> str:
