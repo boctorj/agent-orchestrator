@@ -75,7 +75,7 @@ Ultrareview is **opt-in per feature** (default off) because each run costs measu
 ## Open questions
 
 - **Lead-persona prompt update:** should the lead ask the user during `load_feature` breakdown whether the feature is load-bearing enough to enable ultrareview? Deferred to a later unit (or a separate feature) — out of scope for U-1 through U-4.
-- **Cost attribution:** ultrareview-specific events are recorded but `feature_cost` / `unit_cost` don't separate ultrareview spend from other agent spend. Should we break it out?
+- **Cost attribution:** ultrareview-specific events are planned, but until that telemetry lands `feature_cost` / `unit_cost` won't separate ultrareview spend from other agent spend. Should we break it out once U-3/U-4 add the event stream?
 - **Ultrareview vs reviewer agent overlap:** the reviewer agent already does spec compliance. How much of ultrareview's catch rate is genuinely additive vs duplicating reviewer work? Open until we have a few features ship with the flag enabled and can compare findings.
 - **CLI docs URL stability:** `https://code.claude.com/docs/en/ultrareview` is the authoritative reference for the exit-code contract, `--json` flag, `--timeout` default, etc. Non-validatable from sandbox at review time. If Anthropic restructures the docs, the module's design rationale anchors lose.
 
