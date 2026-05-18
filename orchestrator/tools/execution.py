@@ -14,7 +14,7 @@ from typing import Any
 from orchestrator import ci_wait, github, ntfy, state
 from orchestrator.agents import ManagedAgentWorker
 from orchestrator.blocked_reasons import parse_blocked_marker
-from orchestrator.models import WorkUnitState
+from orchestrator.models import ACTIVE_UNIT_STATUSES, WorkUnitState
 from orchestrator.tools import (
     BUG_FOUND_RE,
     CAP_3,
@@ -572,6 +572,11 @@ def address_review(unit_id: str, source: str, feedback: str) -> str:
         session_id=unit_state.coder_session_id,
         cycle_number=round_num,
         blocked_event="coder_blocked_on_fix",
+        # PR_URL on a coder resume is anomalous — the unit already has a PR
+        # from spawn_unit. Excluding it here makes a stray PR_URL response
+        # fall through to _escalate_no_marker (matching pre-helper behaviour)
+        # instead of writing a spurious pr_opened event + flipping to in_ci.
+        markers=frozenset({"FIX_PUSHED", "BLOCKED"}),
     )
 
     if marker is None:
@@ -601,14 +606,9 @@ def address_review(unit_id: str, source: str, feedback: str) -> str:
             indent=2,
         )
 
-    if marker["marker"] == "BLOCKED":
-        payload = marker["payload"]
-        return f"BLOCKED — coder couldn't apply fix [{payload.reason}]: {payload.prose}"
-
-    # PR_URL on a coder resume is unexpected (no existing call site emits one)
-    # but the helper recorded it; the caller surfaces a generic terminal so
-    # the lead sees the marker.
-    return f"Coder emitted {marker['marker']} during fix — surfaced via state machine."
+    # marker["marker"] == "BLOCKED" — the only other option given the markers subset.
+    payload = marker["payload"]
+    return f"BLOCKED — coder couldn't apply fix [{payload.reason}]: {payload.prose}"
 
 
 # --------------------------- cycle_review (refactored) ---------------------------
@@ -678,6 +678,30 @@ def _emit_terminal(ctx: CycleContext, outcome: str, msg: str) -> str:
 # --------------------------- escalation helpers ---------------------------
 
 
+def _flip_status_if_active(unit_id: str, *, target: str, error: str = "") -> None:
+    """Conditional `touch_unit(status=target)` — applies only on an active from-state.
+
+    The helper-driven status flips (success → ``in_ci``, BLOCKED → ``escalated``)
+    are safe for the spawn_*/address_review surfaces because each does its own
+    ``state.touch_unit(unit_id, status=<active>)`` first — the unit is always in
+    ``coding`` / ``testing`` / ``reviewing`` / ``fixing`` / ``in_ci`` when the
+    marker chain runs.
+
+    ``send_to_unit`` has no such guarantee: it's a low-level escape hatch the
+    user can fire at any session — including a ``done`` or ``escalated`` unit
+    for a clarification chat. Without this gate, a reviewer agent (prompted to
+    end every reply with a marker) emitting ``REVIEW_RECOMMEND_MERGE`` after the
+    PR has already merged would silently flip the unit back to ``in_ci``.
+
+    Audit events still fire from the helper unconditionally — only the status
+    transition is gated, so the manual_message audit trail and structured
+    marker event still land regardless of the unit's terminal state.
+    """
+    cur = state.get_unit_state(unit_id)
+    if cur and cur.status in ACTIVE_UNIT_STATUSES:
+        state.touch_unit(unit_id, status=target, error=error)
+
+
 def _record_terminal_marker(
     *,
     unit_id: str,
@@ -687,6 +711,7 @@ def _record_terminal_marker(
     session_id: str,
     cycle_number: int,
     blocked_event: str | None = None,
+    markers: frozenset[str] | None = None,
 ) -> dict[str, Any] | None:
     """Parse a worker response for role-appropriate terminal markers.
 
@@ -702,14 +727,21 @@ def _record_terminal_marker(
         reviewer -> REVIEW_RECOMMEND_MERGE | REVIEW_REQUEST_CHANGES |
                     REVIEW_COMMENT | BLOCKED
 
+    Callers that know certain role-appropriate markers are invalid in their
+    context can narrow the search via ``markers`` (e.g. ``address_review``
+    passes ``{"FIX_PUSHED", "BLOCKED"}`` — a coder resume returning ``PR_URL``
+    is anomalous since the unit already has a PR from ``spawn_unit``, and
+    matching it here would write a spurious ``pr_opened`` event).
+
     Side effects on match:
       - Appends one ``unit_event`` row (``pr_opened`` / ``fix_pushed`` /
         ``tests_pass`` / ``tester_bug_found`` / ``reviewer_recommend_merge`` /
         ``reviewer_request_changes`` / ``reviewer_comment`` / ``{role}_blocked``
         — or the ``blocked_event`` override, used by ``address_review`` to
         keep the historical ``coder_blocked_on_fix`` distinction).
-      - Updates ``work_units.status``: success markers → ``in_ci``;
-        ``BLOCKED`` → ``escalated`` (and populates ``last_error``);
+      - Updates ``work_units.status`` *only when the unit is currently in an
+        active state* (see :func:`_flip_status_if_active`): success markers →
+        ``in_ci``; ``BLOCKED`` → ``escalated`` (and populates ``last_error``);
         ``BUG_FOUND`` / ``REVIEW_REQUEST_CHANGES`` leave status unchanged
         (the caller's loop holds the unit in ``testing`` / ``reviewing``
         until the next ``address_review`` cycle).
@@ -720,25 +752,30 @@ def _record_terminal_marker(
     Returns ``None`` if no marker matched (caller should escalate as no-marker),
     or a dict ``{"marker": <name>, ...extras}`` describing the match.
     """
+
+    def _allowed(name: str) -> bool:
+        return markers is None or name in markers
+
     if role == "coder":
-        pr = PR_URL_RE.search(response)
-        if pr:
-            pr_url = pr.group(1)
-            pr_number = int(pr.group(2))
-            state.touch_unit(unit_id, status="in_ci")
-            state.record_event(
-                unit_id,
-                feature_id,
-                "pr_opened",
-                source="coder",
-                cycle_number=cycle_number,
-                summary=f"PR #{pr_number} opened",
-                session_id=session_id,
-                details=pr_url,
-            )
-            return {"marker": "PR_URL", "pr_url": pr_url, "pr_number": pr_number}
-        if FIX_PUSHED_RE.search(response):
-            state.touch_unit(unit_id, status="in_ci")
+        if _allowed("PR_URL"):
+            pr = PR_URL_RE.search(response)
+            if pr:
+                pr_url = pr.group(1)
+                pr_number = int(pr.group(2))
+                _flip_status_if_active(unit_id, target="in_ci")
+                state.record_event(
+                    unit_id,
+                    feature_id,
+                    "pr_opened",
+                    source="coder",
+                    cycle_number=cycle_number,
+                    summary=f"PR #{pr_number} opened",
+                    session_id=session_id,
+                    details=pr_url,
+                )
+                return {"marker": "PR_URL", "pr_url": pr_url, "pr_number": pr_number}
+        if _allowed("FIX_PUSHED") and FIX_PUSHED_RE.search(response):
+            _flip_status_if_active(unit_id, target="in_ci")
             state.record_event(
                 unit_id,
                 feature_id,
@@ -751,8 +788,8 @@ def _record_terminal_marker(
             )
             return {"marker": "FIX_PUSHED"}
     elif role == "tester":
-        if TESTS_PASS_RE.search(response):
-            state.touch_unit(unit_id, status="in_ci")
+        if _allowed("TESTS_PASS") and TESTS_PASS_RE.search(response):
+            _flip_status_if_active(unit_id, target="in_ci")
             state.record_event(
                 unit_id,
                 feature_id,
@@ -763,51 +800,54 @@ def _record_terminal_marker(
                 session_id=session_id,
             )
             return {"marker": "TESTS_PASS"}
-        bug = BUG_FOUND_RE.search(response)
-        if bug:
-            reason = bug.group(1).strip()
-            state.record_event(
-                unit_id,
-                feature_id,
-                "tester_bug_found",
-                source="tester",
-                cycle_number=cycle_number,
-                summary=reason,
-                session_id=session_id,
-                details=tail(response),
-            )
-            return {"marker": "BUG_FOUND", "bug": reason}
+        if _allowed("BUG_FOUND"):
+            bug = BUG_FOUND_RE.search(response)
+            if bug:
+                reason = bug.group(1).strip()
+                state.record_event(
+                    unit_id,
+                    feature_id,
+                    "tester_bug_found",
+                    source="tester",
+                    cycle_number=cycle_number,
+                    summary=reason,
+                    session_id=session_id,
+                    details=tail(response),
+                )
+                return {"marker": "BUG_FOUND", "bug": reason}
     elif role == "reviewer":
-        recommend = REVIEW_RECOMMEND_MERGE_RE.search(response)
-        if recommend:
-            reason = recommend.group(1).strip()
-            state.touch_unit(unit_id, status="in_ci")
-            state.record_event(
-                unit_id,
-                feature_id,
-                "reviewer_recommend_merge",
-                source="reviewer",
-                cycle_number=cycle_number,
-                summary=f"Endorsed (self-approval blocked): {reason}",
-                session_id=session_id,
-            )
-            return {"marker": "REVIEW_RECOMMEND_MERGE", "reason": reason}
-        changes = REVIEW_CHANGES_RE.search(response)
-        if changes:
-            reason = changes.group(1).strip()
-            state.record_event(
-                unit_id,
-                feature_id,
-                "reviewer_request_changes",
-                source="reviewer",
-                cycle_number=cycle_number,
-                summary=reason,
-                session_id=session_id,
-                details=tail(response),
-            )
-            return {"marker": "REVIEW_REQUEST_CHANGES", "issue": reason}
-        if REVIEW_COMMENT_RE.search(response):
-            state.touch_unit(unit_id, status="in_ci")
+        if _allowed("REVIEW_RECOMMEND_MERGE"):
+            recommend = REVIEW_RECOMMEND_MERGE_RE.search(response)
+            if recommend:
+                reason = recommend.group(1).strip()
+                _flip_status_if_active(unit_id, target="in_ci")
+                state.record_event(
+                    unit_id,
+                    feature_id,
+                    "reviewer_recommend_merge",
+                    source="reviewer",
+                    cycle_number=cycle_number,
+                    summary=f"Endorsed (self-approval blocked): {reason}",
+                    session_id=session_id,
+                )
+                return {"marker": "REVIEW_RECOMMEND_MERGE", "reason": reason}
+        if _allowed("REVIEW_REQUEST_CHANGES"):
+            changes = REVIEW_CHANGES_RE.search(response)
+            if changes:
+                reason = changes.group(1).strip()
+                state.record_event(
+                    unit_id,
+                    feature_id,
+                    "reviewer_request_changes",
+                    source="reviewer",
+                    cycle_number=cycle_number,
+                    summary=reason,
+                    session_id=session_id,
+                    details=tail(response),
+                )
+                return {"marker": "REVIEW_REQUEST_CHANGES", "issue": reason}
+        if _allowed("REVIEW_COMMENT") and REVIEW_COMMENT_RE.search(response):
+            _flip_status_if_active(unit_id, target="in_ci")
             state.record_event(
                 unit_id,
                 feature_id,
@@ -820,24 +860,25 @@ def _record_terminal_marker(
             return {"marker": "REVIEW_COMMENT"}
 
     # BLOCKED is universal across all three roles.
-    payload = parse_blocked_marker(response)
-    if payload is not None:
-        state.touch_unit(
-            unit_id,
-            status="escalated",
-            error=format_blocked_last_error(payload),
-        )
-        state.record_event(
-            unit_id,
-            feature_id,
-            blocked_event or f"{role}_blocked",
-            source=role,
-            cycle_number=cycle_number,
-            summary=payload.prose,
-            session_id=session_id,
-            details=blocked_event_details(payload, tail(response)),
-        )
-        return {"marker": "BLOCKED", "payload": payload}
+    if _allowed("BLOCKED"):
+        payload = parse_blocked_marker(response)
+        if payload is not None:
+            _flip_status_if_active(
+                unit_id,
+                target="escalated",
+                error=format_blocked_last_error(payload),
+            )
+            state.record_event(
+                unit_id,
+                feature_id,
+                blocked_event or f"{role}_blocked",
+                source=role,
+                cycle_number=cycle_number,
+                summary=payload.prose,
+                session_id=session_id,
+                details=blocked_event_details(payload, tail(response)),
+            )
+            return {"marker": "BLOCKED", "payload": payload}
 
     return None
 
