@@ -592,6 +592,203 @@ class TestSendToUnit:
         assert "ERROR resuming coder" in msg
 
 
+# --------------------------- send_to_unit terminal-marker recording -----------
+
+
+def _seed_unit_for_role(role: str, status: str) -> None:
+    """Set up F-001 + F-001-U-1 with a session id assigned for ``role``.
+
+    The unit starts in ``status`` so tests can assert the helper's status
+    transition (testing/reviewing/fixing/coding → in_ci on success).
+    """
+    _setup_feature()
+    kwargs = {
+        "unit_id": "F-001-U-1",
+        "feature_id": "F-001",
+        "status": status,
+        "branch": "feat/branch",
+        "pr_number": 5,
+    }
+    sid_key = f"{role}_session_id"
+    kwargs[sid_key] = f"sesn-{role}"
+    if role != "coder":
+        # tester/reviewer paths still need a coder session on the unit so
+        # state shape matches real-world post-spawn_unit conditions.
+        kwargs["coder_session_id"] = "sesn-coder"
+    state.upsert_unit_state(WorkUnitState(**kwargs))
+
+
+def _events_of_type(unit_id: str, event_type: str) -> list[dict]:
+    return [e for e in state.list_events(unit_id) if e["event_type"] == event_type]
+
+
+class TestSendToUnitTerminalMarker:
+    """`send_to_unit` runs the per-role marker chain after `worker.resume`.
+
+    Closes audit Gaps B/I: endorsements that previously went through
+    `send_to_unit` were invisible to the orchestrator's state (only the
+    ``_manual_message`` event was recorded, no status transition fired).
+    """
+
+    # --- success markers per role flip status to in_ci AND record both events
+
+    @pytest.mark.parametrize(
+        ("role", "from_status", "response", "expected_event"),
+        [
+            (
+                "reviewer",
+                "reviewing",
+                "looks good\nREVIEW_RECOMMEND_MERGE: tests cover the new path",
+                "reviewer_recommend_merge",
+            ),
+            ("tester", "testing", "all assertions hold\nTESTS_PASS", "tests_pass"),
+            (
+                "reviewer",
+                "reviewing",
+                "comment only\nREVIEW_COMMENT",
+                "reviewer_comment",
+            ),
+            ("coder", "fixing", "pushed\nFIX_PUSHED", "fix_pushed"),
+            (
+                "coder",
+                "coding",
+                "PR_URL: https://github.com/o/r/pull/42",
+                "pr_opened",
+            ),
+        ],
+    )
+    def test_success_marker_records_event_and_flips_to_in_ci(
+        self, tmp_state_db, monkeypatch, role, from_status, response, expected_event
+    ):
+        _seed_unit_for_role(role, status=from_status)
+        _install_fake_worker(monkeypatch, resume_response=response)
+
+        out = execution.send_to_unit("F-001-U-1", role, "carry on")
+        assert out == response  # worker output still returned verbatim
+
+        s = state.get_unit_state("F-001-U-1")
+        assert s.status == "in_ci"
+
+        # Both events recorded (structured marker first, manual_message second
+        # — chronological replay order).
+        events = state.list_events("F-001-U-1")
+        types = [e["event_type"] for e in events]
+        assert expected_event in types
+        assert f"{role}_manual_message" in types
+        assert types.index(expected_event) < types.index(f"{role}_manual_message")
+
+    # --- non-flipping success-side markers (BUG_FOUND, REQUEST_CHANGES) still record
+
+    def test_bug_found_records_event_without_flipping_status(self, tmp_state_db, monkeypatch):
+        _seed_unit_for_role("tester", status="testing")
+        _install_fake_worker(
+            monkeypatch, resume_response="failing test:\nBUG_FOUND: off-by-one in counter"
+        )
+
+        execution.send_to_unit("F-001-U-1", "tester", "rerun please")
+
+        # BUG_FOUND keeps the unit in testing (caller's loop drives address_review)
+        assert state.get_unit_state("F-001-U-1").status == "testing"
+        assert _events_of_type("F-001-U-1", "tester_bug_found")
+        assert _events_of_type("F-001-U-1", "tester_manual_message")
+
+    def test_request_changes_records_event_without_flipping_status(self, tmp_state_db, monkeypatch):
+        _seed_unit_for_role("reviewer", status="reviewing")
+        _install_fake_worker(
+            monkeypatch,
+            resume_response="REVIEW_REQUEST_CHANGES: rename the public symbol",
+        )
+
+        execution.send_to_unit("F-001-U-1", "reviewer", "re-review please")
+
+        assert state.get_unit_state("F-001-U-1").status == "reviewing"
+        assert _events_of_type("F-001-U-1", "reviewer_request_changes")
+        assert _events_of_type("F-001-U-1", "reviewer_manual_message")
+
+    # --- BLOCKED markers per role escalate AND record both events
+
+    @pytest.mark.parametrize(
+        "role,from_status",
+        [
+            ("coder", "fixing"),
+            ("tester", "testing"),
+            ("reviewer", "reviewing"),
+        ],
+    )
+    def test_blocked_marker_escalates(self, tmp_state_db, monkeypatch, role, from_status):
+        _seed_unit_for_role(role, status=from_status)
+        _install_fake_worker(monkeypatch, resume_response="BLOCKED: reason=auth_failure | 401")
+
+        execution.send_to_unit("F-001-U-1", role, "please retry")
+
+        s = state.get_unit_state("F-001-U-1")
+        assert s.status == "escalated"
+        assert "[auth_failure]" in s.last_error
+        assert _events_of_type("F-001-U-1", f"{role}_blocked")
+        assert _events_of_type("F-001-U-1", f"{role}_manual_message")
+
+    # --- cross-role markers are ignored: status unchanged, only _manual_message
+
+    def test_cross_role_marker_ignored_for_tester(self, tmp_state_db, monkeypatch):
+        """A tester response containing REVIEW_RECOMMEND_MERGE is NOT a
+        recognised tester marker — status stays in testing, no
+        reviewer_* event recorded."""
+        _seed_unit_for_role("tester", status="testing")
+        _install_fake_worker(
+            monkeypatch, resume_response="REVIEW_RECOMMEND_MERGE: not mine to emit"
+        )
+
+        execution.send_to_unit("F-001-U-1", "tester", "anything")
+
+        assert state.get_unit_state("F-001-U-1").status == "testing"
+        types = [e["event_type"] for e in state.list_events("F-001-U-1")]
+        assert "reviewer_recommend_merge" not in types
+        assert "tester_manual_message" in types
+
+    def test_cross_role_marker_ignored_for_coder(self, tmp_state_db, monkeypatch):
+        """A coder response containing TESTS_PASS does NOT flip status —
+        TESTS_PASS is the tester's marker, not the coder's."""
+        _seed_unit_for_role("coder", status="coding")
+        _install_fake_worker(monkeypatch, resume_response="some prose\nTESTS_PASS")
+
+        execution.send_to_unit("F-001-U-1", "coder", "anything")
+
+        assert state.get_unit_state("F-001-U-1").status == "coding"
+        types = [e["event_type"] for e in state.list_events("F-001-U-1")]
+        assert "tests_pass" not in types
+        assert "coder_manual_message" in types
+
+    def test_no_marker_only_records_manual_message(self, tmp_state_db, monkeypatch):
+        """No recognised marker in the response means the helper records
+        nothing — only the standard `_manual_message` audit row fires."""
+        _seed_unit_for_role("reviewer", status="reviewing")
+        _install_fake_worker(monkeypatch, resume_response="just chatting, no marker")
+
+        execution.send_to_unit("F-001-U-1", "reviewer", "anything")
+
+        assert state.get_unit_state("F-001-U-1").status == "reviewing"
+        types = [e["event_type"] for e in state.list_events("F-001-U-1")]
+        assert types == ["reviewer_manual_message"]
+
+    def test_worker_failure_records_no_marker_event(self, tmp_state_db, monkeypatch):
+        """If worker.resume raises, neither the structured marker nor the
+        manual_message event should land — early return."""
+        _seed_unit_for_role("reviewer", status="reviewing")
+
+        class BlowUp:
+            def __init__(self, role):
+                pass
+
+            def resume(self, *a, **k):
+                raise RuntimeError("session expired")
+
+        monkeypatch.setattr("orchestrator.tools.execution.ManagedAgentWorker", BlowUp)
+
+        msg = execution.send_to_unit("F-001-U-1", "reviewer", "x")
+        assert "ERROR resuming reviewer" in msg
+        assert state.list_events("F-001-U-1") == []
+
+
 # --------------------------- cycle_review ---------------------------
 
 
