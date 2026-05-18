@@ -33,7 +33,6 @@ from orchestrator import state
 from orchestrator.models import Feature, WorkUnitState
 from orchestrator.tools import ops
 
-
 # --------------------------- helpers ---------------------------
 
 
@@ -113,9 +112,7 @@ def test_check_unit_pr_return_shape_is_stable_unmerged(
     assert "total" in parsed["checks"]  # CI checks block surfaced
 
 
-def test_check_unit_pr_return_shape_is_stable_merged(
-    tmp_state_db, with_github_token, monkeypatch
-):
+def test_check_unit_pr_return_shape_is_stable_merged(tmp_state_db, with_github_token, monkeypatch):
     """Same key set whether or not the PR is merged — the read shape is
     a stable contract for dashboards/diagnostics."""
     _seed(status="in_ci", pr_number=42)
@@ -195,9 +192,7 @@ def test_check_unit_pr_records_zero_events_across_every_pr_state(
 # --------------------------- delegation contract ---------------------------
 
 
-def test_reconcile_delegates_to_check_unit_pr(
-    tmp_state_db, with_github_token, monkeypatch
-):
+def test_reconcile_delegates_to_check_unit_pr(tmp_state_db, with_github_token, monkeypatch):
     """reconcile_unit_pr's docstring promises it 'reads via check_unit_pr'.
     Patch check_unit_pr itself and assert reconcile honours the indirection
     — otherwise a refactor that re-inlines the poll would silently drift
@@ -241,9 +236,7 @@ def test_reconcile_delegates_to_check_unit_pr(
 # --------------------------- event-payload pinning ---------------------------
 
 
-def test_reconcile_merged_event_payload_is_complete(
-    tmp_state_db, with_github_token, monkeypatch
-):
+def test_reconcile_merged_event_payload_is_complete(tmp_state_db, with_github_token, monkeypatch):
     """The emitted `merged` event must carry source='human', the unit's
     review_round as cycle_number, and a summary referencing the PR number
     plus merged_at timestamp. Dashboards depend on this for the
@@ -306,9 +299,7 @@ def test_reconcile_in_ci_does_not_emit_recovered_event(
 # --------------------------- "pending" / unknown fallthrough ---------------------------
 
 
-def test_reconcile_pending_plus_merged_refuses(
-    tmp_state_db, with_github_token, monkeypatch
-):
+def test_reconcile_pending_plus_merged_refuses(tmp_state_db, with_github_token, monkeypatch):
     """`pending` isn't an active role-status but it's also not in_ci/
     escalated/done. The reconciler must not silently flip a pending unit
     to done just because its PR happens to be merged (would mask a serious
