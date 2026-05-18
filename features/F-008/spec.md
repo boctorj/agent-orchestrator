@@ -4,7 +4,7 @@
 
 ## Intent
 
-Add a way for the lead to peek at what worker agents are actually doing mid-flight. Today the only signals between "spawned" and "terminal marker emitted" are session-status (idle / running / terminated / not_found via `resume_unit`) and silence. A spawn that blocks for 10+ minutes is opaque — the lead can't tell whether the agent is making progress, stuck on a bad path, or dead.
+Add a way for the lead to peek at what worker agents are actually doing mid-flight. Today the only signals between "spawned" and "terminal marker emitted" are session-status (raw `resume_unit` states like `idle` / `running` / `rescheduling` / `terminated`, plus retrieval errors) and silence. A spawn that blocks for 10+ minutes is opaque — the lead can't tell whether the agent is making progress, stuck on a bad path, or dead.
 
 **Proactive observability investment**, not driven by a specific incident. Closes the visibility gap before it bites us during a long-running spawn or a debugging session on a flaky agent.
 
@@ -15,8 +15,8 @@ Add a way for the lead to peek at what worker agents are actually doing mid-flig
 - The lead can call `tail_worker(unit_id, role)` while the named agent is mid-session and see the last ~20 messages it has emitted.
 - If the agent's session has died, the tool says so explicitly via a `terminated` status — the lead doesn't have to guess between "still working" and "crashed."
 - Calling `tail_worker` is **read-only** — it doesn't perturb the agent's session, doesn't write to state.db, doesn't trigger any side effects.
-- All four status paths (`running` / `idle` / `terminated` / `not_found`) implemented and tested on **managed_agents**.
-- Three of four status paths (`idle` / `terminated` / `not_found`) implemented and tested on **docker**. The `running` path on docker is a documented limitation pending a follow-up unit (see Open questions).
+- All four status paths (`running` / `idle` / `terminated` / `not_found`) must be implemented and tested on **managed_agents**.
+- Three of four status paths (`idle` / `terminated` / `not_found`) must be implemented and tested on **docker**. The `running` path on docker is a documented limitation pending a follow-up unit (see Open questions).
 - Output is **status-aware**:
   - `running` → "worker active, last N messages"
   - `idle` → "worker completed, final messages"
@@ -72,7 +72,7 @@ Two-layer split:
 
 ## Open questions
 
-- **Docker `running` path unreachability.** The `running` branch in `docker.tail_messages` is unreachable in production today because `spawn()` doesn't pass `--name <session_id>` to the container — `docker inspect <session_id>` returns `No such object`. Of docker's four status paths, only `idle` and `not_found` are reachable until a follow-up unit lands the `--name` wiring. The test pinning the convention for that follow-up (`test_docker_inspect_called_with_session_id_as_container_name`) is in place. **Open:** when does the `--name` wiring land? Either a new unit in F-008, folded into the next docker-backend refactor, or shipped opportunistically with the F-009 state-machine work.
+- **Docker `running` path unreachability.** The `running` branch in `docker.tail_messages` is unreachable in production today because `spawn()` doesn't pass `--name <session_id>` to the container — `docker inspect <session_id>` returns `No such object`. Of docker's four status paths, only `idle` and `not_found` are reachable until a follow-up unit lands the `--name` wiring. The test intended to pin the convention for that follow-up (`test_docker_inspect_called_with_session_id_as_container_name`) exists in unmerged PR #29, not on this branch. **Open:** when does the `--name` wiring land? Either a new unit in F-008, folded into the next docker-backend refactor, or shipped opportunistically with the F-009 state-machine work.
 - **JSONL streaming for long transcripts.** `_read_session_messages` reads the full JSONL into memory then takes the last `limit`. For multi-MB transcripts this is O(transcript), not O(limit). Deferred to a perf-pass if profiles show a real hotspot. (PR #29 Copilot observation; deferred.)
 - **`_runs` registry overlap with F-007.** F-007's `_runs` registry tracks long-running ultrareview subprocesses; F-008's `tail_worker` doesn't have its own registry but opens short-lived `docker inspect` calls. No conflict today; flag in case a future feature wants a unified worker-observation surface.
 - **Cross-feature: F-008-U-2's status-aware formatting** assumes the four `tail_status` values are the right taxonomy for the lead's chat output. Open until U-2 ships and we see actual usage — may need a fifth state (e.g. `unknown` distinct from `not_found`) once the docker `running` path lands.
@@ -82,5 +82,5 @@ Two-layer split:
 - `orchestrator/agents.py` — `Worker` protocol; `tail_messages` lives here.
 - `orchestrator/workers/managed_agent.py` — managed_agents backend `tail_messages` implementation.
 - `orchestrator/workers/docker_claude_code.py` — docker backend `tail_messages` implementation; includes the docker state-map and assistant-only JSONL filter.
-- `orchestrator/workers/base.py` — `_validate_limit` shared helper; `TailMessage` / `TailResult` dataclasses.
+- `orchestrator/workers/base.py` — `_validate_limit` shared helper; `TailMessage` / `TailResult` response types.
 - PR #29 (F-008-U-1, awaiting merge as of 2026-05-18) — backend abstraction.

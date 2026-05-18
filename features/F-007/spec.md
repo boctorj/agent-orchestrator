@@ -69,8 +69,8 @@ Ultrareview is **opt-in per feature** (default off) because each run costs measu
 **Aligned trigger/wait timeouts (both default 600s).**
 **Why:** when the two defaults diverged (1800s trigger / 600s wait), every caller using defaults left a ~20-minute cloud-billing gap after the wrapper SIGKILLed. Aligning by construction closes the gap; explicit-timeout callers can still override. (Cycle-3 reviewer M4 finding on PR #28; fixed in cycle 4.)
 
-**Per-role marker scope on `_parse_bugs` (reviewer-only).**
-**Why:** ultrareview findings are reviewer-domain output. Cross-role parsing (e.g. accepting `TESTS_PASS` from ultrareview's output) would muddy the gate's semantics. Strict role scope keeps the failure mode "ultrareview said this is broken" unambiguous.
+**`_parse_bugs` is schema-scoped to ultrareview JSON findings only.**
+**Why:** `_parse_bugs` does not parse reviewer/tester markers; it only turns `claude ultrareview --json` stdout into findings for the gate. Keeping the parser limited to the documented structured payload, and failing closed on missing or reshaped findings fields, preserves the unambiguous failure mode "ultrareview reported findings" without implying any broader role-specific marker parsing in `orchestrator/ultrareview.py`.
 
 ## Open questions
 
