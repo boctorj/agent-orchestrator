@@ -64,8 +64,9 @@ Add a `pre-push` git hook to the worker sandbox image that enforces two rules:
    agent gets a non-zero exit from `git push`, and emits `BLOCKED`.
 2. **Tester scope guard**: if the worker role is `tester`, abort the push if any
    file outside `tests/` (or the project's equivalent test directory, configurable
-   via `ORCH_TEST_DIR`) is staged. Prevents tester agents from accidentally fixing
-   implementation bugs instead of reporting them.
+   via `ORCH_TEST_DIR`) is included in the commits/refs being pushed. Prevents
+   tester agents from accidentally pushing implementation fixes instead of
+   reporting them.
 The hook is a shell script committed to `docker/hooks/pre-push` and copied into
 `.git/hooks/` during worker sandbox initialization. Add tests: push a workflow file
 without the flag, assert non-zero exit and structured BLOCKED emitted by the agent.
