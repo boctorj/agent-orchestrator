@@ -226,6 +226,64 @@ inline comments via `gh api .../pulls/N/reviews` (one call with
 """
 
 
+def compose_reviewer_delta_task(
+    feature: Feature,
+    unit: WorkUnit,
+    pr_number: int,
+    prior_sha: str,
+    current_sha: str,
+    prior_findings: str,
+    fix_summary: str,
+) -> str:
+    """Delta-review resume message for an existing reviewer session.
+
+    Sent via ``worker.resume(reviewer_session_id, ...)`` on retry (instead of a
+    cold-start ``spawn_reviewer``). The session already holds the full PR
+    inventory + prior verdict from the first turn, so this message scopes the
+    work to:
+
+      1. Re-diff only ``prior_sha..current_sha`` — skip the clone/inventory
+         step the agent ran on its first turn.
+      2. Reconcile each prior finding as RESOLVED / NOT_RESOLVED / N/A.
+      3. Emit a fresh terminal marker for the *current* PR state.
+
+    The companion "On delta re-review" section in ``prompts/reviewer.md``
+    expands the contract (anti-anchoring guidance, reconciliation table format,
+    when N/A is appropriate).
+    """
+    return f"""DELTA RE-REVIEW — PR #{pr_number}, unit {unit.id}.
+
+The coder pushed a fix in response to your prior REVIEW_REQUEST_CHANGES.
+Reassess the current PR state and emit a fresh terminal marker.
+
+PRIOR_SHA:   {prior_sha or "(unknown — diff from your last reviewed state)"}
+CURRENT_SHA: {current_sha or "(unknown — fetch via gh pr view --json headRefOid)"}
+
+PRIOR_FINDINGS (one-line summary from your last verdict):
+{prior_findings or "(none recorded — consult your inline review comments on the PR)"}
+
+CODER'S FIX SUMMARY (their reply to the fix loop):
+{fix_summary or "(no summary — read PR comments for what they changed)"}
+
+Follow the "On delta re-review" section of your system prompt:
+  - SKIP the full clone/inventory step (1 in The Method) — your session
+    already has the PR loaded; just `git fetch` and diff the new range.
+  - DIFF ONLY `{prior_sha or "PRIOR_SHA"}..{current_sha or "CURRENT_SHA"}`
+    rather than the whole PR; the rest is the same code you already reviewed.
+  - RECONCILE each prior finding as RESOLVED, NOT_RESOLVED, or N/A
+    (with a one-line justification per item).
+  - WATCH FOR ANCHORING: don't auto-endorse just because the coder pushed,
+    and don't dig in just to preserve your prior verdict. Vote the code.
+  - EMIT A FRESH terminal marker for the current state. The orchestrator
+    treats *this* marker as the new verdict — silence on the marker line
+    locks the cap-3 loop. End with EXACTLY ONE of:
+      - `REVIEW_RECOMMEND_MERGE: <reason>` (all prior findings resolved, no new ones)
+      - `REVIEW_REQUEST_CHANGES: <main issue>` (any prior 🔴/🟠 still open, or a new one)
+      - `REVIEW_COMMENT` (only 🟡/🔵 left)
+      - `BLOCKED: <reason>` (couldn't reassess)
+"""
+
+
 def compose_fix_task(
     feature: Feature,
     unit: WorkUnit,
