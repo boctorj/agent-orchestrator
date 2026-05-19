@@ -77,7 +77,7 @@ when spawning.
 **F-016-D-3: Prompt version headers and CI drift gate**
 Add a version header to every composed role prompt at load time:
 ```
-<!-- Role: coder-open · Version: 7 · markers: markers.py@<sha> · composed: <timestamp> -->
+<!-- Role: coder-open · Version: 7 · markers-sha: markers.py@<sha> · composed: <timestamp> -->
 ```
 The `Version` integer is stored as a `version: N` frontmatter field at the top of
 each role prompt file (e.g., `prompts/roles/coder-open.md`). It must be manually
