@@ -1249,6 +1249,61 @@ def cycle_review(feature_id: str, unit_id: str) -> str:
 # --------------------------- send_to_unit (low-level) ---------------------------
 
 
+def _resolve_session_id(unit_state: WorkUnitState, role: str) -> str:
+    """Return the persisted session_id for ``role`` on ``unit_state``.
+
+    Empty string if the role has not been spawned yet (caller decides whether
+    that is an error in context).
+    """
+    return {
+        "coder": unit_state.coder_session_id,
+        "tester": unit_state.tester_session_id,
+        "reviewer": unit_state.reviewer_session_id,
+    }[role]
+
+
+def _resume_role_session(role: str, session_id: str, message: str) -> str:
+    """Resume the role's worker session and return the worker's response.
+
+    Thin wrapper over ``ManagedAgentWorker(role).resume()`` — exists so the
+    ``send_to_unit`` MCP tool can stay declarative about *what* it does
+    (resolve session → resume → record) rather than instantiate workers
+    inline alongside everything else.
+    """
+    worker = ManagedAgentWorker(role=role)
+    return worker.resume(session_id, message)
+
+
+def _record_manual_message(
+    *,
+    unit_id: str,
+    feature_id: str,
+    role: str,
+    session_id: str,
+    message: str,
+    cycle_number: int,
+) -> None:
+    """Append the ``{role}_manual_message`` audit row that pairs with every
+    ``send_to_unit`` invocation.
+
+    Always written, regardless of whether the worker's response carried a
+    structured marker — the audit trail captures *that the human sent
+    something*, distinct from *what the agent emitted in reply* (the latter
+    lives in the marker event recorded just before this one).
+    """
+    state.touch_unit(unit_id)
+    state.record_event(
+        unit_id,
+        feature_id,
+        f"{role}_manual_message",
+        source="human",
+        cycle_number=cycle_number,
+        summary="Manual send_to_unit",
+        session_id=session_id,
+        details=message[:500],
+    )
+
+
 @mcp.tool()
 def send_to_unit(unit_id: str, role: str, message: str) -> str:
     """Low-level: resume a role's session with an arbitrary message.
@@ -1267,34 +1322,22 @@ def send_to_unit(unit_id: str, role: str, message: str) -> str:
     if not unit_state:
         return f"ERROR: no state for unit {unit_id}"
 
-    sid = {
-        "coder": unit_state.coder_session_id,
-        "tester": unit_state.tester_session_id,
-        "reviewer": unit_state.reviewer_session_id,
-    }[role]
+    sid = _resolve_session_id(unit_state, role)
     if not sid:
         return f"ERROR: no {role} session for {unit_id}"
 
     try:
-        worker = ManagedAgentWorker(role=role)
-        response = worker.resume(sid, message)
+        response = _resume_role_session(role, sid, message)
     except Exception as e:  # noqa: BLE001
         state.touch_unit(unit_id, error=str(e))
         return f"ERROR resuming {role}: {e}"
 
-    # Per-role marker scan FIRST (chronological replay: any structured outcome
-    # the agent emitted needs to land in the event log before the human-issued
-    # _manual_message that elicited it). Cross-role markers are ignored — a
-    # tester response containing REVIEW_RECOMMEND_MERGE records only the
-    # _manual_message; we don't want a manual coder ping to flip a unit
-    # in_ci via a reviewer marker the helper wouldn't otherwise honour.
-    #
-    # For role='coder', narrow to {FIX_PUSHED, BLOCKED}: a coder resume returning
-    # PR_URL is anomalous (the unit already has a PR from spawn_unit). Matching
-    # PR_URL here would write a 'pr_opened' event whose details point at the URL
-    # parsed from the response, but the helper never updates WorkUnitState.pr_number
-    # — so subsequent tools like spawn_tester would still reject the unit with
-    # "no branch/PR yet". Symmetric to address_review's marker narrowing.
+    # Per-role marker scan FIRST so any structured outcome lands chronologically
+    # before the human-issued audit row that elicited it. For role='coder',
+    # narrow to {FIX_PUSHED, BLOCKED}: a coder resume returning PR_URL is
+    # anomalous (the unit already has a PR from spawn_unit) and matching it
+    # would drift the audit log from the unit row's pr_number — symmetric to
+    # address_review's marker narrowing.
     _record_terminal_marker(
         unit_id=unit_id,
         feature_id=unit_state.feature_id,
@@ -1304,17 +1347,13 @@ def send_to_unit(unit_id: str, role: str, message: str) -> str:
         cycle_number=unit_state.review_round,
         markers=frozenset({"FIX_PUSHED", "BLOCKED"}) if role == "coder" else None,
     )
-
-    state.touch_unit(unit_id)
-    state.record_event(
-        unit_id,
-        unit_state.feature_id,
-        f"{role}_manual_message",
-        source="human",
-        cycle_number=unit_state.review_round,
-        summary="Manual send_to_unit",
+    _record_manual_message(
+        unit_id=unit_id,
+        feature_id=unit_state.feature_id,
+        role=role,
         session_id=sid,
-        details=message[:500],
+        message=message,
+        cycle_number=unit_state.review_round,
     )
     return response
 
