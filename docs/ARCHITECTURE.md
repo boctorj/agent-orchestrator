@@ -564,12 +564,13 @@ _tester_phase ends with TESTS_PASS
 _copilot_phase + _reviewer_phase
    │
    ▼
-[GATE 3: wait_for_ci final pre-merge confirmation] — defensive
-
-   │
-   ▼
 _emit_terminal('approved_awaiting_merge')
 ```
+
+A clean cycle makes exactly two `wait_for_ci` calls (GATE 1 + GATE 2).
+The reviewer phase's own embedded fix-loop already gates on green after
+any reviewer-driven push, so a final pre-merge re-check would only
+re-pay a poll-interval-rounded wait without adding signal.
 
 Inside `_tester_phase` and `_reviewer_phase`, every `address_review`
 that returns FIX_PUSHED is followed by another `wait_for_ci` BEFORE the
@@ -591,9 +592,10 @@ manually or fall back to `cycle_review` for automation.
 
 Timeouts and grace periods are configurable via env:
 `CI_WAIT_TIMEOUT_SECONDS` (default 600s), `CI_WAIT_POLL_INTERVAL`
-(default 15s), `CI_WAIT_NO_CI_GRACE` (default 30s). "No CI configured"
-(zero check_runs after the grace period) is a pass-through — sandbox
-repos without GitHub Actions still complete a cycle.
+(default 5s — `0` is honored as a busy-poll for tests / very fast CI;
+no lower-bound clamp), `CI_WAIT_NO_CI_GRACE` (default 30s). "No CI
+configured" (zero check_runs after the grace period) is a pass-through
+— sandbox repos without GitHub Actions still complete a cycle.
 
 ### 7c. Multi-feature parallel scheduling
 

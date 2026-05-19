@@ -1160,6 +1160,46 @@ class TestCycleReview:
         parsed = json.loads(out)
         assert parsed["outcome"] == "approved_awaiting_merge"
 
+    def test_clean_run_makes_exactly_two_ci_waits(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """F-012-U-1: clean cycle hits GATE 1 (coder push) + GATE 2 (tester push) only.
+
+        GATE 3's defensive final pre-merge re-check was removed: the reviewer
+        phase's own fix-loop already gates on green. Counting `wait_for_ci`
+        calls is the load-bearing assertion — a regression that re-adds the
+        third call would silently re-pay the ~poll-interval-rounded wait.
+        """
+        _seed_coded_unit()
+        monkeypatch.setattr(
+            execution,
+            "spawn_tester",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "TESTS_PASS"}),
+        )
+        monkeypatch.setattr(
+            execution,
+            "spawn_reviewer",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "REVIEW_RECOMMEND_MERGE"}),
+        )
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_ready_to_merge",
+            lambda *a, **k: True,
+        )
+
+        calls: list[tuple] = []
+
+        def counting_wait(*args, **kwargs):
+            calls.append((args, kwargs))
+            return CIWaitResult(status="green", elapsed_seconds=1.0, total_checks=1)
+
+        monkeypatch.setattr("orchestrator.tools.execution.ci_wait.wait_for_ci", counting_wait)
+
+        out = execution.cycle_review("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "approved_awaiting_merge"
+        assert len(calls) == 2, f"expected 2 CI waits on clean run, got {len(calls)}"
+
 
 # --------------------------- internal helpers ---------------------------
 
