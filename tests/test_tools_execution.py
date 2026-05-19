@@ -676,12 +676,6 @@ class TestSendToUnitTerminalMarker:
                 "reviewer_comment",
             ),
             ("coder", "fixing", "pushed\nFIX_PUSHED", "fix_pushed"),
-            (
-                "coder",
-                "coding",
-                "PR_URL: https://github.com/o/r/pull/42",
-                "pr_opened",
-            ),
         ],
     )
     def test_success_marker_records_event_and_flips_to_in_ci(
@@ -703,6 +697,42 @@ class TestSendToUnitTerminalMarker:
         assert expected_event in types
         assert f"{role}_manual_message" in types
         assert types.index(expected_event) < types.index(f"{role}_manual_message")
+
+    def test_coder_pr_url_via_send_to_unit_does_not_drift_state(self, tmp_state_db, monkeypatch):
+        """A coder resume returning PR_URL (instead of FIX_PUSHED) is anomalous
+        — the unit already has a PR from spawn_unit. The helper's PR_URL branch
+        never updates ``WorkUnitState.pr_number``, so accepting it here would
+        leave the audit log claiming a new PR opened (with the URL parsed from
+        the response) while the row's ``pr_number`` stays stale. Downstream
+        tools like ``spawn_tester`` query ``pr_number``, not the event log —
+        the drift would surface as ``ERROR: no branch/PR yet`` (PR #34 reviewer
+        M1).
+
+        ``send_to_unit`` narrows the coder marker set to ``{FIX_PUSHED,
+        BLOCKED}`` so PR_URL does not match; the response is still returned
+        to the caller verbatim and the manual_message audit row still lands.
+        """
+        # Seed with an EXISTING pr_number that differs from the URL in the
+        # response so a drift would be observable.
+        _seed_unit_for_role("coder", status="coding")
+        existing = state.get_unit_state("F-001-U-1")
+        existing.pr_number = 7
+        state.upsert_unit_state(existing)
+
+        _install_fake_worker(monkeypatch, resume_response="PR_URL: https://github.com/o/r/pull/123")
+
+        execution.send_to_unit("F-001-U-1", "coder", "any update?")
+
+        s = state.get_unit_state("F-001-U-1")
+        # No state drift: pr_number stays at 7, status stays in coding (the
+        # from-state guard wouldn't flip it anyway, but check both ways).
+        assert s.pr_number == 7
+        assert s.status == "coding"
+
+        # No spurious pr_opened event. Only the manual_message audit row.
+        types = [e["event_type"] for e in state.list_events("F-001-U-1")]
+        assert "pr_opened" not in types
+        assert types == ["coder_manual_message"]
 
     # --- non-flipping success-side markers (BUG_FOUND, REQUEST_CHANGES) still record
 

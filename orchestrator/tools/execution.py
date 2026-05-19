@@ -1265,6 +1265,13 @@ def send_to_unit(unit_id: str, role: str, message: str) -> str:
     # tester response containing REVIEW_RECOMMEND_MERGE records only the
     # _manual_message; we don't want a manual coder ping to flip a unit
     # in_ci via a reviewer marker the helper wouldn't otherwise honour.
+    #
+    # For role='coder', narrow to {FIX_PUSHED, BLOCKED}: a coder resume returning
+    # PR_URL is anomalous (the unit already has a PR from spawn_unit). Matching
+    # PR_URL here would write a 'pr_opened' event whose details point at the URL
+    # parsed from the response, but the helper never updates WorkUnitState.pr_number
+    # — so subsequent tools like spawn_tester would still reject the unit with
+    # "no branch/PR yet". Symmetric to address_review's marker narrowing.
     _record_terminal_marker(
         unit_id=unit_id,
         feature_id=unit_state.feature_id,
@@ -1272,6 +1279,7 @@ def send_to_unit(unit_id: str, role: str, message: str) -> str:
         response=response,
         session_id=sid,
         cycle_number=unit_state.review_round,
+        markers=frozenset({"FIX_PUSHED", "BLOCKED"}) if role == "coder" else None,
     )
 
     state.touch_unit(unit_id)
