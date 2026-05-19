@@ -1345,10 +1345,12 @@ def _reviewer_phase(ctx: CycleContext) -> tuple[bool, str | None]:
     if isinstance(outcome, str) and outcome.startswith("BLOCKED"):
         return False, "reviewer blocked"
 
-    # Anchor for the next retry's delta range — whatever SHA we just reviewed.
-    _capture_reviewed_sha(ctx)
-
     while outcome == "REVIEW_REQUEST_CHANGES":
+        # Anchor the next delta range on what the reviewer just saw. Done
+        # inside the loop (not after the initial spawn) so a clean first
+        # review skips the gh GET — the anchor is only consulted on retry.
+        _capture_reviewed_sha(ctx)
+
         unit_state = state.get_unit_state(ctx.unit_id)
         if unit_state is None or unit_state.review_round >= CAP_3:
             return False, f"cap of {CAP_3} cycles hit while addressing reviewer"
@@ -1395,8 +1397,6 @@ def _reviewer_phase(ctx: CycleContext) -> tuple[bool, str | None]:
         outcome = reviewer_out.get("outcome")
         if isinstance(outcome, str) and outcome.startswith("BLOCKED"):
             return False, "reviewer blocked on retry"
-
-        _capture_reviewed_sha(ctx)
 
     if outcome in ("REVIEW_COMMENT", "REVIEW_RECOMMEND_MERGE"):
         return True, None

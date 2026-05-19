@@ -369,15 +369,26 @@ individually before deciding the marker — use it.
 - Acknowledging Copilot's findings (already done unless Copilot posted
   again in the delta window).
 
-### When `PRIOR_SHA` is unknown
+### When PRIOR_SHA or CURRENT_SHA is unknown
 
 The delta message falls back to `(unknown — diff from your last reviewed
-state)` when the orchestrator couldn't capture the SHA before resume.
-In that case:
+state)` for PRIOR_SHA, or `(unknown — fetch via gh pr view --json
+headRefOid)` for CURRENT_SHA, when the orchestrator couldn't capture
+the SHA before resume.
+
+For **PRIOR_SHA** unknown:
 
 1. `gh pr view <pr_number> --json commits --jq '.commits[-2:]'` —
    identify the new commit(s) by author/timestamp vs what you remember.
 2. Diff from the parent of those commits onward.
+3. Note the SHA inference in your top-level body so the human can audit.
+
+For **CURRENT_SHA** unknown (the gh API call from the orchestrator failed):
+
+1. `gh pr view <pr_number> --json headRefOid --jq .headRefOid` — fetch
+   the head SHA directly from inside the sandbox.
+2. Use that as the right-hand side of the diff range
+   (`git diff PRIOR_SHA..<head>`).
 3. Note the SHA inference in your top-level body so the human can audit.
 
 ## Red Flags — STOP and re-read

@@ -251,7 +251,7 @@ def compose_reviewer_delta_task(
     expands the contract (anti-anchoring guidance, reconciliation table format,
     when N/A is appropriate).
     """
-    return f"""DELTA RE-REVIEW — PR #{pr_number}, unit {unit.id}.
+    return f"""DELTA RE-REVIEW — PR #{pr_number} ({feature.title}), unit {unit.id}.
 
 The coder pushed a fix in response to your prior REVIEW_REQUEST_CHANGES.
 Reassess the current PR state and emit a fresh terminal marker.
