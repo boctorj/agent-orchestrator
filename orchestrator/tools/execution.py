@@ -1070,6 +1070,98 @@ def _wait_ci_with_fix_loop(ctx: CycleContext, label: str) -> tuple[bool, str | N
         unit_state = state.get_unit_state(ctx.unit_id) or unit_state
 
 
+_TESTER_RESUME_RECOVERY_PROMPT = (
+    "Your previous response was lost to a network timeout in the orchestrator. "
+    "The PR is still open and CI is currently green. Please re-evaluate the "
+    "current PR head and re-emit your verdict marker (TESTS_PASS / BUG_FOUND / "
+    "BLOCKED) — do not redo test work you already completed. Output only the "
+    "marker on its own line."
+)
+
+
+def _resume_or_spawn_tester(feature_id: str, unit_id: str) -> str:
+    """Resume an existing tester session, or delegate to ``spawn_tester``.
+
+    ``cycle_review`` re-entering a unit whose previous ``_tester_phase`` died
+    on a network timeout previously caused ``spawn_tester`` to error with
+    "tester session already exists" — surfacing as an "unexpected outcome: RAW"
+    escalation. This helper detects the orphaned session, resumes it for a
+    cheap verdict re-emission, and returns a result in the same JSON shape
+    ``_record_step`` expects from a fresh ``spawn_tester`` call so
+    ``_tester_phase`` parses it identically.
+
+    Only the ``_tester_phase`` initial-call site uses this. The interior
+    retry site clears ``tester_session_id`` before calling ``spawn_tester``
+    directly, so the orphan condition cannot arise there.
+    """
+    unit_state = state.get_unit_state(unit_id)
+    if unit_state is None or not unit_state.tester_session_id:
+        return spawn_tester(feature_id, unit_id)
+
+    session_id = unit_state.tester_session_id
+    cycle_number = unit_state.review_round
+
+    try:
+        response = _resume_role_session("tester", session_id, _TESTER_RESUME_RECOVERY_PROMPT)
+    except Exception as e:  # noqa: BLE001 — surface as orchestrator error
+        state.touch_unit(unit_id, status="escalated", error=str(e))
+        state.record_event(
+            unit_id,
+            feature_id,
+            "tester_resume_error",
+            source="orchestrator",
+            cycle_number=cycle_number,
+            summary=str(e),
+        )
+        return f"ERROR resuming tester: {e}"
+
+    marker = _record_terminal_marker(
+        unit_id=unit_id,
+        feature_id=feature_id,
+        role="tester",
+        response=response,
+        session_id=session_id,
+        cycle_number=cycle_number,
+    )
+
+    if marker is None:
+        return _escalate_no_marker(
+            unit_id=unit_id,
+            feature_id=feature_id,
+            role="tester",
+            cycle_number=cycle_number,
+            session_id=session_id,
+            response=response,
+        )
+
+    if marker["marker"] == "TESTS_PASS":
+        return json.dumps(
+            {
+                "unit_id": unit_id,
+                "outcome": "TESTS_PASS",
+                "session_id": session_id,
+                "summary": tail(response),
+            },
+            indent=2,
+        )
+
+    if marker["marker"] == "BUG_FOUND":
+        return json.dumps(
+            {
+                "unit_id": unit_id,
+                "outcome": "BUG_FOUND",
+                "bug": marker["bug"],
+                "session_id": session_id,
+                "summary": tail(response),
+            },
+            indent=2,
+        )
+
+    # marker["marker"] == "BLOCKED"
+    payload = marker["payload"]
+    return f"BLOCKED — tester for {unit_id} [{payload.reason}]: {payload.prose}"
+
+
 def _tester_phase(ctx: CycleContext) -> tuple[bool, str | None]:
     """Run tester until TESTS_PASS or escalation. Returns (passed, escalation_msg).
 
@@ -1077,7 +1169,7 @@ def _tester_phase(ctx: CycleContext) -> tuple[bool, str | None]:
     After every coder fix push, waits for CI green before re-spawning the
     tester (the fix might break CI even if the tester would re-pass).
     """
-    tester_out = _record_step(ctx, "tester", spawn_tester(ctx.feature_id, ctx.unit_id))
+    tester_out = _record_step(ctx, "tester", _resume_or_spawn_tester(ctx.feature_id, ctx.unit_id))
     outcome = tester_out.get("outcome")
 
     if isinstance(outcome, str) and outcome.startswith("BLOCKED"):

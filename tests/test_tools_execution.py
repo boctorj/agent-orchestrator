@@ -1908,3 +1908,122 @@ class TestStructuredBlockedPayload:
 
         s = state.get_unit_state("F-001-U-1")
         assert "[unknown]" in s.last_error
+
+
+# --------------------------- F-013-U-1: _resume_or_spawn_tester ---------------------------
+
+
+class TestResumeOrSpawnTester:
+    """F-013-U-1: helper that detects an orphaned tester session on the unit
+    and resumes it (re-emitting the verdict marker) instead of letting the
+    initial spawn_tester call inside `_tester_phase` error out with
+    "session already exists" — which cycle_review previously surfaced as
+    an unhelpful "tester ended with unexpected outcome: RAW" escalation.
+    """
+
+    def test_delegates_to_spawn_tester_when_no_session(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """With `tester_session_id` empty, the helper just calls spawn_tester
+        and returns its raw response unchanged."""
+        _seed_coded_unit()  # no tester_session_id set
+        calls: list[tuple[str, str]] = []
+
+        def fake_spawn_tester(fid: str, uid: str) -> str:
+            calls.append((fid, uid))
+            return json.dumps({"unit_id": uid, "outcome": "TESTS_PASS", "session_id": "fresh"})
+
+        monkeypatch.setattr(execution, "spawn_tester", fake_spawn_tester)
+
+        out = execution._resume_or_spawn_tester("F-001", "F-001-U-1")
+        assert calls == [("F-001", "F-001-U-1")]
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "TESTS_PASS"
+        assert parsed["session_id"] == "fresh"
+
+    def test_resumes_session_and_records_tests_pass(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """With `tester_session_id` set, the helper resumes the worker and
+        returns a JSON outcome of TESTS_PASS that `_record_step` parses the
+        same way as a fresh `spawn_tester` output. Also records a
+        `tests_pass` event for the audit trail."""
+        _seed_coded_unit()
+        s = state.get_unit_state("F-001-U-1")
+        s.tester_session_id = "stale-tester-sid"
+        state.upsert_unit_state(s)
+
+        instances = _install_fake_worker(monkeypatch, resume_response="TESTS_PASS")
+        _stub_github(monkeypatch)
+
+        # Must NOT delegate to spawn_tester — fail loudly if it does
+        def boom(*a, **k):
+            raise AssertionError("should resume, not spawn")
+
+        monkeypatch.setattr(execution, "spawn_tester", boom)
+
+        out = execution._resume_or_spawn_tester("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "TESTS_PASS"
+        assert parsed["session_id"] == "stale-tester-sid"
+
+        # Worker was resumed with the stale session id and the recovery prompt
+        tester_worker = instances["tester"]
+        assert len(tester_worker.resume_calls) == 1
+        sid, msg = tester_worker.resume_calls[0]
+        assert sid == "stale-tester-sid"
+        assert "re-emit" in msg and "TESTS_PASS" in msg
+
+        # Audit trail: tests_pass event recorded by _record_terminal_marker
+        types = [e["event_type"] for e in state.list_events("F-001-U-1")]
+        assert "tests_pass" in types
+
+
+class TestCycleReviewRecoversOrphanedTesterSession:
+    """Regression for the F-013 root-cause bug: `cycle_review` re-entering a
+    unit whose previous `_tester_phase` died on a network timeout (leaving a
+    non-empty `tester_session_id` but no terminal marker recorded) used to
+    escalate with `outcome=escalated` / `message="tester ended with
+    unexpected outcome: RAW"` because the FIRST `spawn_tester` call hit
+    "tester session already exists" and `_record_step` parsed the error
+    string as RAW.
+
+    With `_resume_or_spawn_tester` wired into `_tester_phase`, the orphaned
+    session is resumed (re-emits its verdict) and the cycle proceeds normally.
+    """
+
+    def test_does_not_escalate_with_raw_outcome(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        # Mimic the post-timeout state: tester session id persisted, CI green
+        # (the autouse `_ci_green` fixture handles that), no terminal marker.
+        s = state.get_unit_state("F-001-U-1")
+        s.tester_session_id = "stale-tester-sid"
+        state.upsert_unit_state(s)
+
+        # Per-role workers: tester resume re-emits TESTS_PASS; reviewer spawns
+        # fresh and recommends merge so cycle_review can reach the happy path.
+        def factory(role: str) -> FakeWorker:
+            spawn = {
+                "tester": "TESTS_PASS",
+                "reviewer": "REVIEW_RECOMMEND_MERGE: clean",
+            }.get(role, "")
+            resume = "TESTS_PASS" if role == "tester" else ""
+            return FakeWorker(role, spawn, resume)
+
+        monkeypatch.setattr("orchestrator.tools.execution.ManagedAgentWorker", factory)
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_ready_to_merge", lambda *a, **k: True
+        )
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_escalation", lambda *a, **k: True
+        )
+
+        out = execution.cycle_review("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+
+        # The original failure mode produced both of these — neither should land
+        assert parsed["outcome"] != "escalated"
+        assert "unexpected outcome: RAW" not in parsed["message"]
+        # Positive assertion: cycle reached terminal success
+        assert parsed["outcome"] == "approved_awaiting_merge"
