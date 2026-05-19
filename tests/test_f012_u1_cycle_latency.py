@@ -124,7 +124,7 @@ class TestDefaultPollIntervalIsFiveSeconds:
         someone bumps the default back up but the env-override path masks it
         in CI shells that happen to set the var.
         """
-        src = (REPO_ROOT / "orchestrator" / "ci_wait.py").read_text()
+        src = (REPO_ROOT / "orchestrator" / "ci_wait.py").read_text(encoding="utf-8")
         # Match: os.getenv("CI_WAIT_POLL_INTERVAL", "<digits>")
         m = re.search(
             r'os\.getenv\(\s*"CI_WAIT_POLL_INTERVAL"\s*,\s*"(\d+)"\s*\)',
@@ -376,7 +376,7 @@ class TestCycleReviewTwoCIWaitsOnly:
         a partial re-add (e.g. wrong label, same logic) could still pass a
         2-call assertion by accident depending on how it's wired.
         """
-        src = (REPO_ROOT / "orchestrator" / "tools" / "execution.py").read_text()
+        src = (REPO_ROOT / "orchestrator" / "tools" / "execution.py").read_text(encoding="utf-8")
         # The original block's distinguishing comment header.
         assert "GATE 3 (defensive)" not in src, (
             "execution.py still references the deleted GATE-3 defensive block"
@@ -396,7 +396,7 @@ class TestArchitectureDocumentsNewDefaults:
     """`docs/ARCHITECTURE.md` mentions the new 5s default and 0-as-busy-poll."""
 
     def test_architecture_md_states_5s_default(self):
-        text = (REPO_ROOT / "docs" / "ARCHITECTURE.md").read_text()
+        text = (REPO_ROOT / "docs" / "ARCHITECTURE.md").read_text(encoding="utf-8")
         # The env-knobs paragraph must reference CI_WAIT_POLL_INTERVAL with
         # a `5s` default (not `15s`). Regex pinned to the same line family
         # used in the existing prose so a future re-word still trips if the
@@ -425,7 +425,7 @@ class TestArchitectureDocumentsNewDefaults:
         )
 
     def test_architecture_md_describes_zero_as_busy_poll(self):
-        text = (REPO_ROOT / "docs" / "ARCHITECTURE.md").read_text()
+        text = (REPO_ROOT / "docs" / "ARCHITECTURE.md").read_text(encoding="utf-8")
         assert "busy-poll" in text.lower(), (
             "ARCHITECTURE.md must describe the `0` poll-interval semantics "
             "(busy-poll / no clamp) per F-012-U-1"
@@ -438,7 +438,7 @@ class TestArchitectureDocumentsNewDefaults:
         confirmation]` line. Removing the block was an explicit part of the
         unit's scope.
         """
-        text = (REPO_ROOT / "docs" / "ARCHITECTURE.md").read_text()
+        text = (REPO_ROOT / "docs" / "ARCHITECTURE.md").read_text(encoding="utf-8")
         assert "GATE 3:" not in text, (
             "ARCHITECTURE.md still references `GATE 3:` in the cycle-review diagram"
         )
