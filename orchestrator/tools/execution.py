@@ -988,8 +988,9 @@ def _wait_ci_with_fix_loop(ctx: CycleContext, label: str) -> tuple[bool, str | N
       - timeout        → return (False, msg) — cycle_review escalates.
       - cap hit during CI-fix loop → return (False, msg).
 
-    ``label`` describes which push we're gating on (e.g. "coder push",
-    "tester push", "final pre-merge") for ctx.history breadcrumbs.
+    ``label`` describes which push we're gating on (e.g. "coder PR push",
+    "tester test push", "tester-bug fix push", "reviewer-changes fix push")
+    for ctx.history breadcrumbs.
     """
     unit_state = state.get_unit_state(ctx.unit_id)
     feature = state.get_feature(ctx.feature_id)

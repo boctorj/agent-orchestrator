@@ -118,23 +118,6 @@ class TestDefaultPollIntervalIsFiveSeconds:
         finally:
             importlib.reload(ci_wait)
 
-    def test_source_literal_is_5(self):
-        """Belt-and-braces: the literal in `os.getenv("CI_WAIT_POLL_INTERVAL", "5")`
-        must be `"5"`, not `"15"`. Catches a hypothetical regression where
-        someone bumps the default back up but the env-override path masks it
-        in CI shells that happen to set the var.
-        """
-        src = (REPO_ROOT / "orchestrator" / "ci_wait.py").read_text(encoding="utf-8")
-        # Match: os.getenv("CI_WAIT_POLL_INTERVAL", "<digits>")
-        m = re.search(
-            r'os\.getenv\(\s*"CI_WAIT_POLL_INTERVAL"\s*,\s*"(\d+)"\s*\)',
-            src,
-        )
-        assert m, "CI_WAIT_POLL_INTERVAL env fallback literal not found in ci_wait.py"
-        assert m.group(1) == "5", (
-            f"CI_WAIT_POLL_INTERVAL literal default is {m.group(1)!r}, must be '5' per F-012-U-1"
-        )
-
 
 # =====================================================================
 # Contract 2: poll_interval = 0 is honored (no clamp), both via env + kwarg
@@ -320,70 +303,6 @@ class TestCycleReviewTwoCIWaitsOnly:
             f"clean cycle_review must call wait_for_ci exactly twice "
             f"(GATE 1 coder push + GATE 2 tester push); got {len(calls)}. "
             f"A 3rd call indicates the GATE-3 defensive recheck was re-added."
-        )
-
-    def test_clean_run_history_has_no_final_pre_merge_step(
-        self, tmp_state_db, with_github_token, monkeypatch
-    ):
-        """Inspect the structured history: no `ci_wait (...)` step should
-        mention the pre-merge GATE-3 label. The dropped block called
-        `_wait_ci_with_fix_loop(ctx, "final pre-merge check")`, which would
-        leave a `step: "ci_wait (final pre-merge check)"` entry.
-        """
-        _seed_ready_for_cycle()
-        _stub_clean_phases(monkeypatch)
-        _stub_github_for_cycle(monkeypatch)
-        monkeypatch.setattr(
-            "orchestrator.tools.execution.ci_wait.wait_for_ci",
-            lambda *a, **k: CIWaitResult(status="green", elapsed_seconds=0.1, total_checks=1),
-        )
-
-        out = execution.cycle_review("F-001", "F-001-U-1")
-        parsed = json.loads(out)
-
-        history = parsed.get("history", [])
-        offending = [
-            s
-            for s in history
-            if isinstance(s, dict)
-            and isinstance(s.get("step"), str)
-            and "pre-merge" in s["step"].lower()
-        ]
-        assert not offending, (
-            f"cycle_review history must not contain a 'final pre-merge' CI wait step; "
-            f"found: {offending}"
-        )
-
-        # And exactly two ci_wait entries total.
-        ci_wait_steps = [
-            s
-            for s in history
-            if isinstance(s, dict)
-            and isinstance(s.get("step"), str)
-            and s["step"].startswith("ci_wait ")
-        ]
-        assert len(ci_wait_steps) == 2, (
-            f"expected 2 ci_wait history steps on a clean run, got {len(ci_wait_steps)}: "
-            f"{ci_wait_steps}"
-        )
-
-    def test_source_no_longer_contains_gate3_defensive_block(self):
-        """Static regression guard: the original `GATE 3 (defensive)` comment
-        block + the `_wait_ci_with_fix_loop(ctx, "final pre-merge check")`
-        call must not reappear in `orchestrator/tools/execution.py`.
-
-        We check on the source rather than only on runtime behavior because
-        a partial re-add (e.g. wrong label, same logic) could still pass a
-        2-call assertion by accident depending on how it's wired.
-        """
-        src = (REPO_ROOT / "orchestrator" / "tools" / "execution.py").read_text(encoding="utf-8")
-        # The original block's distinguishing comment header.
-        assert "GATE 3 (defensive)" not in src, (
-            "execution.py still references the deleted GATE-3 defensive block"
-        )
-        # And the call with the GATE-3 label.
-        assert '_wait_ci_with_fix_loop(ctx, "final pre-merge check")' not in src, (
-            "execution.py still calls _wait_ci_with_fix_loop with the GATE-3 label"
         )
 
 

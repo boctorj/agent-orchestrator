@@ -1546,7 +1546,7 @@ class TestCycleReviewCIGate:
         _stub_github(monkeypatch)
 
         # Drive CI: first call (gate 1, pre-tester) = failed, then green for
-        # all subsequent calls (post-fix wait, gate 2 after tester, gate 3 final).
+        # all subsequent calls (post-fix wait, gate 2 after tester).
         results = iter(
             [
                 CIWaitResult(
