@@ -1947,7 +1947,8 @@ class TestResumeOrSpawnTester:
         """With `tester_session_id` set, the helper resumes the worker and
         returns a JSON outcome of TESTS_PASS that `_record_step` parses the
         same way as a fresh `spawn_tester` output. Also records a
-        `tests_pass` event for the audit trail."""
+        `tests_pass` event for the audit trail and a `tester_resume`
+        breadcrumb so the recovery branch is visible to operators."""
         _seed_coded_unit()
         s = state.get_unit_state("F-001-U-1")
         s.tester_session_id = "stale-tester-sid"
@@ -1974,9 +1975,201 @@ class TestResumeOrSpawnTester:
         assert sid == "stale-tester-sid"
         assert "re-emit" in msg and "TESTS_PASS" in msg
 
-        # Audit trail: tests_pass event recorded by _record_terminal_marker
-        types = [e["event_type"] for e in state.list_events("F-001-U-1")]
+        # Audit trail: tester_resume breadcrumb fires BEFORE the marker event
+        # (chronological replay order). The tester_resume row is what tells
+        # an operator the recovery branch was chosen over a fresh spawn —
+        # without it there's no breadcrumb for "why is there a tests_pass
+        # against the orphan session and no spawn_tester event".
+        events = state.list_events("F-001-U-1")
+        types = [e["event_type"] for e in events]
+        assert "tester_resume" in types
         assert "tests_pass" in types
+        assert types.index("tester_resume") < types.index("tests_pass")
+
+    def test_resume_tests_pass_fires_dismiss_and_comment_side_effects(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """The TESTS_PASS branch must mirror `spawn_tester:317-327`'s PR-side
+        actions on a resume hit too: dismiss any prior tester REQUEST_CHANGES
+        review (so branch protection's "Require resolution of changes requested"
+        doesn't block the eventual merge) and post the operator-visible
+        same-user COMMENT breadcrumb.
+
+        The orphan tester is typically the *retry* tester from a cycle N-1
+        BUG_FOUND → fix-loop, so the prior REQUEST_CHANGES is real. Without
+        the dismissal, `cycle_review` can drive the PR to
+        `approved_awaiting_merge` while a stale tester review still blocks
+        the merge — defeating the point of F-013.
+        """
+        _seed_coded_unit()
+        s = state.get_unit_state("F-001-U-1")
+        s.tester_session_id = "stale-tester-sid"
+        state.upsert_unit_state(s)
+
+        _install_fake_worker(monkeypatch, resume_response="TESTS_PASS")
+
+        dismiss_calls: list[tuple] = []
+        review_calls: list[tuple] = []
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.safe_dismiss_own_change_requests",
+            lambda *a, **k: dismiss_calls.append((a, k)) or 0,
+        )
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.safe_submit_pr_review",
+            lambda *a, **k: review_calls.append((a, k)) or "",
+        )
+        monkeypatch.setattr("orchestrator.tools.execution.safe_comment_pr", lambda *a, **k: "")
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.github.parse_repo_url",
+            lambda url: ("owner", "repo"),
+        )
+
+        execution._resume_or_spawn_tester("F-001", "F-001-U-1")
+
+        # Both side-effect counters fire exactly once on the resume path
+        # (matched 1:1 with the spawn path — see TestSpawnTester.test_tests_pass).
+        assert len(dismiss_calls) == 1, (
+            f"resume TESTS_PASS must dismiss prior REQUEST_CHANGES (M5); "
+            f"got {len(dismiss_calls)} calls"
+        )
+        assert len(review_calls) == 1, (
+            f"resume TESTS_PASS must post same-user COMMENT breadcrumb (M5); "
+            f"got {len(review_calls)} calls"
+        )
+
+        # Dismissal targets the unit's actual PR with the expected reason text
+        args, _ = dismiss_calls[0]
+        assert args[0] == "https://github.com/o/r"
+        assert args[1] == 5  # pr_number from _seed_coded_unit
+        assert "Tests pass on retry" in args[2]
+
+        # COMMENT review carries the session-id breadcrumb and event=COMMENT
+        args, kwargs = review_calls[0]
+        assert args[0] == "https://github.com/o/r"
+        assert args[1] == 5
+        assert "stale-tester-sid" in args[2]
+        assert kwargs.get("event") == "COMMENT"
+
+    def test_resume_blocked_returns_json_outcome_not_raw(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """A BLOCKED resume must return a JSON outcome (not the bare
+        `BLOCKED — ...` string that `spawn_tester` returns). `_record_step`
+        falls back to `outcome="RAW"` on non-JSON, and `_tester_phase`'s
+        `outcome.startswith("BLOCKED")` short-circuit checks the parsed
+        outcome — not the raw blob — so a bare string would re-surface
+        the very "unexpected outcome: RAW" escalation this PR exists to
+        eliminate (M1).
+        """
+        _seed_coded_unit()
+        s = state.get_unit_state("F-001-U-1")
+        s.tester_session_id = "stale-tester-sid"
+        state.upsert_unit_state(s)
+
+        _install_fake_worker(
+            monkeypatch,
+            resume_response="tried again\nBLOCKED: reason=ci_tool_missing tool=pytest | gone",
+        )
+
+        comment_calls: list[tuple] = []
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.safe_comment_pr",
+            lambda *a, **k: comment_calls.append((a, k)) or "",
+        )
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.github.parse_repo_url",
+            lambda url: ("owner", "repo"),
+        )
+
+        out = execution._resume_or_spawn_tester("F-001", "F-001-U-1")
+        parsed = json.loads(out)  # Must be valid JSON, not bare prose
+        assert parsed["outcome"] == "BLOCKED"
+        assert parsed["reason"] == "ci_tool_missing"
+        assert "gone" in parsed["prose"]
+        assert parsed["session_id"] == "stale-tester-sid"
+
+        # PR comment fires on the resume BLOCKED path too (mirrors spawn_tester:356-360)
+        assert len(comment_calls) == 1
+        args, _ = comment_calls[0]
+        assert args[1] == 5  # pr_number
+        assert "Tester BLOCKED" in args[2]
+        assert "ci_tool_missing" in args[2]
+
+        # _record_step + _tester_phase parse this as outcome="BLOCKED",
+        # which `startswith("BLOCKED")` correctly catches — closing the M1 gap.
+        ctx = execution.CycleContext(feature_id="F-001", unit_id="F-001-U-1", history=[])
+        parsed_step = execution._record_step(ctx, "tester", out)
+        assert parsed_step["outcome"] == "BLOCKED"
+        assert parsed_step["outcome"] != "RAW"
+
+    def test_resume_flips_status_to_testing_during_resume(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """While the resume worker is running (minutes on the real wire),
+        the unit must show `testing` — not the prior `in_ci` from
+        cycle_review's GATE 1 — so dashboards/`unit_summary` aren't
+        misleading. Captured via a hook in the resume call (M4).
+        """
+        _seed_coded_unit()
+        s = state.get_unit_state("F-001-U-1")
+        s.tester_session_id = "stale-tester-sid"
+        # Start in in_ci as cycle_review's GATE 1 would leave it
+        s.status = "in_ci"
+        state.upsert_unit_state(s)
+
+        observed_during_resume: list[str] = []
+
+        class StatusObservingWorker:
+            def __init__(self, role: str) -> None:
+                self.role = role
+
+            def resume(self, sid: str, msg: str) -> str:
+                cur = state.get_unit_state("F-001-U-1")
+                observed_during_resume.append(cur.status if cur else "<none>")
+                return "TESTS_PASS"
+
+            def spawn(self, *a, **k):  # pragma: no cover — not used on resume path
+                raise AssertionError("must resume, not spawn")
+
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ManagedAgentWorker", StatusObservingWorker
+        )
+        _stub_github(monkeypatch)
+
+        execution._resume_or_spawn_tester("F-001", "F-001-U-1")
+
+        assert observed_during_resume == ["testing"], (
+            f"unit must be in `testing` during resume (M4); observed {observed_during_resume}"
+        )
+
+    def test_resume_phase_blocked_surfaces_tester_blocked_not_raw(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """End-to-end `_tester_phase` assertion for M1/M3: a BLOCKED resume
+        must surface `(False, "tester blocked")` from `_tester_phase`, not
+        `(False, "tester ended with unexpected outcome: RAW")`. This is the
+        observable behaviour M3 asked for — the explicit phase-level test
+        that the looser tests in the broader matrix were silently allowing
+        to regress."""
+        _seed_coded_unit()
+        s = state.get_unit_state("F-001-U-1")
+        s.tester_session_id = "stale-tester-sid"
+        state.upsert_unit_state(s)
+
+        _install_fake_worker(
+            monkeypatch,
+            resume_response="BLOCKED: reason=auth_failure | gh token expired",
+        )
+        _stub_github(monkeypatch)
+
+        ctx = execution.CycleContext(feature_id="F-001", unit_id="F-001-U-1", history=[])
+        passed, msg = execution._tester_phase(ctx)
+
+        assert passed is False
+        assert msg == "tester blocked", (
+            f"_tester_phase must surface 'tester blocked' on a BLOCKED resume, "
+            f"not the misleading 'unexpected outcome: RAW' fallback; got msg={msg!r}"
+        )
 
 
 class TestCycleReviewRecoversOrphanedTesterSession:

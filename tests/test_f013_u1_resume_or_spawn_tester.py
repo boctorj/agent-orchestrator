@@ -1,8 +1,17 @@
-"""Independent tester-agent tests for F-013-U-1.
+"""Extended F-013-U-1 coverage for ``_resume_or_spawn_tester``.
 
-The unit adds a ``_resume_or_spawn_tester(feature_id, unit_id)`` helper to
-``orchestrator/tools/execution.py`` and rewires the **initial** call site
-inside ``_tester_phase`` from ``spawn_tester(...)`` to
+Supplements the spec-shaped tests in
+``tests/test_tools_execution.py::TestResumeOrSpawnTester`` /
+``TestCycleReviewRecoversOrphanedTesterSession`` with a per-behaviour
+matrix (one test class per observable property). The split exists
+because the spec-shaped trio is short by design — the matrix here
+covers edge cases the spec doesn't mention (recovery-prompt content,
+retry-site wire-up, audit-event chronology, JSON round-trip through
+``_record_step``).
+
+The unit adds a ``_resume_or_spawn_tester(feature_id, unit_id)`` helper
+to ``orchestrator/tools/execution.py`` and rewires the **initial** call
+site inside ``_tester_phase`` from ``spawn_tester(...)`` to
 ``_resume_or_spawn_tester(...)``. Behaviour:
 
   * If ``unit_state.tester_session_id`` is empty → delegate to
@@ -24,11 +33,6 @@ escalated as ``outcome="escalated"`` / message ``"tester ended with
 unexpected outcome: RAW"`` because the first ``spawn_tester`` errored
 with "tester session already exists" and ``_record_step`` parsed the
 error string as a RAW outcome.
-
-These tests are independent of the coder's tests in
-``tests/test_tools_execution.py::TestResumeOrSpawnTester`` /
-``TestCycleReviewRecoversOrphanedTesterSession`` — divergences should
-flag drift in either direction.
 """
 
 from __future__ import annotations
@@ -362,9 +366,18 @@ class TestResumeReturnsShapeRecordStepConsumes:
         assert out.get("bug") == bug_text
 
     def test_resume_blocked_propagates_marker(self, tmp_state_db, with_github_token, monkeypatch):
-        """BLOCKED on resume must be passed through in a form
-        ``_record_step`` parses as ``outcome.startswith("BLOCKED")``
-        (matching how ``_tester_phase`` short-circuits on tester blocks)."""
+        """BLOCKED on resume must round-trip through ``_record_step`` as a
+        parsed JSON outcome of ``"BLOCKED"`` — NOT a RAW fallback whose
+        outcome field is the literal string ``"RAW"``.
+
+        Earlier this test accepted both shapes (parsed BLOCKED *or* RAW
+        fallback with a BLOCKED prefix on the raw blob). The RAW fork was
+        masking M1: ``_tester_phase``'s ``outcome.startswith("BLOCKED")``
+        short-circuit checks the parsed ``outcome`` field, not the raw
+        blob, so a RAW outcome would fall through to the
+        "unexpected outcome: RAW" branch — the exact bug this PR exists
+        to fix.
+        """
         _seed_feature_and_unit(tester_session_id="stale-sid")
         _install_workers(
             monkeypatch,
@@ -381,23 +394,18 @@ class TestResumeReturnsShapeRecordStepConsumes:
 
         raw = execution._resume_or_spawn_tester("F-013", "F-013-U-1")
 
-        # The wire path: `_record_step` → outcome string startswith "BLOCKED"
         ctx = execution.CycleContext(feature_id="F-013", unit_id="F-013-U-1", history=[])
         out = execution._record_step(ctx, "tester", raw)
         outcome = out.get("outcome")
-        # Either a parsed JSON outcome that starts with BLOCKED, or the RAW
-        # fallback whose raw string starts with BLOCKED — `_tester_phase`'s
-        # ``isinstance(outcome, str) and outcome.startswith("BLOCKED")``
-        # branch covers the RAW-string case.
-        if outcome == "RAW":
-            raw_blob = out.get("raw", "")
-            assert raw_blob.startswith("BLOCKED"), (
-                f"_record_step RAW fallback must preserve BLOCKED prefix; got: {raw_blob!r}"
-            )
-        else:
-            assert isinstance(outcome, str) and outcome.startswith("BLOCKED"), (
-                f"resume-path BLOCKED outcome must start with 'BLOCKED'; got: {outcome!r}"
-            )
+        # Strict assertion (no RAW fallback): the resume helper must return
+        # parseable JSON so _tester_phase's startswith("BLOCKED") fires.
+        assert outcome != "RAW", (
+            "resume BLOCKED must not fall through _record_step's RAW fallback "
+            "— that re-creates the 'unexpected outcome: RAW' bug (M1)"
+        )
+        assert isinstance(outcome, str) and outcome.startswith("BLOCKED"), (
+            f"resume-path BLOCKED outcome must be the literal string 'BLOCKED'; got: {outcome!r}"
+        )
 
         # And the unit status is now escalated, per _record_terminal_marker
         s = state.get_unit_state("F-013-U-1")

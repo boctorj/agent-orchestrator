@@ -1086,9 +1086,26 @@ def _resume_or_spawn_tester(feature_id: str, unit_id: str) -> str:
     on a network timeout previously caused ``spawn_tester`` to error with
     "tester session already exists" — surfacing as an "unexpected outcome: RAW"
     escalation. This helper detects the orphaned session, resumes it for a
-    cheap verdict re-emission, and returns a result in the same JSON shape
-    ``_record_step`` expects from a fresh ``spawn_tester`` call so
-    ``_tester_phase`` parses it identically.
+    cheap verdict re-emission, and returns a result ``_record_step`` parses
+    such that ``_tester_phase`` reaches the right branch.
+
+    Behaviour parity with ``spawn_tester`` on a resume hit:
+      - status flips to ``testing`` while the worker runs (so dashboards
+        don't show the stale ``in_ci`` from cycle_review's GATE 1);
+      - a ``tester_resume`` audit row is written before the resume call so
+        operators can tell the recovery branch was chosen over a fresh spawn;
+      - the TESTS_PASS branch dismisses any prior tester REQUEST_CHANGES
+        review and posts the same-user COMMENT breadcrumb (the orphan is
+        typically the *retry* tester from a cycle N-1 BUG_FOUND → fix-loop,
+        so the prior REQUEST_CHANGES is real and would otherwise block
+        merge under "Require resolution of changes requested" protection);
+      - the BLOCKED branch posts the same PR comment and returns a JSON
+        outcome (``outcome="BLOCKED"``) so ``_record_step`` parses it as
+        a real outcome — returning the bare ``"BLOCKED — ..."`` string
+        like ``spawn_tester`` does falls through ``_record_step``'s JSON
+        fallback as ``outcome="RAW"``, which ``_tester_phase`` then
+        surfaces as the very ``"unexpected outcome: RAW"`` escalation
+        this PR exists to eliminate.
 
     Only the ``_tester_phase`` initial-call site uses this. The interior
     retry site clears ``tester_session_id`` before calling ``spawn_tester``
@@ -1100,6 +1117,18 @@ def _resume_or_spawn_tester(feature_id: str, unit_id: str) -> str:
 
     session_id = unit_state.tester_session_id
     cycle_number = unit_state.review_round
+    feature = state.get_feature(feature_id)
+
+    state.touch_unit(unit_id, status="testing")
+    state.record_event(
+        unit_id,
+        feature_id,
+        "tester_resume",
+        source="orchestrator",
+        cycle_number=cycle_number,
+        session_id=session_id,
+        summary="Resuming orphaned tester session",
+    )
 
     try:
         response = _resume_role_session("tester", session_id, _TESTER_RESUME_RECOVERY_PROMPT)
@@ -1135,6 +1164,22 @@ def _resume_or_spawn_tester(feature_id: str, unit_id: str) -> str:
         )
 
     if marker["marker"] == "TESTS_PASS":
+        if feature and unit_state.pr_number:
+            # Mirrors spawn_tester:317-327 — supersede any prior
+            # REQUEST_CHANGES from a BUG_FOUND cycle so branch protection's
+            # "Require resolution of changes requested" rule doesn't block
+            # the eventual merge, and post the operator-visible breadcrumb.
+            safe_dismiss_own_change_requests(
+                feature.repo_path,
+                unit_state.pr_number,
+                "Tests pass on retry — superseding prior tester review.",
+            )
+            safe_submit_pr_review(
+                feature.repo_path,
+                unit_state.pr_number,
+                f"🤖 **Tester:** all tests pass. _Session: `{session_id}`_",
+                event="COMMENT",
+            )
         return json.dumps(
             {
                 "unit_id": unit_id,
@@ -1159,7 +1204,26 @@ def _resume_or_spawn_tester(feature_id: str, unit_id: str) -> str:
 
     # marker["marker"] == "BLOCKED"
     payload = marker["payload"]
-    return f"BLOCKED — tester for {unit_id} [{payload.reason}]: {payload.prose}"
+    if feature and unit_state.pr_number:
+        safe_comment_pr(
+            feature.repo_path,
+            unit_state.pr_number,
+            f"🚨 **Tester BLOCKED [{payload.reason}]:** {payload.prose}\n_Escalated to human._",
+        )
+    # JSON (not bare string) so _record_step parses outcome="BLOCKED" — keeps
+    # _tester_phase's startswith("BLOCKED") short-circuit from missing into
+    # the "unexpected outcome: RAW" branch.
+    return json.dumps(
+        {
+            "unit_id": unit_id,
+            "outcome": "BLOCKED",
+            "reason": payload.reason,
+            "prose": payload.prose,
+            "session_id": session_id,
+            "summary": tail(response),
+        },
+        indent=2,
+    )
 
 
 def _tester_phase(ctx: CycleContext) -> tuple[bool, str | None]:
@@ -1168,6 +1232,13 @@ def _tester_phase(ctx: CycleContext) -> tuple[bool, str | None]:
     Iterates the tester→address_review→retest loop, respecting CAP_3.
     After every coder fix push, waits for CI green before re-spawning the
     tester (the fix might break CI even if the tester would re-pass).
+
+    On entry, an orphaned ``tester_session_id`` (typical after a previous
+    cycle died on a network timeout) is resumed via
+    ``_resume_or_spawn_tester`` for a cheap verdict re-emission instead of
+    a fresh ``spawn_tester`` call (which would error "session already exists").
+    The interior retry site clears the session id first and calls
+    ``spawn_tester`` directly.
     """
     tester_out = _record_step(ctx, "tester", _resume_or_spawn_tester(ctx.feature_id, ctx.unit_id))
     outcome = tester_out.get("outcome")
