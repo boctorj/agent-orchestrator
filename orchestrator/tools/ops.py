@@ -97,8 +97,12 @@ def reconcile_unit_pr(unit_id: str) -> str:
     Idempotent: a second call after the unit has already flipped to ``done``
     re-reads the PR but emits no further events.
 
-    Return shape matches ``check_unit_pr`` plus a ``reconciled`` flag and
-    ``action`` slug describing the branch taken.
+    Return shape matches ``check_unit_pr`` plus an ``action`` slug naming
+    the branch taken and a ``reconciled`` flag that is ``True`` **only**
+    when the unit's ``status`` row was actually transitioned to ``done``
+    on this call. The ``no-op-*`` and ``refused-from-*`` branches all
+    return ``reconciled=False`` (status unchanged); consult ``action``
+    for the precise sub-case.
     """
     poll_result = check_unit_pr(unit_id)
     # Surface upstream errors verbatim (no PR, no feature, no token, GH error).
@@ -135,6 +139,7 @@ def reconcile_unit_pr(unit_id: str) -> str:
 
     summary = f"PR #{unit_state.pr_number} merged at {pr_state.get('merged_at')}"
     cycle = unit_state.review_round
+    reconciled = False  # only the two status-flipping branches below set True
 
     if status == "in_ci":
         state.touch_unit(unit_id, status="done")
@@ -147,6 +152,7 @@ def reconcile_unit_pr(unit_id: str) -> str:
             summary=summary,
         )
         action = "merged-from-in_ci"
+        reconciled = True
     elif status == "escalated":
         prior_error = unit_state.last_error
         state.touch_unit(unit_id, status="done", clear_error=True)
@@ -168,10 +174,13 @@ def reconcile_unit_pr(unit_id: str) -> str:
             details=prior_error,
         )
         action = "merged-from-escalated"
+        reconciled = True
     elif status in _RECONCILE_REFUSED_STATUSES:
         # Merged while an agent role is mid-flight is racy enough that the
         # right policy is "refuse and let the human investigate" — never
         # silently advance a unit whose coder/tester/reviewer is still live.
+        # Unit status stays unchanged; reconciled=False matches the no-op
+        # branches' "row not transitioned" semantic.
         state.record_event(
             unit_id,
             unit_state.feature_id,
@@ -210,7 +219,7 @@ def reconcile_unit_pr(unit_id: str) -> str:
         {
             **poll,
             "orchestrator_status": refreshed.status if refreshed else "unknown",
-            "reconciled": True,
+            "reconciled": reconciled,
             "action": action,
         },
         indent=2,

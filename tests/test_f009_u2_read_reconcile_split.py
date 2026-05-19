@@ -310,6 +310,8 @@ def test_reconcile_pending_plus_merged_refuses(tmp_state_db, with_github_token, 
     out = ops.reconcile_unit_pr("U1")
     parsed = json.loads(out)
     assert parsed["action"] == "refused-from-pending"
+    # Refusal is not a state transition; reconciled mirrors the no-op branches.
+    assert parsed["reconciled"] is False
     # Status unchanged.
     assert state.get_unit_state("U1").status == "pending"
     event_types = [e["event_type"] for e in state.list_events("U1")]

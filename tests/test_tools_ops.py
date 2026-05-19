@@ -211,7 +211,11 @@ def test_reconcile_escalated_plus_open_pr_is_noop(tmp_state_db, with_github_toke
 
 def test_reconcile_active_status_plus_merged_refuses(tmp_state_db, with_github_token, monkeypatch):
     """coding/testing/reviewing/fixing/opening_pr + merged = racy; refuse +
-    emit 'reconcile_refused'. Unreachable in practice but explicit."""
+    emit 'reconcile_refused'. Unreachable in practice but explicit.
+
+    ``reconciled`` stays False because the unit's status row is NOT
+    transitioned — the refusal only records an audit event.
+    """
     _stub_pr_merged(monkeypatch)
     for status in ("coding", "testing", "reviewing", "fixing", "opening_pr"):
         unit_id = f"U-{status}"
@@ -219,7 +223,7 @@ def test_reconcile_active_status_plus_merged_refuses(tmp_state_db, with_github_t
 
         out = ops.reconcile_unit_pr(unit_id)
         parsed = json.loads(out)
-        assert parsed["reconciled"] is True
+        assert parsed["reconciled"] is False
         assert parsed["action"] == f"refused-from-{status}"
 
         refreshed = state.get_unit_state(unit_id)
@@ -285,6 +289,43 @@ def test_reconcile_missing_token(tmp_state_db, no_github_token):
     _seed_unit(pr_number=5)
     msg = ops.reconcile_unit_pr("U1")
     assert "no GitHub auth" in msg
+
+
+def test_reconcile_flag_matrix_pins_per_branch_semantic(
+    tmp_state_db, with_github_token, monkeypatch
+):
+    """Single-shot pin for the ``reconciled`` flag across every branch.
+
+    ``reconciled`` means "this call transitioned the unit's status row to
+    done". True ONLY on the two merging branches; False on every no-op
+    and every refusal (which records an audit event but leaves status
+    untouched). Reviewer M1 on PR #33 caught the prior inconsistency
+    where refused-from-* paths returned True alongside an unchanged
+    status — guard against regressing that.
+    """
+    cases = [
+        # (status, pr-stub, expected reconciled, expected action)
+        ("in_ci", _stub_pr_merged, True, "merged-from-in_ci"),
+        ("escalated", _stub_pr_merged, True, "merged-from-escalated"),
+        ("in_ci", _stub_pr_open, False, "no-op-pr-not-merged"),
+        ("in_ci", _stub_pr_closed_unmerged, False, "no-op-pr-not-merged"),
+        ("done", _stub_pr_merged, False, "no-op-already-done"),
+        ("coding", _stub_pr_merged, False, "refused-from-coding"),
+        ("testing", _stub_pr_merged, False, "refused-from-testing"),
+        ("opening_pr", _stub_pr_merged, False, "refused-from-opening_pr"),
+        ("reviewing", _stub_pr_merged, False, "refused-from-reviewing"),
+        ("fixing", _stub_pr_merged, False, "refused-from-fixing"),
+        ("pending", _stub_pr_merged, False, "refused-from-pending"),
+    ]
+    for i, (status, stub, expected_reconciled, expected_action) in enumerate(cases):
+        unit_id = f"U-mx-{i}"
+        _seed_unit(unit_id=unit_id, pr_number=5, status=status)
+        stub(monkeypatch)
+        parsed = json.loads(ops.reconcile_unit_pr(unit_id))
+        assert parsed["reconciled"] is expected_reconciled, (
+            f"{status!r}/{expected_action!r}: reconciled flag wrong"
+        )
+        assert parsed["action"] == expected_action
 
 
 # --------------------------- list_in_flight ---------------------------
