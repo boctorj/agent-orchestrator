@@ -48,7 +48,7 @@ one release window, allowing rollback without a revert.
 ### Units
 
 **F-015-U-1: Define `orchestrator/markers.py` schema**
-Create `orchestrator/markers.py` with a `TerminalMarker` TypedDict (or dataclass):
+Create `orchestrator/markers.py` with a `TerminalMarker` dataclass:
 `name`, `description`, `fields` (list of typed field names), `github_event`
 (for reviewer markers: `"REQUEST_CHANGES"` / `"COMMENT"` / `None`), `severity`
 (maps to the coder/tester/reviewer role that emits it).
