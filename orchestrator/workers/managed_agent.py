@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from pathlib import Path
 
 from anthropic import Anthropic
+
+logger = logging.getLogger(__name__)
 
 PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 DEFAULT_MODEL = "claude-opus-4-7"
@@ -78,7 +81,9 @@ class ManagedAgentWorker:
 
     # Bound the poll loop in `_wait_for_session_active`. Class attributes so
     # tests can monkeypatch them down to near-zero without changing call sites.
-    SESSION_ACTIVE_POLL_TIMEOUT = 10.0
+    # 60s: sessions idle for hours need more server-side state-update time
+    # before the SSE stream will see activity (10s was too short in practice).
+    SESSION_ACTIVE_POLL_TIMEOUT = 60.0
     SESSION_ACTIVE_POLL_INTERVAL = 0.3
 
     def __init__(self, role: str, *, model: str = DEFAULT_MODEL):
@@ -213,15 +218,35 @@ class ManagedAgentWorker:
         import time
 
         deadline = time.time() + self.SESSION_ACTIVE_POLL_TIMEOUT
+        polls = 0
         while time.time() < deadline:
             try:
                 session = self.client.beta.sessions.retrieve(session_id)
-            except Exception:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "session_active_poll_error session=%s poll=%d error=%r — proceeding to stream",
+                    session_id,
+                    polls,
+                    e,
+                )
                 return
             status = getattr(session, "status", None)
             if status != "idle":
+                logger.debug(
+                    "session_active session=%s status=%s polls=%d",
+                    session_id,
+                    status,
+                    polls,
+                )
                 return
+            polls += 1
             time.sleep(self.SESSION_ACTIVE_POLL_INTERVAL)
+        logger.warning(
+            "session_active_timeout session=%s still_idle after %.1fs (%d polls) — proceeding to stream",
+            session_id,
+            self.SESSION_ACTIVE_POLL_TIMEOUT,
+            polls,
+        )
 
     def _send_and_collect(self, session_id: str, msg: str) -> str:
         # Send the user.message BEFORE subscribing to the SSE event stream.
@@ -236,6 +261,7 @@ class ManagedAgentWorker:
         # status flips away from `idle` before opening the stream.
         # The saw_activity gate stays as defense-in-depth in case the
         # agent finishes between send and stream-open on a very fast task.
+        logger.info("send_and_collect_start session=%s msg_len=%d", session_id, len(msg))
         self.client.beta.sessions.events.send(
             session_id,
             events=[
@@ -245,14 +271,24 @@ class ManagedAgentWorker:
                 }
             ],
         )
+        logger.debug("send_and_collect_sent session=%s", session_id)
         self._wait_for_session_active(session_id)
         text_parts: list[str] = []
         saw_activity = False
+        event_count = 0
         with self.client.beta.sessions.events.stream(session_id) as stream:
             for event in stream:
                 etype = getattr(event, "type", None)
+                event_count += 1
+                logger.debug("send_and_collect_event session=%s type=%s", session_id, etype)
                 if etype == "session.status_idle":
                     if saw_activity:
+                        logger.debug(
+                            "send_and_collect_done session=%s events=%d response_len=%d",
+                            session_id,
+                            event_count,
+                            sum(len(p) for p in text_parts),
+                        )
                         break
                     continue
                 saw_activity = True
@@ -261,4 +297,20 @@ class ManagedAgentWorker:
                         text = getattr(block, "text", None)
                         if text:
                             text_parts.append(text)
-        return "".join(text_parts)
+        response = "".join(text_parts)
+        if not response:
+            logger.warning(
+                "send_and_collect_empty session=%s events=%d saw_activity=%s — "
+                "stream closed with no agent output; likely session_active_timeout fired too early",
+                session_id,
+                event_count,
+                saw_activity,
+            )
+        else:
+            logger.info(
+                "send_and_collect_complete session=%s events=%d response_len=%d",
+                session_id,
+                event_count,
+                len(response),
+            )
+        return response
