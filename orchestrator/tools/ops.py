@@ -6,7 +6,7 @@ import contextlib
 import json
 import sqlite3
 
-from orchestrator import blocked_hints, github, github_app, repo_verify, state
+from orchestrator import blocked_hints, cycle_log, github, github_app, repo_verify, state
 from orchestrator.agents import ManagedAgentWorker
 from orchestrator.models import ACTIVE_UNIT_STATUSES
 from orchestrator.tools import mcp, need_github_token
@@ -48,16 +48,43 @@ def check_unit_pr(unit_id: str) -> str:
     except Exception as e:  # noqa: BLE001
         return f"ERROR querying GitHub: {e}"
 
-    if pr_state.get("merged") and unit_state.status != "done":
-        state.touch_unit(unit_id, status="done")
-        state.record_event(
-            unit_id,
-            unit_state.feature_id,
-            "merged",
-            source="human",
-            cycle_number=unit_state.review_round,
-            summary=f"PR #{unit_state.pr_number} merged at {pr_state.get('merged_at')}",
-        )
+    if pr_state.get("merged"):
+        if unit_state.status != "done":
+            state.touch_unit(unit_id, status="done")
+            state.record_event(
+                unit_id,
+                unit_state.feature_id,
+                "merged",
+                source="human",
+                cycle_number=unit_state.review_round,
+                summary=f"PR #{unit_state.pr_number} merged at {pr_state.get('merged_at')}",
+            )
+        # Post-merge SHA backfill — the one and only edit allowed after
+        # the cycle log has been finalized at terminal review state (see
+        # proposal § "Per-unit cycle log"). ``merge_commit_sha`` diverges
+        # from ``head_sha`` for squash- and rebase-merge strategies.
+        #
+        # GitHub populates ``merge_commit_sha`` asynchronously — the REST
+        # response right after a merge can carry ``merged=True`` with a
+        # still-null ``merge_commit_sha``, then populate it within seconds.
+        # We therefore re-attempt the backfill on every merged poll until
+        # the SHA arrives; ``_git_commit_local`` is idempotent on identical
+        # content (``git diff --cached --quiet`` returns 0 → no commit)
+        # so repeated runs with the same SHA produce no extra commits.
+        # The "amends once" contract is enforced at the file-content
+        # level (the SHA line appears exactly once), not by call count.
+        # Best-effort wrt transport: a missing ``gh``, non-repo workdir,
+        # or disk error must not block ``check_unit_pr`` from returning
+        # the merged state.
+        merge_sha = pr_state.get("merge_commit_sha")
+        if merge_sha:
+            with contextlib.suppress(Exception):
+                cycle_log.write_cycle_log(
+                    unit_id,
+                    base_dir=cycle_log.cycle_log_base_dir(),
+                    merge_commit_sha=merge_sha,
+                    commit_message=f"cycle-log: backfill merge SHA for {unit_id}",
+                )
 
     # Re-read after potential touch_unit above to surface latest status
     refreshed = state.get_unit_state(unit_id)

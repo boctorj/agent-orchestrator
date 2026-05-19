@@ -149,6 +149,7 @@ def get_pr_state(repo_url: str, pr_number: int) -> dict:
         "merged": data.get("merged", False),
         "merged_at": data.get("merged_at"),
         "head_sha": data.get("head", {}).get("sha"),
+        "merge_commit_sha": data.get("merge_commit_sha"),
         "mergeable": data.get("mergeable"),
         "mergeable_state": data.get("mergeable_state"),
     }

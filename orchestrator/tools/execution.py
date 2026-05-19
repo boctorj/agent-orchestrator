@@ -7,13 +7,14 @@ linear and each phase independently testable.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from orchestrator import ci_wait, github, ntfy, state
+from orchestrator import ci_wait, cycle_log, github, ntfy, state
 from orchestrator.agents import ManagedAgentWorker
 from orchestrator.blocked_reasons import parse_blocked_marker
 from orchestrator.models import ACTIVE_UNIT_STATUSES, WorkUnitState
@@ -635,6 +636,20 @@ def _record_step(ctx: CycleContext, name: str, result_json_str: str) -> dict:
     return r
 
 
+def _write_cycle_log_safe(unit_id: str) -> None:
+    """Render + commit the per-unit cycle log; swallow every failure.
+
+    Cycle logs are post-hoc summaries — a gh outage, a non-repo workdir,
+    or a missing ``git`` must never abort ``cycle_review``. Errors are
+    intentionally silent here; recovery lives in
+    ``cycle_log.regenerate_cycle_log``. The post-merge SHA backfill is
+    handled in ``check_unit_pr`` (ops.py), not here — cycle_review
+    runs strictly before any merge.
+    """
+    with contextlib.suppress(Exception):
+        cycle_log.write_cycle_log(unit_id, base_dir=cycle_log.cycle_log_base_dir())
+
+
 def _pr_url_for(feature_id: str, unit_state: WorkUnitState | None) -> str | None:
     """Reconstruct a PR URL from feature.repo_path + unit_state.pr_number."""
     if not unit_state or not unit_state.pr_number:
@@ -651,6 +666,14 @@ def _pr_url_for(feature_id: str, unit_state: WorkUnitState | None) -> str | None
 
 def _emit_terminal(ctx: CycleContext, outcome: str, msg: str) -> str:
     """Final return value of cycle_review. Fires ntfy push as side effect."""
+    # Finalize the cycle log before the ntfy push so an operator who taps
+    # the notification and looks at features/F-XXX/U-N.md sees the
+    # current terminal state captured on disk. Covers all cycle_review
+    # terminal branches: REVIEW_RECOMMEND_MERGE, REVIEW_COMMENT, and
+    # every escalation path (tester blocked, reviewer blocked, cap-3,
+    # CI timeout, ...).
+    _write_cycle_log_safe(ctx.unit_id)
+
     unit_state = state.get_unit_state(ctx.unit_id)
     pr_url = _pr_url_for(ctx.feature_id, unit_state)
 
@@ -1078,6 +1101,13 @@ def _tester_phase(ctx: CycleContext) -> tuple[bool, str | None]:
         if not ok:
             return False, msg
 
+        # Append this cycle's events to the on-disk log before the next
+        # iteration. The renderer reads state.list_events, so each call
+        # picks up the FIX_PUSHED / CI / re-tester events recorded since
+        # the previous write — that's the "per-cycle append" the proposal
+        # specifies, materialized as a fresh atomic write.
+        _write_cycle_log_safe(ctx.unit_id)
+
         # Clear tester session so the retry creates a fresh one
         s = state.get_unit_state(ctx.unit_id)
         if s is None:
@@ -1172,6 +1202,9 @@ def _reviewer_phase(ctx: CycleContext) -> tuple[bool, str | None]:
         ok, msg = _wait_ci_with_fix_loop(ctx, "reviewer-changes fix push")
         if not ok:
             return False, msg
+
+        # Per-cycle append (see matching call in _tester_phase).
+        _write_cycle_log_safe(ctx.unit_id)
 
         # Clear reviewer session so retry creates a fresh one
         s = state.get_unit_state(ctx.unit_id)

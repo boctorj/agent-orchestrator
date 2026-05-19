@@ -26,6 +26,7 @@ section for the local-only commit policy.
 from __future__ import annotations
 
 import contextlib
+import re
 import subprocess  # nosec B404 — invoking `git` is the whole point of the commit step
 from pathlib import Path
 from typing import Any
@@ -48,8 +49,27 @@ from orchestrator.cycle_log_render import (
 COMMIT_USER_NAME = "orchestrator-bot"
 COMMIT_USER_EMAIL = "agent@orchestrator"
 
+# Reverse of the renderer's ``Merge commit SHA: <sha>`` line. Used by
+# ``regenerate_cycle_log`` to preserve a previously-backfilled SHA when
+# re-rendering offline (so the recovery tool doesn't silently strip the
+# only post-finalization edit allowed by the proposal).
+_MERGE_SHA_RE = re.compile(r"^Merge commit SHA:\s*(\S+)\s*$", re.MULTILINE)
+
 
 # --------------------------- paths ---------------------------
+
+
+def cycle_log_base_dir() -> Path:
+    """Return the on-disk anchor for ``features/`` cycle-log storage.
+
+    Anchored to ``state.STATE_DB.parent`` rather than ``Path.cwd()`` so
+    tests (which monkeypatch ``state.STATE_DB`` to a tmp file) get an
+    isolated tmp tree, and so runtime callers don't depend on whatever
+    the caller's CWD happens to be. Matches the
+    ``orchestrator.feature_spec.features_root`` anchor — a future
+    re-anchoring of cycle-log storage lands here in one place.
+    """
+    return Path(state.STATE_DB).parent
 
 
 def feature_dir(feature_id: str, *, base_dir: Path | None = None) -> Path:
@@ -181,6 +201,7 @@ def write_cycle_log(
     run: SubprocessRunner | None = None,
     pr_info: dict[str, Any] | None = None,
     review_threads: list[dict[str, Any]] | None = None,
+    merge_commit_sha: str | None = None,
     commit_message: str | None = None,
 ) -> Path:
     """Render + persist ``features/F-XXX/U-N.md`` and auto-commit locally.
@@ -197,6 +218,12 @@ def write_cycle_log(
       5. ``git add`` + commit under ``orchestrator-bot`` identity. Never
          pushes — push policy is operator-driven (see proposal §
          "Persistence and commit strategy").
+
+    ``merge_commit_sha`` is the post-merge backfill knob: ``check_unit_pr``
+    re-invokes this writer once it confirms the PR has merged, supplying
+    ``mergeCommit.oid`` so the finalized log records the commit on main.
+    This is the only post-finalization edit allowed (proposal § "Per-unit
+    cycle log" rule on immutability).
 
     Returns the resolved absolute path to the written file.
     """
@@ -219,7 +246,12 @@ def write_cycle_log(
         review_threads = fetch_review_threads(feature.repo_path, unit_state.pr_number, run=runner)
 
     # 3. render
-    markdown = render_cycle_log(unit_id, pr_info=pr_info, review_threads=review_threads)
+    markdown = render_cycle_log(
+        unit_id,
+        pr_info=pr_info,
+        review_threads=review_threads,
+        merge_commit_sha=merge_commit_sha,
+    )
 
     # 4. atomic write
     _atomic_write(target, markdown)
@@ -230,6 +262,21 @@ def write_cycle_log(
     _git_commit_local(target, cwd=cwd, run=runner, message=message)
 
     return target.resolve()
+
+
+def _extract_merge_sha(markdown: str) -> str | None:
+    """Return the ``Merge commit SHA`` value from an existing cycle log.
+
+    The renderer emits ``Merge commit SHA: <sha>`` only when ``check_unit_pr``
+    has backfilled the post-merge SHA. ``regenerate_cycle_log`` calls
+    this to preserve that field across an offline re-render — otherwise
+    re-running the recovery tool on a merged unit silently strips the
+    one and only post-finalization edit the proposal permits.
+    """
+    m = _MERGE_SHA_RE.search(markdown)
+    if not m:
+        return None
+    return m.group(1)
 
 
 def regenerate_cycle_log(
@@ -254,11 +301,24 @@ def regenerate_cycle_log(
     function works for features that pre-date the ``features/``
     directory (i.e. before F-006-U-1's ``load_feature`` change has
     landed).
+
+    Preserves any previously-backfilled ``Merge commit SHA`` line in
+    the existing on-disk file — the proposal makes the merge-SHA edit
+    the only post-finalization mutation; the recovery tool must not
+    silently undo it. Read the SHA from disk rather than re-fetching
+    from ``gh`` so the recovery path stays usable offline.
     """
+    target = cycle_log_path(unit_id, base_dir=base_dir)
+    preserved_sha: str | None = None
+    if target.exists():
+        with contextlib.suppress(OSError):
+            preserved_sha = _extract_merge_sha(target.read_text(encoding="utf-8"))
+
     return write_cycle_log(
         unit_id,
         base_dir=base_dir,
         run=run,
+        merge_commit_sha=preserved_sha,
         commit_message=f"cycle-log: regenerate {unit_id}",
     )
 
@@ -266,6 +326,7 @@ def regenerate_cycle_log(
 __all__ = [
     "COMMIT_USER_EMAIL",
     "COMMIT_USER_NAME",
+    "cycle_log_base_dir",
     "cycle_log_path",
     "feature_dir",
     "fetch_pr_info",

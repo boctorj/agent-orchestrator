@@ -73,6 +73,7 @@ def _render_pr_section(
     repo_url: str,
     unit_status: str,
     status_ts: str = "",
+    merge_commit_sha: str | None = None,
 ) -> list[str]:
     lines = ["## PR"]
     if pr_number and repo_url:
@@ -94,6 +95,13 @@ def _render_pr_section(
     lines.append(status_line)
     head_sha = pr_info.get("headRefOid") or ""
     lines.append(f"PR head SHA: {head_sha or '_unknown_'}")
+    # `mergeCommit.oid` only exists once the PR is merged; the backfill
+    # path (F-006-U-3: ``check_unit_pr``) re-renders the log with the SHA
+    # supplied so the finalized cycle log records the commit on main.
+    # Pre-merge writes omit the line entirely — see the proposal
+    # § "Per-unit cycle log" "Two SHAs captured at different points".
+    if merge_commit_sha:
+        lines.append(f"Merge commit SHA: {merge_commit_sha}")
     return lines
 
 
@@ -192,6 +200,7 @@ def render_cycle_log(
     *,
     pr_info: dict[str, Any] | None = None,
     review_threads: list[dict[str, Any]] | None = None,
+    merge_commit_sha: str | None = None,
 ) -> str:
     """Render the cycle-log markdown for ``unit_id`` from current state.
 
@@ -199,6 +208,11 @@ def render_cycle_log(
     ``orchestrator.cycle_log_gh.fetch_pr_info`` /
     ``fetch_review_threads`` in normal operation; pass them in directly
     for tests or for an offline regenerate.
+
+    ``merge_commit_sha`` is captured separately by ``check_unit_pr`` once
+    the PR confirms merged (the post-merge backfill — the only edit
+    allowed after the cycle log has been finalized). When omitted the
+    log renders without a "Merge commit SHA" line.
     """
     pr_info = pr_info or {}
     review_threads = review_threads or []
@@ -219,6 +233,7 @@ def render_cycle_log(
             feature.repo_path if feature else "",
             unit_state.status if unit_state else "unknown",
             status_ts=unit_state.last_activity if unit_state else "",
+            merge_commit_sha=merge_commit_sha,
         ),
         _render_pr_description(pr_info),
         _render_cycle_history(
