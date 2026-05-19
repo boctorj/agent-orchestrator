@@ -543,7 +543,7 @@ class TestMergeShaBackfill:
             lambda url, pr: {"total": 0, "conclusion_counts": {}, "runs": []},
         )
 
-        out = ops.check_unit_pr("F-001-U-1")
+        out = ops.reconcile_unit_pr("F-001-U-1")
         parsed = json.loads(out)
         assert parsed["orchestrator_status"] == "done"
 
@@ -630,7 +630,7 @@ class TestMergeShaBackfill:
             lambda url, pr: {"total": 0, "conclusion_counts": {}, "runs": []},
         )
 
-        ops.check_unit_pr("F-001-U-1")
+        ops.reconcile_unit_pr("F-001-U-1")
         after = log_path.read_text(encoding="utf-8")
         assert "Merge commit SHA: deadbeef0000" in after
 
@@ -674,7 +674,7 @@ class TestMergeShaBackfill:
             lambda url, pr: {"total": 0, "conclusion_counts": {}, "runs": []},
         )
 
-        out = ops.check_unit_pr("F-001-U-1")
+        out = ops.reconcile_unit_pr("F-001-U-1")
         parsed = json.loads(out)
         assert parsed["orchestrator_status"] == "done"
         assert parsed["pr_state"]["merged"] is True
@@ -724,7 +724,7 @@ class TestMergeShaBackfill:
             lambda url, pr: {"total": 0, "conclusion_counts": {}, "runs": []},
         )
 
-        ops.check_unit_pr("F-001-U-1")
+        ops.reconcile_unit_pr("F-001-U-1")
         assert calls == [], (
             f"writer must be skipped when merge_commit_sha is null; got call: {calls!r}"
         )
@@ -943,8 +943,8 @@ class TestMergeShaRaceCatchUp:
             lambda url, pr: {"total": 0, "conclusion_counts": {}, "runs": []},
         )
 
-        ops.check_unit_pr("F-001-U-1")  # poll 1 — status flips, no SHA
-        ops.check_unit_pr("F-001-U-1")  # poll 2 — SHA arrives, backfill runs
+        ops.reconcile_unit_pr("F-001-U-1")  # poll 1 — status flips, no SHA
+        ops.reconcile_unit_pr("F-001-U-1")  # poll 2 — SHA arrives, backfill runs
 
         log_path = tmp_state_db.parent / "features" / "F-001" / "U-1.md"
         body = log_path.read_text(encoding="utf-8")
@@ -988,9 +988,9 @@ class TestMergeShaRaceCatchUp:
             lambda url, pr: {"total": 0, "conclusion_counts": {}, "runs": []},
         )
 
-        ops.check_unit_pr("F-001-U-1")
-        ops.check_unit_pr("F-001-U-1")
-        ops.check_unit_pr("F-001-U-1")
+        ops.reconcile_unit_pr("F-001-U-1")
+        ops.reconcile_unit_pr("F-001-U-1")
+        ops.reconcile_unit_pr("F-001-U-1")
 
         events = state.list_events("F-001-U-1")
         merged_events = [ev for ev in events if ev["event_type"] == "merged"]

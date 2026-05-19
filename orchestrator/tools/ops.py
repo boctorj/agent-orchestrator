@@ -103,6 +103,14 @@ def reconcile_unit_pr(unit_id: str) -> str:
     on this call. The ``no-op-*`` and ``refused-from-*`` branches all
     return ``reconciled=False`` (status unchanged); consult ``action``
     for the precise sub-case.
+
+    Side effect: on every merged poll (whether this call flipped the
+    status or a prior call already did) we re-invoke the cycle-log
+    writer with the observed ``mergeCommit.oid`` so the finalized cycle
+    log records the commit on main. Idempotent at the file layer; runs
+    on every merged poll so the null→populated ``merge_commit_sha``
+    race that GitHub's REST API can hit catches up on a subsequent
+    call. See ``orchestrator.cycle_log.write_cycle_log``.
     """
     poll_result = check_unit_pr(unit_id)
     # Surface upstream errors verbatim (no PR, no feature, no token, GH error).
@@ -195,7 +203,18 @@ def reconcile_unit_pr(unit_id: str) -> str:
         )
         action = f"refused-from-{status}"
 
-    if action.startswith("merged-from-"):
+    if action.startswith("merged-from-") or action == "no-op-already-done":
+        # F-006-U-3 SHA backfill — runs on every merged observation, not
+        # just the status-flipping transition. GitHub populates
+        # ``merge_commit_sha`` asynchronously, so the first poll right
+        # after a merge can carry ``merged=True`` with a still-null SHA;
+        # subsequent polls (where ``action == "no-op-already-done"``)
+        # catch up once the SHA arrives. ``write_cycle_log`` is
+        # idempotent at the file layer (``git diff --cached --quiet``
+        # → no commit on identical content), so repeated runs with the
+        # same SHA produce no extra commits. Best-effort wrt transport:
+        # a missing ``gh``, non-repo workdir, or disk error must not
+        # break the reconcile response the lead is waiting on.
         merge_sha = pr_state.get("merge_commit_sha")
         if merge_sha:
             with contextlib.suppress(Exception):
