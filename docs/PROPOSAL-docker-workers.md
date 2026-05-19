@@ -446,7 +446,7 @@ loop, worth filing for future feature work:
   refuse to advance the unit. Workaround: manual state.db patch
   (`UPDATE work_units SET pr_number=...`) or bypass-via-worktree. Real
   fix on the backlog: detect orphan PRs in `check_unit_pr` and offer an
-  adopt path.
+  adopt path via `reconcile_unit_pr`.
 - **Coder-session silent failure.** Twice during F-001 (U-5 specifically),
   `address_review` returned empty output with no FIX_PUSHED/BLOCKED marker,
   burning cycle counters. Cause unclear (possibly upstream Anthropic

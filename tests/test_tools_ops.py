@@ -328,6 +328,44 @@ def test_reconcile_flag_matrix_pins_per_branch_semantic(
         assert parsed["action"] == expected_action
 
 
+def test_reconcile_no_op_branches_return_fresh_orchestrator_status(
+    tmp_state_db, with_github_token, monkeypatch
+):
+    """Copilot finding on PR #33: every return path — including the no-op-*
+    early-return branches — must surface the *re-read* orchestrator_status,
+    not the stale value baked into ``check_unit_pr``'s response.
+
+    Simulate the race: ``check_unit_pr`` reports status=in_ci, then a
+    concurrent caller flips the unit to ``done`` before ``reconcile_unit_pr``
+    re-reads. The returned ``orchestrator_status`` must reflect the
+    post-race row.
+    """
+    _seed_unit(pr_number=5, status="in_ci")
+    _stub_pr_open(monkeypatch)
+
+    # Patch check_unit_pr to return a stale orchestrator_status. We don't
+    # also race state.touch_unit because the early-return path doesn't
+    # exercise the post-read transition; the contract is that the final
+    # re-read wins regardless of what the poll observed.
+    stale_payload = json.dumps(
+        {
+            "unit_id": "U1",
+            "pr_number": 5,
+            "pr_state": {"state": "open", "merged": False, "head_sha": "abc"},
+            "checks": {"total": 0, "conclusion_counts": {}, "runs": []},
+            "orchestrator_status": "in_ci",  # stale: the row will be 'done' below
+        },
+        indent=2,
+    )
+    monkeypatch.setattr("orchestrator.tools.ops.check_unit_pr", lambda uid: stale_payload)
+    # Simulate concurrent advance between the poll and reconcile's re-read.
+    state.touch_unit("U1", status="done")
+
+    parsed = json.loads(ops.reconcile_unit_pr("U1"))
+    assert parsed["action"] == "no-op-pr-not-merged"
+    assert parsed["orchestrator_status"] == "done"  # re-read wins, not stale 'in_ci'
+
+
 # --------------------------- list_in_flight ---------------------------
 
 

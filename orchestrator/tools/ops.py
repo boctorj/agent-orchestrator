@@ -122,26 +122,17 @@ def reconcile_unit_pr(unit_id: str) -> str:
     pr_state = poll.get("pr_state", {})
     merged = bool(pr_state.get("merged"))
     status = unit_state.status
-
-    # Open PR or closed-unmerged: orchestrator stays out.
-    if not merged:
-        return json.dumps(
-            {**poll, "reconciled": False, "action": "no-op-pr-not-merged"},
-            indent=2,
-        )
-
-    # Idempotency guard: a prior reconcile already flipped to done.
-    if status == "done":
-        return json.dumps(
-            {**poll, "reconciled": False, "action": "no-op-already-done"},
-            indent=2,
-        )
-
-    summary = f"PR #{unit_state.pr_number} merged at {pr_state.get('merged_at')}"
     cycle = unit_state.review_round
     reconciled = False  # only the two status-flipping branches below set True
 
-    if status == "in_ci":
+    if not merged:
+        # Open PR or closed-unmerged: orchestrator stays out.
+        action = "no-op-pr-not-merged"
+    elif status == "done":
+        # Idempotency guard: a prior reconcile already flipped to done.
+        action = "no-op-already-done"
+    elif status == "in_ci":
+        summary = f"PR #{unit_state.pr_number} merged at {pr_state.get('merged_at')}"
         state.touch_unit(unit_id, status="done")
         state.record_event(
             unit_id,
@@ -154,6 +145,7 @@ def reconcile_unit_pr(unit_id: str) -> str:
         action = "merged-from-in_ci"
         reconciled = True
     elif status == "escalated":
+        summary = f"PR #{unit_state.pr_number} merged at {pr_state.get('merged_at')}"
         prior_error = unit_state.last_error
         state.touch_unit(unit_id, status="done", clear_error=True)
         state.record_event(
@@ -214,6 +206,10 @@ def reconcile_unit_pr(unit_id: str) -> str:
                     commit_message=f"cycle-log: backfill merge SHA for {unit_id}",
                 )
 
+    # Single return path through a fresh re-read so every branch reflects
+    # the post-transition row — including the no-op-* / refused-* branches
+    # where a concurrent caller may have advanced the unit between
+    # check_unit_pr's read and ours.
     refreshed = state.get_unit_state(unit_id)
     return json.dumps(
         {

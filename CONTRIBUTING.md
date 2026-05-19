@@ -61,7 +61,7 @@ orchestrator/
     execution.py        — spawn_unit/tester/reviewer, address_review, cycle_review, send_to_unit
     scheduling.py       — next_ready_units(_all), parallel_units(_global)
     observability.py    — get_unit_status, list_units, unit_history, unit_summary, show_dashboard
-    ops.py              — hello_world_test, check_unit_pr, reconcile_unit_pr, list_in_flight, resume_unit, reset_cached_resources
+    ops.py              — hello_world_test, check_unit_pr, reconcile_unit_pr, list_in_flight, resume_unit, reset_cached_resources, verify_repo, list_verified_repos, forget_repo
 
 tests/                  — pytest; one test file per source module
   conftest.py           — shared fixtures (tmp_state_db, with/no_github_token, with/no_ntfy_topic)

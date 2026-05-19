@@ -101,7 +101,8 @@ boundaries.
 │   │                            unit_cost, show_dashboard         │    │
 │   │  tools/ops.py — check_unit_pr, reconcile_unit_pr,            │    │
 │   │                 list_in_flight, resume_unit, hello_world_test,│    │
-│   │                 reset_cached_resources                       │    │
+│   │                 reset_cached_resources, verify_repo,         │    │
+│   │                 list_verified_repos, forget_repo             │    │
 │   └──────────────────────────────────────────────────────────────┘    │
 │                                                                        │
 │   state.py    — SQLite (state.db)                                      │
@@ -251,9 +252,10 @@ orchestrator/
 │   ├── observability.py         7 tools: get_unit_status, list_units,
 │   │                            unit_history, unit_summary, unit_cost,
 │   │                            feature_cost, show_dashboard
-│   └── ops.py                   6 tools: hello_world_test, check_unit_pr,
+│   └── ops.py                   9 tools: hello_world_test, check_unit_pr,
 │                                reconcile_unit_pr, list_in_flight,
-│                                resume_unit, reset_cached_resources
+│                                resume_unit, reset_cached_resources,
+│                                verify_repo, list_verified_repos, forget_repo
 └── prompts/
     ├── coder.md                 system prompt for coder Managed Agent
     ├── tester.md                system prompt for tester Managed Agent
@@ -272,7 +274,7 @@ pyproject.toml                   Package metadata + ruff + mypy + bandit +
                                  pytest + coverage configs
 ```
 
-**Total: 24 MCP tools across 6 modules; 17 Python modules; ~3000 LOC.**
+**Total: 31 MCP tools across 5 modules; 17 Python modules; ~3000 LOC.**
 
 ---
 
