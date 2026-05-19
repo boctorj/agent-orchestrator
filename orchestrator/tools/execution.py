@@ -1011,8 +1011,9 @@ def _wait_ci_with_fix_loop(ctx: CycleContext, label: str) -> tuple[bool, str | N
       - timeout        → return (False, msg) — cycle_review escalates.
       - cap hit during CI-fix loop → return (False, msg).
 
-    ``label`` describes which push we're gating on (e.g. "coder push",
-    "tester push", "final pre-merge") for ctx.history breadcrumbs.
+    ``label`` describes which push we're gating on (e.g. "coder PR push",
+    "tester test push", "tester-bug fix push", "reviewer-changes fix push")
+    for ctx.history breadcrumbs.
     """
     unit_state = state.get_unit_state(ctx.unit_id)
     feature = state.get_feature(ctx.feature_id)
@@ -1263,14 +1264,6 @@ def cycle_review(feature_id: str, unit_id: str) -> str:
     approved, msg = _reviewer_phase(ctx)
     if not approved:
         return _emit_terminal(ctx, "escalated", msg or "reviewer phase failed")
-
-    # GATE 3 (defensive): final CI check before declaring ready-to-merge.
-    # If reviewer's loop already pushed fixes, _reviewer_phase has waited; this
-    # is a belt-and-suspenders confirmation. A red here typically means a race
-    # with a re-running workflow.
-    ok, msg = _wait_ci_with_fix_loop(ctx, "final pre-merge check")
-    if not ok:
-        return _emit_terminal(ctx, "escalated", msg or "CI red at final pre-merge confirmation")
 
     return _emit_terminal(
         ctx,

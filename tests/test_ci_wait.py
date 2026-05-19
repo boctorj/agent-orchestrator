@@ -321,3 +321,46 @@ def test_env_defaults_override_module_defaults(monkeypatch):
         monkeypatch.delenv("CI_WAIT_POLL_INTERVAL", raising=False)
         monkeypatch.delenv("CI_WAIT_NO_CI_GRACE", raising=False)
         importlib.reload(ci_wait)
+
+
+def test_default_poll_interval_is_5s(monkeypatch):
+    """F-012-U-1: default poll interval is 5s (was 15s).
+
+    Lowered to cut rounding-up loss at each of the ~2 CI gates per cycle.
+    Re-import under a clean env so the developer's shell doesn't skew the check.
+    """
+    import importlib
+
+    monkeypatch.delenv("CI_WAIT_POLL_INTERVAL", raising=False)
+    importlib.reload(ci_wait)
+    try:
+        assert ci_wait.DEFAULT_POLL_INTERVAL_SECONDS == 5
+    finally:
+        importlib.reload(ci_wait)
+
+
+def test_poll_interval_zero_completes(monkeypatch):
+    """F-012-U-1: poll_interval_seconds=0 (busy-poll) is allowed end-to-end.
+
+    Tests and very fast CI matrices want a zero-sleep loop; there's no
+    lower-bound clamp. Verifies a pending→green transition completes without
+    calling sleep with a positive value AND that the result is `green`.
+    """
+    clock = FakeClock(step=5)
+    fetch = ScriptedGetChecks(
+        _snapshot(_check("tests", status="in_progress", conclusion=None)),
+        _snapshot(_check("tests", status="completed", conclusion="success")),
+    )
+    r = wait_for_ci(
+        "u",
+        1,
+        timeout_seconds=60,
+        poll_interval_seconds=0,
+        no_ci_grace_seconds=30,
+        get_checks=fetch,
+        sleep=clock.sleep,
+        now=clock.now,
+    )
+    assert r.status == "green"
+    # All sleeps between polls were 0 — no clamp upward.
+    assert clock.slept == [0]

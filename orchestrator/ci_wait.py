@@ -45,10 +45,12 @@ from orchestrator import github
 # target repos with Linux + macOS + Windows matrices commonly take longer.
 DEFAULT_TIMEOUT_SECONDS = int(os.getenv("CI_WAIT_TIMEOUT_SECONDS", "600"))  # 10 min
 
-# Poll the check_runs API every N seconds. Long enough to avoid rate-
-# limiting on long waits, short enough that we react promptly when CI
-# settles.
-DEFAULT_POLL_INTERVAL_SECONDS = int(os.getenv("CI_WAIT_POLL_INTERVAL", "15"))
+# Poll the check_runs API every N seconds. Short enough to react promptly
+# when CI settles (each cycle hits ~2 CI gates and pays a poll-interval
+# rounding penalty at each); long enough to avoid rate-limiting on long
+# waits. `0` is honored as a true busy-poll (no clamp) — valid for tests
+# and very fast CI matrices.
+DEFAULT_POLL_INTERVAL_SECONDS = int(os.getenv("CI_WAIT_POLL_INTERVAL", "5"))
 
 # If a PR has zero check_runs immediately after a push, GitHub Actions
 # may simply not have started the workflow yet. Wait briefly before
