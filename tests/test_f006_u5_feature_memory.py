@@ -381,11 +381,24 @@ class TestPopulatedState:
         self, tmp_path: Path, tmp_state_db: Path
     ) -> None:
         """Recent escalation events from ``unit_events`` — coder_blocked
-        and reviewer_no_marker are the canonical escalation classes."""
+        and reviewer_no_marker are the canonical escalation classes.
+
+        Also asserts the structured ``reason`` slug from the BLOCKED
+        ``details`` blob surfaces verbatim — without this, the rendering
+        falls back to the prose-only summary and the classification
+        (``auth_failure`` etc.) is lost despite the structured payload
+        being present.
+        """
         _populated_setup(tmp_path)
         out = feature_memory.build_feature_memory("F-200", base_dir=tmp_path, run=_Runner())
         assert "coder_blocked" in out
         assert "reviewer_no_marker" in out
+        assert "auth_failure" in out, (
+            "structured reason slug from BLOCKED details must render in the "
+            "escalation section — the populated fixture seeded it but the "
+            "original `summary or _reason_from_details(...)` short-circuit "
+            "silently dropped it"
+        )
 
     def test_recent_escalations_exclude_normal_scheduling_chatter(
         self, tmp_path: Path, tmp_state_db: Path

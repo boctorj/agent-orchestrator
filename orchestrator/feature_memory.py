@@ -139,11 +139,26 @@ def _render_spec_git_log(root: Path, feature_id: str, run: SubprocessRunner) -> 
     return "## Recent spec.md edits (git log -10)\n\n" + stdout
 
 
+def _unit_sort_key(unit_id: str) -> tuple[int, int, str]:
+    """Sort key that orders units numerically by their ``U-N`` suffix.
+
+    ``state.list_unit_states`` sorts rows by ``ORDER BY unit_id``, which
+    is lexicographic — so F-XXX-U-10 sorts before F-XXX-U-2. Once a
+    feature crosses 10 units the digest is unreadable. We bucket
+    well-formed ids by their numeric tail and fall back to a string sort
+    for non-numeric tails so legacy / malformed ids don't crash.
+    """
+    tail = unit_id.rsplit("-", 1)[-1]
+    if tail.isdigit():
+        return (0, int(tail), unit_id)
+    return (1, 0, unit_id)
+
+
 def _render_units(units: list[WorkUnitState]) -> str:
     if not units:
         return "## Units\n\n_no units spawned yet_"
     lines = ["## Units", ""]
-    for u in units:
+    for u in sorted(units, key=lambda u: _unit_sort_key(u.unit_id)):
         summary = state.summarize_unit(u.unit_id)
         cycle_count = u.review_round
         # ``event_counts_by_type`` is a Counter dump; surface the keys
@@ -175,7 +190,7 @@ def _render_cycle_log_finals(root: Path, feature_id: str, units: list[WorkUnitSt
         return "## Cycle log finals\n\n_no cycle logs on disk_"
 
     blocks: list[str] = []
-    for u in units:
+    for u in sorted(units, key=lambda u: _unit_sort_key(u.unit_id)):
         log_path = feature_dir / f"{_unit_basename(u.unit_id)}.md"
         body = _safe_read_text(log_path)
         if body is None:
@@ -215,7 +230,19 @@ def _render_recent_escalations(units: list[WorkUnitState]) -> str:
 
     lines = ["## Recent escalations", ""]
     for r in rows:
-        summary = (r.get("summary") or "").strip() or _reason_from_details(r.get("details", ""))
+        # H1: always prefix the reason slug from `details` when present —
+        # the canonical BLOCKED writer in `execution.py` populates both
+        # `summary` (= prose) and `details` (= {reason, prose}), so
+        # short-circuiting on `summary` would drop the classification
+        # the structured payload exists to convey.
+        reason, _ = blocked_hints.extract_reason_from_details(r.get("details", ""))
+        prose = (r.get("summary") or "").strip()
+        label_bits: list[str] = []
+        if reason and reason != blocked_hints.UNKNOWN_REASON:
+            label_bits.append(f"[{reason}]")
+        if prose:
+            label_bits.append(prose)
+        summary = " ".join(label_bits)
         cycle = r.get("cycle_number")
         cycle_bit = f" cycle={cycle}" if cycle is not None else ""
         ts = r.get("ts") or ""
@@ -329,21 +356,6 @@ def _terminal_event_counts(type_counts: dict[str, int]) -> str:
     )
     bits = [f"{label}={type_counts[key]}" for key, label in interesting if type_counts.get(key)]
     return " ".join(bits)
-
-
-def _reason_from_details(details: str) -> str:
-    """One-line label for an escalation event with a structured details blob.
-
-    Thin wrapper over :func:`blocked_hints.extract_reason_from_details`
-    so the two surfaces stay in sync — if the BLOCKED-payload schema ever
-    grows a new field, ``blocked_hints`` is the one place we update. We
-    drop the prose half of the tuple when there's no recognized reason
-    (it just echoes the raw details, which the caller already showed).
-    """
-    reason, prose = blocked_hints.extract_reason_from_details(details)
-    if reason == blocked_hints.UNKNOWN_REASON:
-        return ""
-    return f"[{reason}] {prose}" if prose else f"[{reason}]"
 
 
 def _truncate(s: str, limit: int) -> str:

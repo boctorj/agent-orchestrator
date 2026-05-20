@@ -416,6 +416,27 @@ class TestPopulatedState:
         assert "pr_opened" not in esc_block
         assert "fix_pushed" not in esc_block
 
+    def test_recent_escalations_render_structured_reason_slug(
+        self, tmp_path: Path, tmp_state_db: Path
+    ) -> None:
+        """The whole reason ``details`` carries a structured ``reason`` field
+        is so the escalation list can carry the classification — short-
+        circuiting on a populated ``summary`` (which the canonical writer
+        in ``execution.py`` always sets) silently drops it. The fixture
+        seeds ``reason=auth_failure``; assert it surfaces verbatim."""
+        self._setup(tmp_path)
+        out = feature_memory.build_feature_memory("F-007", base_dir=tmp_path, run=FakeRunner())
+
+        esc_block = _section(out, "## Recent escalations")
+        assert "auth_failure" in esc_block, (
+            "structured reason slug from BLOCKED details must surface in the "
+            "escalation line — `summary or _reason_from_details(...)` is a "
+            "regression trap because `summary` is always populated"
+        )
+        # And the prose isn't duplicated when both are present — the bracket
+        # tag plus the prose appears once each.
+        assert esc_block.count("401 from gh api") == 1
+
     def test_recent_escalations_carry_unit_id_for_traceability(
         self, tmp_path: Path, tmp_state_db: Path
     ) -> None:
@@ -470,6 +491,43 @@ class TestReadSideNullSafety:
         out = feature_memory.build_feature_memory("F-007", base_dir=tmp_path, run=FakeRunner())
         # No crash, and the unit header still appears.
         assert "F-007-U-1" in out
+
+
+# --------------------------- numeric unit ordering ---------------------------
+
+
+class TestNumericUnitOrdering:
+    """A feature with >=10 units must render in numeric order, not the
+    lexicographic order ``state.list_unit_states`` returns. Otherwise
+    the lead scanning the digest finds U-2 between U-19 and U-20."""
+
+    def test_units_sorted_numerically_by_suffix(self, tmp_path: Path, tmp_state_db: Path) -> None:
+        _seed_feature(feature_id="F-007")
+        # Seed in the lex order list_unit_states would naturally return.
+        # U-1, U-10, U-11, U-2, U-20, U-3 — exactly the pathological case.
+        for n in (1, 10, 11, 2, 20, 3):
+            _seed_unit("F-007", f"F-007-U-{n}", status="pending")
+
+        out = feature_memory.build_feature_memory("F-007", base_dir=tmp_path, run=FakeRunner())
+
+        units_block = _section(out, "## Units")
+        positions = [(n, units_block.find(f"F-007-U-{n} ")) for n in (1, 2, 3, 10, 11, 20)]
+        assert all(pos != -1 for _, pos in positions), "every unit must appear"
+        # Strictly increasing positions == numerically-sorted output.
+        assert [pos for _, pos in positions] == sorted(pos for _, pos in positions), (
+            f"units rendered out of numeric order: {positions}"
+        )
+
+    def test_non_numeric_suffix_does_not_crash(self, tmp_path: Path, tmp_state_db: Path) -> None:
+        """Defensive: a malformed unit id (no numeric tail) must fall
+        through the sort, not raise. State.list_unit_states is permissive."""
+        _seed_feature(feature_id="F-007")
+        _seed_unit("F-007", "F-007-U-1", status="pending")
+        _seed_unit("F-007", "F-007-U-spike", status="pending")
+
+        out = feature_memory.build_feature_memory("F-007", base_dir=tmp_path, run=FakeRunner())
+        assert "F-007-U-1" in out
+        assert "F-007-U-spike" in out
 
 
 # --------------------------- MCP-tool wrapper ---------------------------
