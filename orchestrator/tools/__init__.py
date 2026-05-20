@@ -149,9 +149,67 @@ def ensure_verified_for_unit(unit_id: str) -> str | None:
 
 
 # --- task-composition templates ---
+#
+# The compose_*_task helpers build the initial worker task message for the
+# coder / tester / reviewer roles. Each accepts optional context blocks
+# defined in docs/PROPOSAL-feature-spec-and-headless-daemon.md
+# § "Role prompt changes":
+#
+#   | block                        | when                             |
+#   | ## FEATURE SPEC              | always (when spec.md exists)     |
+#   | ## PREDECESSOR UNITS         | when deps exist + their logs do  |
+#   | ## THIS UNIT'S CYCLE LOG     | reviewer, retry cycle >= 2       |
+#
+# Read-side is graceful: missing files yield empty strings here and the
+# block silently drops out. Callers in execution.py read the files via
+# orchestrator.feature_spec.read_spec / orchestrator.cycle_log.cycle_log_summary
+# / orchestrator.cycle_log.read_cycle_log; this module just renders.
 
 
-def compose_coder_task(feature: Feature, unit: WorkUnit, branch: str, github_token: str) -> str:
+def _render_context_blocks(
+    *,
+    feature_spec_text: str = "",
+    predecessor_logs: list[tuple[str, str]] | None = None,
+    own_cycle_log: str = "",
+) -> str:
+    """Render the proposal's three optional context blocks as a single string.
+
+    Returns ``""`` when nothing to render — the splice site can append the
+    return value unconditionally. Each non-empty input becomes one ``##``
+    block; predecessor logs nest under ``### <unit_id>`` sub-headings.
+    Empty predecessor summaries are dropped individually, so the
+    ``## PREDECESSOR UNITS`` heading itself disappears if every dep's log
+    happens to be missing.
+    """
+    blocks: list[str] = []
+    if feature_spec_text.strip():
+        blocks.append(f"## FEATURE SPEC\n\n{feature_spec_text.rstrip()}\n")
+    if predecessor_logs:
+        kept = [(uid, s) for uid, s in predecessor_logs if s.strip()]
+        if kept:
+            parts = ["## PREDECESSOR UNITS\n"]
+            for uid, summary in kept:
+                parts.append(f"\n### {uid}\n\n{summary.rstrip()}\n")
+            blocks.append("".join(parts))
+    if own_cycle_log.strip():
+        blocks.append(f"## THIS UNIT'S CYCLE LOG\n\n{own_cycle_log.rstrip()}\n")
+    if not blocks:
+        return ""
+    return "\n\n".join(blocks) + "\n\n"
+
+
+def compose_coder_task(
+    feature: Feature,
+    unit: WorkUnit,
+    branch: str,
+    github_token: str,
+    *,
+    feature_spec_text: str = "",
+    predecessor_logs: list[tuple[str, str]] | None = None,
+) -> str:
+    context = _render_context_blocks(
+        feature_spec_text=feature_spec_text, predecessor_logs=predecessor_logs
+    )
     return f"""Implement work unit {unit.id} for feature {feature.id}.
 
 REPO_URL: {feature.repo_path}
@@ -166,14 +224,24 @@ UNIT DESCRIPTION:
 FEATURE CONTEXT (parent feature this unit belongs to):
 {feature.description}
 
-Follow your standard workflow (see system prompt). End with `PR_URL: <url>`
+{context}Follow your standard workflow (see system prompt). End with `PR_URL: <url>`
 or `BLOCKED: <reason>` on the last line.
 """
 
 
 def compose_tester_task(
-    feature: Feature, unit: WorkUnit, branch: str, pr_number: int, github_token: str
+    feature: Feature,
+    unit: WorkUnit,
+    branch: str,
+    pr_number: int,
+    github_token: str,
+    *,
+    feature_spec_text: str = "",
+    predecessor_logs: list[tuple[str, str]] | None = None,
 ) -> str:
+    context = _render_context_blocks(
+        feature_spec_text=feature_spec_text, predecessor_logs=predecessor_logs
+    )
     return f"""Write tests for work unit {unit.id} which the coder has already
 implemented and pushed to branch `{branch}`.
 
@@ -190,7 +258,7 @@ UNIT DESCRIPTION (what the implementation SHOULD do):
 FEATURE CONTEXT:
 {feature.description}
 
-Follow your standard workflow (see system prompt). End with EXACTLY ONE of:
+{context}Follow your standard workflow (see system prompt). End with EXACTLY ONE of:
 - `TESTS_PASS` (tests written + pushed, all green)
 - `BUG_FOUND: <one-line bug summary>` (failing tests committed + inline
   review posted per system prompt; include the failing assertion + expected
@@ -200,8 +268,20 @@ Follow your standard workflow (see system prompt). End with EXACTLY ONE of:
 
 
 def compose_reviewer_task(
-    feature: Feature, unit: WorkUnit, pr_number: int, github_token: str
+    feature: Feature,
+    unit: WorkUnit,
+    pr_number: int,
+    github_token: str,
+    *,
+    feature_spec_text: str = "",
+    predecessor_logs: list[tuple[str, str]] | None = None,
+    own_cycle_log: str = "",
 ) -> str:
+    context = _render_context_blocks(
+        feature_spec_text=feature_spec_text,
+        predecessor_logs=predecessor_logs,
+        own_cycle_log=own_cycle_log,
+    )
     return f"""Review PR #{pr_number} for work unit {unit.id}.
 
 REPO_URL:  {feature.repo_path}
@@ -216,7 +296,7 @@ UNIT DESCRIPTION (intended behavior to validate against):
 FEATURE CONTEXT:
 {feature.description}
 
-Follow your standard workflow (see system prompt). Post the review as
+{context}Follow your standard workflow (see system prompt). Post the review as
 inline comments via `gh api .../pulls/N/reviews` (one call with
 `comments[]`) and end with EXACTLY ONE of:
 - `REVIEW_RECOMMEND_MERGE: <one-line reason>` (endorsing — clean PR, human merges)

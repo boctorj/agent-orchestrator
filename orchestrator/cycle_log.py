@@ -279,6 +279,61 @@ def _extract_merge_sha(markdown: str) -> str | None:
     return m.group(1)
 
 
+def read_cycle_log(unit_id: str, *, base_dir: Path | None = None) -> str:
+    """Return the contents of ``features/F-XXX/U-N.md``, or ``""``.
+
+    Used by worker-task composition to inject the reviewer's
+    ``## THIS UNIT'S CYCLE LOG`` block (proposal § "Role prompt changes").
+    Missing or unreadable files yield ``""`` — the reviewer's first turn
+    on a unit has no own log yet, and that's expected.
+
+    Defaults ``base_dir`` to :func:`cycle_log_base_dir` so callers that
+    operate on the orchestrator workdir (every production call site, plus
+    the ``tmp_state_db`` test fixture) don't have to thread it through;
+    pass an explicit ``base_dir`` only when reading from a non-default
+    location.
+    """
+    resolved_base = base_dir if base_dir is not None else cycle_log_base_dir()
+    try:
+        return cycle_log_path(unit_id, base_dir=resolved_base).read_text(encoding="utf-8")
+    except (FileNotFoundError, IsADirectoryError, OSError):
+        return ""
+
+
+# The PR-description block heading rendered by
+# ``orchestrator.cycle_log_render._render_pr_description``. Used to slice the
+# verbatim PR body out of predecessor summaries (it's by far the largest section
+# and reviewers / coders don't need it in the downstream task message — the
+# decision history in "Cycle history" + "Review threads" is what matters).
+_PR_DESCRIPTION_HEADING = "## Coder's PR description"
+
+
+def cycle_log_summary(unit_id: str, *, base_dir: Path | None = None) -> str:
+    """Return a token-trimmed slice of a unit's cycle log for predecessor injection.
+
+    The full log is read via :func:`read_cycle_log` and the verbatim
+    ``## Coder's PR description`` block is dropped — proposal § "Role prompt
+    changes" budgets ~500 tokens per predecessor block, and the PR description
+    can run 5–10 KB on its own. The retained slice is header + PR identity +
+    cycle history + review threads — the parts a downstream coder / tester /
+    reviewer actually needs to see "what U-2 decided and where it landed".
+
+    ``base_dir`` shares :func:`read_cycle_log`'s default of
+    :func:`cycle_log_base_dir`.
+    """
+    full = read_cycle_log(unit_id, base_dir=base_dir)
+    if not full:
+        return ""
+    start = full.find(_PR_DESCRIPTION_HEADING)
+    if start == -1:
+        return full
+    after = full.find("\n## ", start + len(_PR_DESCRIPTION_HEADING))
+    if after == -1:
+        # PR description was the last block — keep everything before it.
+        return full[:start].rstrip() + "\n"
+    return full[:start] + full[after + 1 :]
+
+
 def regenerate_cycle_log(
     unit_id: str,
     *,
@@ -328,9 +383,11 @@ __all__ = [
     "COMMIT_USER_NAME",
     "cycle_log_base_dir",
     "cycle_log_path",
+    "cycle_log_summary",
     "feature_dir",
     "fetch_pr_info",
     "fetch_review_threads",
+    "read_cycle_log",
     "regenerate_cycle_log",
     "render_cycle_log",
     "write_cycle_log",
