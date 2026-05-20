@@ -52,6 +52,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from orchestrator.workers.base import TailMessage, TailResult, TailStatus, _validate_limit
+
 # Type alias for the subprocess.run-shaped callable that tests inject.
 # Real `subprocess.run` has a complex overloaded signature; for our
 # purposes we only need "called with argv + kwargs, returns something
@@ -1236,6 +1238,301 @@ class DockerClaudeCodeWorker:
         Worker-protocol completeness.
         """
         return None
+
+    def tail_messages(self, session_id: str, *, limit: int = 50) -> TailResult:
+        """Return the worker container's state + its most recent messages.
+
+        Two reads, both safe to call mid-cycle:
+          1. ``docker inspect <session_id>`` for container state. The
+             container is expected to be named after the session id
+             (the contract F-008's spawn-side wiring follows).
+          2. The Claude Code session JSONL at
+             ``<home>/.claude/sessions/<session_id>.jsonl`` for the
+             recent agent messages. The bind-mounted sessions dir is
+             persisted across container lifetimes so we can read it
+             even after ``--rm`` removed the container.
+
+        Status resolution (see ``_DOCKER_STATE_MAP`` for the full table):
+          * container State.Status == 'running'            → ``running``
+          * State.Status == 'exited' & ExitCode == 0       → ``idle``
+          * State.Status == 'exited' & ExitCode != 0       → ``terminated``
+            (``reason='exit_code=<code>'``)
+          * State.Status == 'restarting'                   → ``running``
+          * State.Status ∈ {created,paused,dead,removing}  → ``terminated``
+            (``reason='container_state=<state>'``)
+          * any other (future) State.Status                → ``terminated``
+            (fail-safe — caller shouldn't wait on an unknown state)
+          * no container, session JSONL exists             → ``idle``
+            (``--rm`` removed the finished container)
+          * no container, no session JSONL                 → ``not_found``
+          * ``docker inspect`` failed (daemon down,
+            permission denied, timeout, …)                 → ``terminated``
+            with ``reason='docker inspect failed: <detail>'`` — the user
+            sees the operational outage rather than a misleading
+            ``not_found``.
+
+        Note (B1 from PR #29 review): the ``running`` branch is not yet
+        reachable in production runs. ``spawn()`` does not pass
+        ``--name <session_id>`` to ``docker run`` today, so for a real
+        F-008 cycle ``docker inspect`` will return "No such object" and
+        this method falls through to ``idle`` (when the JSONL exists) or
+        ``not_found``. Wiring the ``--name`` flag into ``spawn()`` is a
+        follow-up unit; this unit ships the abstraction + the JSONL +
+        inspect plumbing the follow-up will rely on.
+        """
+        _validate_limit(limit)
+        inspect = self._inspect_container(session_id)
+        messages = _read_session_messages(self.home_dir, session_id, limit)
+
+        if not inspect["found"]:
+            err = inspect.get("error")
+            if err:
+                # Operational outage (daemon down, permission denied,
+                # timeout). Caller shouldn't wait on the session AND
+                # needs the underlying cause visible — `terminated` +
+                # `reason=` covers both.
+                return {
+                    "status": "terminated",
+                    "messages": messages,
+                    "reason": f"docker inspect failed: {err}",
+                }
+            # Legitimate "no such object" — either the worker finished
+            # and `--rm` removed it (JSONL surfaces the work that ran)
+            # or the session is genuinely unknown.
+            if _session_file_exists(self.home_dir, session_id):
+                return {"status": "idle", "messages": messages, "reason": None}
+            return {"status": "not_found", "messages": [], "reason": None}
+
+        state = inspect["status"]
+        exit_code = inspect["exit_code"]
+        if state == "running":
+            return {"status": "running", "messages": messages, "reason": None}
+        if state == "exited":
+            if exit_code == 0:
+                return {"status": "idle", "messages": messages, "reason": None}
+            return {
+                "status": "terminated",
+                "messages": messages,
+                "reason": f"exit_code={exit_code}",
+            }
+        # Non-running, non-exited container states. Map per
+        # `_DOCKER_STATE_MAP`; default to `terminated` for future states
+        # so the unknown case fails toward "don't wait on it" (per
+        # PR #29 review C2).
+        mapped = _DOCKER_STATE_MAP.get(state, "terminated")
+        return {
+            "status": mapped,
+            "messages": messages,
+            "reason": f"container_state={state}",
+        }
+
+    def _inspect_container(self, name: str) -> dict[str, Any]:
+        """Run ``docker inspect`` and return a discriminated result dict.
+
+        Return shapes:
+          * ``{"found": True, "status": <state>, "exit_code": <int>}``
+            — container exists; caller maps ``status`` per the state
+            table.
+          * ``{"found": False}`` — ``No such object`` / ``No such
+            container``. The normal post-``--rm`` state; ``tail_messages``
+            falls back to the JSONL.
+          * ``{"found": False, "error": "<detail>"}`` — anything else
+            (daemon down, permission denied, timeout, non-zero exit
+            with unrecognized stderr, empty stdout). The caller surfaces
+            the detail in ``TailResult.reason`` instead of pretending
+            it was a missing container.
+
+        Exception handling is narrowed to the subprocess module's own
+        errors plus ``OSError`` / ``FileNotFoundError`` (the latter
+        happens when ``docker`` itself isn't on ``$PATH``). Programmer
+        errors (a bad argv from a future edit, etc.) propagate so they
+        surface in tests rather than masquerading as a missing
+        container.
+        """
+        runner = self._runner()
+        try:
+            proc = runner(
+                [
+                    "docker",
+                    "inspect",
+                    "--format",
+                    "{{.State.Status}} {{.State.ExitCode}}",
+                    name,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (subprocess.SubprocessError, FileNotFoundError, OSError) as exc:
+            # Subprocess-level failure: docker CLI missing, daemon
+            # connection refused at the OS level, 10s timeout. Caller
+            # gets `terminated` + `reason=docker inspect failed: ...`.
+            return {"found": False, "error": f"{type(exc).__name__}: {exc}"}
+
+        returncode = getattr(proc, "returncode", 1)
+        stderr = (getattr(proc, "stderr", "") or "").strip()
+
+        if returncode != 0:
+            # `docker inspect` prints "Error: No such object: <name>" for
+            # a missing container. Anything else with non-zero exit is
+            # an operational outage we should surface — daemon down,
+            # permission denied on the socket, etc.
+            if "No such object" in stderr or "No such container" in stderr:
+                return {"found": False}
+            return {"found": False, "error": stderr or f"exit code {returncode}"}
+
+        out = (getattr(proc, "stdout", "") or "").strip()
+        if not out:
+            return {"found": False, "error": "empty inspect output"}
+
+        parts = out.split()
+        status = parts[0]
+        exit_code = 0
+        if len(parts) > 1:
+            try:
+                exit_code = int(parts[1])
+            except ValueError:
+                exit_code = 0
+        return {"found": True, "status": status, "exit_code": exit_code}
+
+
+def _session_jsonl_path(home: Path, session_id: str) -> Path:
+    """Canonical location of a Claude Code session's JSONL transcript."""
+    return home / ".claude" / "sessions" / f"{session_id}.jsonl"
+
+
+def _session_file_exists(home: Path, session_id: str) -> bool:
+    return _session_jsonl_path(home, session_id).is_file()
+
+
+# Docker container ``State.Status`` → ``TailStatus`` for the non-running,
+# non-exited cases. ``running`` and ``exited`` are special-cased in
+# ``tail_messages`` (the exited branch needs the exit code) so they're
+# not in this table. Unknown states default to ``terminated`` at the
+# call site so a future docker state doesn't get misreported as
+# in-flight — see PR #29 review C2.
+_DOCKER_STATE_MAP: dict[str, TailStatus] = {
+    "restarting": "running",  # transient; expected to return to running
+    "paused": "terminated",  # suspended; caller shouldn't wait for output
+    "created": "terminated",  # exists but never started — no work to tail
+    "dead": "terminated",  # daemon couldn't deliver signal — won't recover
+    "removing": "terminated",  # mid-teardown — no further messages coming
+}
+
+
+# Outer-record ``type`` values that count as assistant output in claude's
+# JSONL. Anything else (``user``, ``tool_use``, ``tool_result``, ``system``,
+# …) is filtered out by ``_extract_tail_message`` so the docker backend's
+# tail matches the managed-agent backend's ``types=['agent.message']``
+# filter and doesn't leak user prompts into the result (PR #29 review C1).
+_ASSISTANT_OUTER_TYPES = frozenset({"assistant", "agent", "agent.message"})
+# Inner ``message.role`` values that count as assistant output.
+_ASSISTANT_ROLES = frozenset({"assistant", "agent"})
+
+
+def _read_session_messages(home: Path, session_id: str, limit: int) -> list[TailMessage]:
+    """Parse the session JSONL into ``TailMessage`` dicts, capped at ``limit``.
+
+    Permissive on shape, strict on speaker. The two layouts that show
+    up across Claude Code CLI versions:
+
+      * ``{type, role, text, ts}`` flat on the object
+      * ``{type, timestamp, message: {role, content: <str | list[block]>}}``
+        — the current Claude Code shape, where ``content`` may be a
+        plain string or a list of typed blocks each carrying ``text``.
+
+    Either way, the record is kept ONLY when the outer ``type`` or
+    inner ``message.role`` identifies the speaker as the assistant.
+    User prompts, tool-use turns, tool-result turns, and system
+    records are dropped (PR #29 review C1).
+
+    Lines that don't parse, lines that aren't a recognized shape, and
+    lines without any text payload are silently skipped. Returns the
+    most recent ``limit`` entries in chronological order.
+    """
+    path = _session_jsonl_path(home, session_id)
+    if not path.is_file():
+        return []
+    try:
+        text = path.read_text()
+    except OSError:
+        return []
+    out: list[TailMessage] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        msg = _extract_tail_message(obj)
+        if msg is not None:
+            out.append(msg)
+    return out[-limit:]
+
+
+def _extract_tail_message(obj: object) -> TailMessage | None:
+    """Map one JSONL record onto the ``TailMessage`` shape, or ``None``.
+
+    Returns ``None`` for any record whose speaker is NOT the assistant
+    (per ``_ASSISTANT_OUTER_TYPES`` / ``_ASSISTANT_ROLES``). See
+    ``_read_session_messages`` for the supported record layouts.
+    """
+    if not isinstance(obj, dict):
+        return None
+    outer_type = obj.get("type")
+    ts = str(obj.get("timestamp") or obj.get("processed_at") or obj.get("created_at") or "")
+
+    # Flat shape: {role, text, ...}
+    flat_role = obj.get("role")
+    flat_text = obj.get("text")
+    if (
+        isinstance(flat_role, str)
+        and flat_role in _ASSISTANT_ROLES
+        and isinstance(flat_text, str)
+        and flat_text
+    ):
+        return {"ts": ts, "role": flat_role, "text": flat_text}
+
+    # Nested shape: {type, message: {role, content}}. Require the outer
+    # type to identify assistant output — the nested role check is a
+    # second line of defense for older shapes where `type` is absent.
+    nested = obj.get("message")
+    if not isinstance(nested, dict):
+        return None
+    role = nested.get("role")
+    if not isinstance(role, str) or role not in _ASSISTANT_ROLES:
+        return None
+    if outer_type is not None and outer_type not in _ASSISTANT_OUTER_TYPES:
+        return None
+    text = _coerce_content_text(nested.get("content"))
+    if not text:
+        return None
+    return {"ts": ts, "role": role, "text": text}
+
+
+def _coerce_content_text(content: object) -> str:
+    """Reduce claude's ``content`` value to a single text string.
+
+    The field is either a string (older schemas) or a list of block
+    dicts (current), each block typically ``{type: 'text', text: '...'}``
+    but tolerated to carry the raw string directly.
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict):
+            text = block.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+        elif isinstance(block, str):
+            parts.append(block)
+    return "".join(parts)
 
 
 def _extract_response_text(stdout: str) -> str:

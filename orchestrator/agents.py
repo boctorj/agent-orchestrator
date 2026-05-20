@@ -15,7 +15,7 @@ keep working without churn. New code should import from
 
 from __future__ import annotations
 
-from orchestrator.workers.base import Worker
+from orchestrator.workers.base import TailMessage, TailResult, TailStatus, Worker
 from orchestrator.workers.managed_agent import (
     ALLOWED_NETWORK_HOSTS,
     DEFAULT_ENV_CONFIG,
@@ -34,6 +34,9 @@ __all__ = [
     "DEFAULT_TOOLS",
     "PROMPTS_DIR",
     "ManagedAgentWorker",
+    "TailMessage",
+    "TailResult",
+    "TailStatus",
     "Worker",
     "_resource_signature",
     "load_role_prompt",
