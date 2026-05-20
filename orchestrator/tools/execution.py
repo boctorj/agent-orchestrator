@@ -15,7 +15,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from orchestrator import ci_wait, cycle_log, github, ntfy, state, ultrareview
+from orchestrator import ci_wait, cycle_log, feature_spec, github, ntfy, state, ultrareview
 from orchestrator.agents import ManagedAgentWorker
 from orchestrator.blocked_reasons import parse_blocked_marker
 from orchestrator.models import ACTIVE_UNIT_STATUSES, Feature, WorkUnit, WorkUnitState
@@ -47,6 +47,48 @@ from orchestrator.tools import (
     safe_submit_pr_review,
     tail,
 )
+
+# --------------------------- task-message context helpers ---------------------------
+
+
+def _predecessor_summaries(unit: WorkUnit) -> list[tuple[str, str]]:
+    """``(unit_id, cycle-log summary)`` for every declared predecessor.
+
+    Empty summaries (missing cycle log on disk) are preserved here so callers
+    can see which deps were declared regardless of materialization state;
+    :func:`_render_context_blocks` drops the empties when rendering. This
+    keeps the "graceful missing-file" contract from F-006-U-4 explicit at
+    both layers.
+    """
+    return [(dep_id, cycle_log.cycle_log_summary(dep_id)) for dep_id in unit.depends_on]
+
+
+def _task_context_kwargs(feature: Feature, unit: WorkUnit) -> dict[str, Any]:
+    """Common ``compose_*_task`` injection kwargs: spec text + predecessor logs.
+
+    Centralizes the two reads coder/tester/reviewer share so a future change
+    to either source (additional fields, alternative summarization) lands in
+    one place. Missing files yield empty values — each context block then
+    drops out individually at the renderer (see
+    :func:`orchestrator.tools._render_context_blocks`). That's the F-006-U-4
+    "read-side gracefully handles missing files" guarantee: e.g. a feature
+    with no merged predecessors still injects ``## FEATURE SPEC`` once its
+    spec.md exists, but ``## PREDECESSOR UNITS`` stays absent until the
+    first dep's cycle log lands on disk.
+    """
+    return {
+        "feature_spec_text": feature_spec.read_spec(feature.id),
+        "predecessor_logs": _predecessor_summaries(unit),
+    }
+
+
+# Reviewer retry threshold for injecting the unit's own cycle log
+# (PROPOSAL § "Role prompt changes" — reviewer gets ``## THIS UNIT'S CYCLE LOG``
+# only on retry cycle >= 2; the first reviewer turn has no prior cycle to
+# read). Pulled out as a constant so the proposal-spec semantics are
+# greppable from anywhere.
+REVIEWER_OWN_LOG_MIN_ROUND = 2
+
 
 # --------------------------- spawn_unit (coder) ---------------------------
 
@@ -90,7 +132,9 @@ def spawn_unit(feature_id: str, unit_id: str) -> str:
     github_token = get_agent_token()
 
     branch = branch_for(feature, unit)
-    task = compose_coder_task(feature, unit, branch, github_token)
+    task = compose_coder_task(
+        feature, unit, branch, github_token, **_task_context_kwargs(feature, unit)
+    )
 
     state.upsert_unit_state(
         WorkUnitState(unit_id=unit_id, feature_id=feature_id, status="coding", branch=branch)
@@ -262,7 +306,14 @@ def spawn_tester(feature_id: str, unit_id: str) -> str:
         return err
     github_token = get_agent_token()
 
-    task = compose_tester_task(feature, unit, unit_state.branch, unit_state.pr_number, github_token)
+    task = compose_tester_task(
+        feature,
+        unit,
+        unit_state.branch,
+        unit_state.pr_number,
+        github_token,
+        **_task_context_kwargs(feature, unit),
+    )
     state.touch_unit(unit_id, status="testing")
     state.record_event(
         unit_id,
@@ -407,7 +458,12 @@ def spawn_reviewer(feature_id: str, unit_id: str) -> str:
         return err
     github_token = get_agent_token()
 
-    task = compose_reviewer_task(feature, unit, unit_state.pr_number, github_token)
+    reviewer_kwargs = _task_context_kwargs(feature, unit)
+    if unit_state.review_round >= REVIEWER_OWN_LOG_MIN_ROUND:
+        reviewer_kwargs["own_cycle_log"] = cycle_log.read_cycle_log(unit_id)
+    task = compose_reviewer_task(
+        feature, unit, unit_state.pr_number, github_token, **reviewer_kwargs
+    )
     state.touch_unit(unit_id, status="reviewing")
     state.record_event(
         unit_id,
@@ -468,8 +524,8 @@ def spawn_reviewer(feature_id: str, unit_id: str) -> str:
 def _format_reviewer_marker_response(
     *,
     unit_id: str,
-    repo_path: str,
-    pr_number: int,
+    repo_path: str | None,
+    pr_number: int | None,
     session_id: str,
     response: str,
     marker: dict[str, Any],
@@ -480,16 +536,22 @@ def _format_reviewer_marker_response(
     same shape so ``cycle_review`` consumers (``_record_step``, history
     entries) don't need to special-case the retry path.
 
-    Side effect: posts the recommendation / BLOCKED comment to the PR.
+    Side effect: posts the recommendation / BLOCKED comment to the PR when
+    ``repo_path`` and ``pr_number`` are both set. The degenerate case where
+    ``_resume_or_spawn_reviewer`` resumes on a row whose ``pr_number`` /
+    feature record was lost gracefully skips the PR-side write rather than
+    falling through to ``_escalate_no_marker`` for a marker that already
+    parsed cleanly.
     """
     if marker["marker"] == "REVIEW_RECOMMEND_MERGE":
         reason = marker["reason"]
-        safe_comment_pr(
-            repo_path,
-            pr_number,
-            f"🤖 **Reviewer endorsed for merge** (self-approval blocked, posted as comment).\n\n"
-            f"_{reason}_\n_Session: `{session_id}`_",
-        )
+        if repo_path and pr_number is not None:
+            safe_comment_pr(
+                repo_path,
+                pr_number,
+                f"🤖 **Reviewer endorsed for merge** (self-approval blocked, posted as comment).\n\n"
+                f"_{reason}_\n_Session: `{session_id}`_",
+            )
         return json.dumps(
             {
                 "unit_id": unit_id,
@@ -526,11 +588,12 @@ def _format_reviewer_marker_response(
 
     # marker["marker"] == "BLOCKED"
     payload = marker["payload"]
-    safe_comment_pr(
-        repo_path,
-        pr_number,
-        f"🚨 **Reviewer BLOCKED [{payload.reason}]:** {payload.prose}\n_Escalated to human._",
-    )
+    if repo_path and pr_number is not None:
+        safe_comment_pr(
+            repo_path,
+            pr_number,
+            f"🚨 **Reviewer BLOCKED [{payload.reason}]:** {payload.prose}\n_Escalated to human._",
+        )
     return f"BLOCKED — reviewer for {unit_id} [{payload.reason}]: {payload.prose}"
 
 
@@ -1492,6 +1555,145 @@ def _resume_reviewer_for_delta(
     )
 
 
+_REVIEWER_RESUME_RECOVERY_PROMPT = (
+    "Your previous response was lost to a network timeout in the orchestrator. "
+    "The PR is still open and CI is currently green. Please re-evaluate the "
+    "current PR head and re-emit your verdict marker (REVIEW_RECOMMEND_MERGE / "
+    "REVIEW_REQUEST_CHANGES / REVIEW_COMMENT / BLOCKED) — do not redo review "
+    "work you already completed. Output only the marker on its own line "
+    "(with its one-line reason where applicable)."
+)
+
+
+def _resume_or_spawn_reviewer(feature_id: str, unit_id: str) -> str:
+    """Resume an existing reviewer session, or delegate to ``spawn_reviewer``.
+
+    Symmetric to ``_resume_or_spawn_tester`` (F-013-U-1). ``cycle_review``
+    re-entering a unit whose previous ``_reviewer_phase`` died on a network
+    timeout previously caused ``spawn_reviewer`` to error with "reviewer
+    session already exists" — surfacing as the misleading "unexpected
+    outcome: RAW" escalation via ``_record_step``'s JSON fallback. This
+    helper detects the orphaned session, resumes it for a cheap verdict
+    re-emission, and returns a result in the same JSON shape ``_record_step``
+    expects from a fresh ``spawn_reviewer`` call (with the BLOCKED branch
+    extended to JSON — see below).
+
+    Behaviour parity with ``spawn_reviewer`` on a resume hit:
+      - status flips to ``reviewing`` while the worker runs (so dashboards
+        don't show the stale ``in_ci`` from cycle_review's GATE 2);
+      - a ``reviewer_resume`` audit row is written before the resume call
+        so operators can tell the recovery branch was chosen over a fresh
+        spawn (matching the ``tester_resume`` breadcrumb from U-1);
+      - REVIEW_RECOMMEND_MERGE / REVIEW_REQUEST_CHANGES / REVIEW_COMMENT
+        use the shared ``_format_reviewer_marker_response`` formatter so
+        the PR-side endorsement comment matches ``spawn_reviewer``;
+      - the BLOCKED branch posts the same PR comment as
+        ``_format_reviewer_marker_response`` but returns JSON
+        (``outcome="BLOCKED"``) rather than the bare ``"BLOCKED — …"``
+        string. ``_reviewer_phase``'s ``outcome.startswith("BLOCKED")``
+        short-circuit checks the parsed ``outcome`` field from
+        ``_record_step``; a bare string falls through as ``outcome="RAW"``,
+        which re-creates the very ``"unexpected outcome: RAW"`` regression
+        this PR exists to prevent. The pre-existing ``spawn_reviewer`` /
+        ``_resume_reviewer_for_delta`` BLOCKED bare-string return is left
+        alone — fixing it is out of scope for F-013-U-2.
+
+    Only the ``_reviewer_phase`` initial-call site uses this. The retry
+    site goes through ``_resume_reviewer_for_delta`` (F-012-U-2) which
+    keeps the existing session for a delta re-review.
+    """
+    unit_state = state.get_unit_state(unit_id)
+    if unit_state is None or not unit_state.reviewer_session_id:
+        return spawn_reviewer(feature_id, unit_id)
+
+    session_id = unit_state.reviewer_session_id
+    cycle_number = unit_state.review_round
+    feature = state.get_feature(feature_id)
+
+    state.touch_unit(unit_id, status="reviewing")
+    state.record_event(
+        unit_id,
+        feature_id,
+        "reviewer_resume",
+        source="orchestrator",
+        cycle_number=cycle_number,
+        session_id=session_id,
+        summary="Resuming orphaned reviewer session",
+    )
+
+    try:
+        response = _resume_role_session("reviewer", session_id, _REVIEWER_RESUME_RECOVERY_PROMPT)
+    except Exception as e:  # noqa: BLE001 — surface as orchestrator error
+        state.touch_unit(unit_id, status="escalated", error=str(e))
+        state.record_event(
+            unit_id,
+            feature_id,
+            "reviewer_resume_error",
+            source="orchestrator",
+            cycle_number=cycle_number,
+            summary=str(e),
+        )
+        return f"ERROR resuming reviewer: {e}"
+
+    marker = _record_terminal_marker(
+        unit_id=unit_id,
+        feature_id=feature_id,
+        role="reviewer",
+        response=response,
+        session_id=session_id,
+        cycle_number=cycle_number,
+    )
+
+    if marker is None:
+        return _escalate_no_marker(
+            unit_id=unit_id,
+            feature_id=feature_id,
+            role="reviewer",
+            cycle_number=cycle_number,
+            session_id=session_id,
+            response=response,
+        )
+
+    if marker["marker"] == "BLOCKED":
+        payload = marker["payload"]
+        if feature and unit_state.pr_number:
+            safe_comment_pr(
+                feature.repo_path,
+                unit_state.pr_number,
+                f"🚨 **Reviewer BLOCKED [{payload.reason}]:** {payload.prose}\n"
+                f"_Escalated to human._",
+            )
+        # JSON (not bare string like spawn_reviewer) so _record_step parses
+        # outcome="BLOCKED" — keeps _reviewer_phase's startswith("BLOCKED")
+        # short-circuit from missing into the "unexpected outcome: RAW" branch.
+        return json.dumps(
+            {
+                "unit_id": unit_id,
+                "outcome": "BLOCKED",
+                "reason": payload.reason,
+                "prose": payload.prose,
+                "session_id": session_id,
+                "summary": tail(response),
+            },
+            indent=2,
+        )
+
+    # REVIEW_RECOMMEND_MERGE / REVIEW_REQUEST_CHANGES / REVIEW_COMMENT — the
+    # marker is already parsed and recorded; degrade gracefully when feature
+    # or pr_number is missing rather than escalating a clean verdict via
+    # _escalate_no_marker. The formatter guards its PR-side writes on the
+    # Optional repo_path/pr_number, so a None pair skips the PR comment but
+    # still returns the JSON outcome _record_step expects.
+    return _format_reviewer_marker_response(
+        unit_id=unit_id,
+        repo_path=feature.repo_path if feature else None,
+        pr_number=unit_state.pr_number,
+        session_id=session_id,
+        response=response,
+        marker=marker,
+    )
+
+
 def _reviewer_phase(ctx: CycleContext) -> tuple[bool, str | None, str | None]:
     """Run reviewer until approved/recommend-merge/comment or escalation.
 
@@ -1502,13 +1704,20 @@ def _reviewer_phase(ctx: CycleContext) -> tuple[bool, str | None, str | None]:
     on ``REVIEW_RECOMMEND_MERGE``).
 
     Iterates the fix-loop on REVIEW_REQUEST_CHANGES, respecting CAP_3. The
-    *first* reviewer turn is a cold-start ``spawn_reviewer``; every retry is
-    a session resume via ``_resume_reviewer_for_delta`` (F-012-U-2 — avoids
-    re-paying the ~900s clone+inventory on every cycle).
+    *first* reviewer turn is a spawn-or-resume via
+    ``_resume_or_spawn_reviewer`` — a cold-start ``spawn_reviewer`` when no
+    ``reviewer_session_id`` is on the unit, or a cheap verdict re-emission
+    when an orphaned session is present (typical after a previous cycle died
+    on a network timeout; symmetric to the ``_tester_phase`` recovery added
+    in F-013-U-1). Every subsequent retry inside the REVIEW_REQUEST_CHANGES
+    fix-loop is a session resume via ``_resume_reviewer_for_delta``
+    (F-012-U-2 — avoids re-paying the ~900s clone+inventory on every cycle).
 
     Each coder fix push waits for CI green before re-running the reviewer.
     """
-    reviewer_out = _record_step(ctx, "reviewer", spawn_reviewer(ctx.feature_id, ctx.unit_id))
+    reviewer_out = _record_step(
+        ctx, "reviewer", _resume_or_spawn_reviewer(ctx.feature_id, ctx.unit_id)
+    )
     outcome = reviewer_out.get("outcome")
 
     if isinstance(outcome, str) and outcome.startswith("BLOCKED"):
@@ -1711,6 +1920,15 @@ def cycle_review(feature_id: str, unit_id: str) -> str:
     BLOCKS until terminal (success or escalation). Typically 5-20+ minutes.
 
     Repo must be fresh-verified (call `verify_repo(<url>)` if blocked).
+
+    Re-entry recovery: if a previous ``cycle_review`` call died mid-phase
+    (typically a network timeout) leaving the unit with a non-empty
+    ``tester_session_id`` or ``reviewer_session_id`` but no terminal marker
+    recorded, the initial ``_tester_phase`` / ``_reviewer_phase`` call on
+    re-entry resumes the existing session (asking it to re-emit its
+    verdict) rather than spawning a fresh one. See
+    ``docs/STATE-MACHINE-AUDIT.md``
+    § "Stale-session recovery at tester/reviewer re-entry".
     """
     if err := ensure_verified_for_feature(feature_id):
         return err

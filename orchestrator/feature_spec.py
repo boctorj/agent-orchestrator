@@ -70,6 +70,23 @@ def render_template(feature_id: str, title: str, description: str) -> str:
     )
 
 
+def read_spec(feature_id: str) -> str:
+    """Return the contents of ``features/<feature_id>/spec.md``, or ``""``.
+
+    Used by worker-task composition (``orchestrator.tools.compose_*_task``)
+    to inject the ``## FEATURE SPEC`` block defined in
+    ``docs/PROPOSAL-feature-spec-and-headless-daemon.md`` § "Role prompt
+    changes". Missing or unreadable files yield ``""`` rather than raising
+    so the rendering layer can drop the spec block individually when no
+    spec.md is on disk — that's the F-006-U-4 "read-side gracefully handles
+    missing files" path.
+    """
+    try:
+        return spec_path(feature_id).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
 def write_spec_if_missing(feature_id: str, title: str, description: str) -> Path:
     """Create `features/<feature_id>/spec.md` from the template if absent.
 

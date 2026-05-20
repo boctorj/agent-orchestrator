@@ -19,6 +19,13 @@ from orchestrator import state
 from orchestrator.github import parse_repo_url
 from orchestrator.models import WorkUnit
 
+# Single source of truth for the "Coder's PR description" block heading.
+# Exported so ``orchestrator.cycle_log.cycle_log_summary`` can locate the
+# block by exact-match rather than by prefix — if this string is ever
+# reworded, the import in ``cycle_log.py`` fails loudly instead of
+# silently degrading to a no-op stripper.
+PR_DESCRIPTION_HEADING = "## Coder's PR description (verbatim, as of last capture)"
+
 
 def _unit_basename(unit_id: str) -> str:
     """Return ``U-N`` from ``F-XXX-U-N``. Falls back to the raw id."""
@@ -114,7 +121,7 @@ def _render_pr_section(
 
 def _render_pr_description(pr_info: dict[str, Any]) -> list[str]:
     body = (pr_info.get("body") or "").rstrip()
-    lines = ["## Coder's PR description (verbatim, as of last capture)"]
+    lines = [PR_DESCRIPTION_HEADING]
     lines.append(body if body else "_unavailable_")
     return lines
 
@@ -253,5 +260,6 @@ def render_cycle_log(
 
 
 __all__ = [
+    "PR_DESCRIPTION_HEADING",
     "render_cycle_log",
 ]

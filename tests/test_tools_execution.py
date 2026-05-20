@@ -2695,3 +2695,203 @@ class TestCycleReviewRecoversOrphanedTesterSession:
         assert "unexpected outcome: RAW" not in parsed["message"]
         # Positive assertion: cycle reached terminal success
         assert parsed["outcome"] == "approved_awaiting_merge"
+
+
+# --------------------------- F-013-U-2: _resume_or_spawn_reviewer ---------------------------
+
+
+class TestResumeOrSpawnReviewer:
+    """F-013-U-2: helper symmetric to ``_resume_or_spawn_tester`` (U-1) that
+    detects an orphaned reviewer session on the unit and resumes it instead
+    of letting the initial ``spawn_reviewer`` call inside ``_reviewer_phase``
+    error out with "reviewer session already exists" — which cycle_review
+    previously surfaced as a misleading "unexpected outcome: RAW" escalation.
+    """
+
+    def test_delegates_to_spawn_reviewer_when_no_session(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """With ``reviewer_session_id`` empty, the helper just calls
+        ``spawn_reviewer`` and returns its raw response unchanged."""
+        _seed_coded_unit()  # no reviewer_session_id set
+        calls: list[tuple[str, str]] = []
+
+        def fake_spawn_reviewer(fid: str, uid: str) -> str:
+            calls.append((fid, uid))
+            return json.dumps(
+                {"unit_id": uid, "outcome": "REVIEW_RECOMMEND_MERGE", "session_id": "fresh"}
+            )
+
+        monkeypatch.setattr(execution, "spawn_reviewer", fake_spawn_reviewer)
+
+        out = execution._resume_or_spawn_reviewer("F-001", "F-001-U-1")
+        assert calls == [("F-001", "F-001-U-1")]
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "REVIEW_RECOMMEND_MERGE"
+        assert parsed["session_id"] == "fresh"
+
+    def test_resumes_session_and_records_recommend_merge(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """With ``reviewer_session_id`` set, the helper resumes the worker
+        and returns a JSON outcome of REVIEW_RECOMMEND_MERGE that
+        ``_record_step`` parses the same way as a fresh ``spawn_reviewer``
+        output. Also records a ``reviewer_recommend_merge`` event for the
+        audit trail and a ``reviewer_resume`` breadcrumb so the recovery
+        branch is visible to operators (mirrors U-1's ``tester_resume`` /
+        ``tests_pass`` chronology assertion)."""
+        _seed_coded_unit()
+        s = state.get_unit_state("F-001-U-1")
+        s.reviewer_session_id = "stale-reviewer-sid"
+        state.upsert_unit_state(s)
+
+        instances = _install_fake_worker(
+            monkeypatch,
+            resume_response="endorsed\nREVIEW_RECOMMEND_MERGE: tests cover everything",
+        )
+        _stub_github(monkeypatch)
+
+        # Must NOT delegate to spawn_reviewer — fail loudly if it does
+        def boom(*a, **k):
+            raise AssertionError("should resume, not spawn")
+
+        monkeypatch.setattr(execution, "spawn_reviewer", boom)
+
+        out = execution._resume_or_spawn_reviewer("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "REVIEW_RECOMMEND_MERGE"
+        assert parsed["session_id"] == "stale-reviewer-sid"
+        assert "tests cover everything" in parsed["reason"]
+
+        # Worker was resumed with the stale session id and the recovery prompt
+        reviewer_worker = instances["reviewer"]
+        assert len(reviewer_worker.resume_calls) == 1
+        sid, msg = reviewer_worker.resume_calls[0]
+        assert sid == "stale-reviewer-sid"
+        # Recovery prompt must list every reviewer marker so the resumed
+        # agent knows the marker vocabulary it's expected to re-emit.
+        assert "re-emit" in msg
+        for marker_name in (
+            "REVIEW_RECOMMEND_MERGE",
+            "REVIEW_REQUEST_CHANGES",
+            "REVIEW_COMMENT",
+            "BLOCKED",
+        ):
+            assert marker_name in msg, f"recovery prompt must list {marker_name}"
+
+        # Audit trail: reviewer_resume breadcrumb fires BEFORE the marker event
+        # (chronological replay order). Without it there's no breadcrumb
+        # for "why is there a reviewer_recommend_merge against the orphan
+        # session and no spawn_reviewer event".
+        events = state.list_events("F-001-U-1")
+        types = [e["event_type"] for e in events]
+        assert "reviewer_resume" in types
+        assert "reviewer_recommend_merge" in types
+        assert types.index("reviewer_resume") < types.index("reviewer_recommend_merge")
+
+    def test_resume_blocked_returns_json_outcome_not_raw(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """A BLOCKED resume must return a JSON outcome (not the bare
+        ``"BLOCKED — …"`` string that ``spawn_reviewer`` returns).
+        ``_record_step`` falls back to ``outcome="RAW"`` on non-JSON, and
+        ``_reviewer_phase``'s ``outcome.startswith("BLOCKED")``
+        short-circuit checks the parsed outcome — not the raw blob — so a
+        bare string would re-surface the very "unexpected outcome: RAW"
+        escalation this unit exists to eliminate.
+        """
+        _seed_coded_unit()
+        s = state.get_unit_state("F-001-U-1")
+        s.reviewer_session_id = "stale-reviewer-sid"
+        state.upsert_unit_state(s)
+
+        _install_fake_worker(
+            monkeypatch,
+            resume_response="tried again\nBLOCKED: reason=auth_failure | gh token expired",
+        )
+
+        comment_calls: list[tuple] = []
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.safe_comment_pr",
+            lambda *a, **k: comment_calls.append((a, k)) or "",
+        )
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.github.parse_repo_url",
+            lambda url: ("owner", "repo"),
+        )
+
+        out = execution._resume_or_spawn_reviewer("F-001", "F-001-U-1")
+        parsed = json.loads(out)  # Must be valid JSON, not bare prose
+        assert parsed["outcome"] == "BLOCKED"
+        assert parsed["reason"] == "auth_failure"
+        assert "gh token expired" in parsed["prose"]
+        assert parsed["session_id"] == "stale-reviewer-sid"
+
+        # PR comment fires on the resume BLOCKED path too (mirrors the
+        # spawn_reviewer BLOCKED breadcrumb in _format_reviewer_marker_response).
+        assert len(comment_calls) == 1
+        args, _ = comment_calls[0]
+        assert args[1] == 5  # pr_number
+        assert "Reviewer BLOCKED" in args[2]
+        assert "auth_failure" in args[2]
+
+        # _record_step + _reviewer_phase parse this as outcome="BLOCKED",
+        # which `startswith("BLOCKED")` correctly catches.
+        ctx = execution.CycleContext(feature_id="F-001", unit_id="F-001-U-1", history=[])
+        parsed_step = execution._record_step(ctx, "reviewer", out)
+        assert parsed_step["outcome"] == "BLOCKED"
+        assert parsed_step["outcome"] != "RAW"
+
+
+class TestCycleReviewRecoversOrphanedReviewerSession:
+    """Regression for the reviewer half of the F-013 root-cause bug:
+    ``cycle_review`` re-entering a unit whose previous ``_reviewer_phase``
+    died on a network timeout (leaving a non-empty ``reviewer_session_id``
+    but no terminal marker recorded) used to escalate with
+    ``outcome=escalated`` / ``message="reviewer ended with unexpected
+    outcome: RAW"`` because the FIRST ``spawn_reviewer`` call hit "reviewer
+    session already exists" and ``_record_step`` parsed the error string
+    as RAW.
+
+    With ``_resume_or_spawn_reviewer`` wired into ``_reviewer_phase``, the
+    orphaned session is resumed (re-emits its verdict) and the cycle
+    proceeds normally.
+    """
+
+    def test_does_not_escalate_with_raw_outcome(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        # Mimic the post-timeout state: reviewer session id persisted,
+        # tester session also set (so _tester_phase resumes too — the
+        # observed bugs hit this on a unit that had already passed tests
+        # in a prior cycle), CI green (autouse fixture).
+        s = state.get_unit_state("F-001-U-1")
+        s.tester_session_id = "stale-tester-sid"
+        s.reviewer_session_id = "stale-reviewer-sid"
+        state.upsert_unit_state(s)
+
+        # Per-role workers: tester + reviewer resume re-emit happy-path
+        # markers so cycle_review can reach the terminal.
+        def factory(role: str) -> FakeWorker:
+            resume = {
+                "tester": "TESTS_PASS",
+                "reviewer": "REVIEW_RECOMMEND_MERGE: clean",
+            }.get(role, "")
+            return FakeWorker(role, "", resume)
+
+        monkeypatch.setattr("orchestrator.tools.execution.ManagedAgentWorker", factory)
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_ready_to_merge", lambda *a, **k: True
+        )
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_escalation", lambda *a, **k: True
+        )
+
+        out = execution.cycle_review("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+
+        # The original failure mode produced both of these — neither should land
+        assert parsed["outcome"] != "escalated"
+        assert "unexpected outcome: RAW" not in parsed["message"]
+        # Positive assertion: cycle reached terminal success
+        assert parsed["outcome"] == "approved_awaiting_merge"
