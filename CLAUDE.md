@@ -128,6 +128,40 @@ escalating to the user.
   (`status: idle`), is still working (`running`), or died (`terminated`).
   Does NOT auto-advance the unit — based on what you see, manually call
   the appropriate next-step tool.
+- `tail_worker(unit_id, role, limit=20)` — peek at the worker's most
+  recent `agent.message` output without waiting for the cycle to finish.
+  Read-only (no state.db writes, no session perturbation, no events).
+  Output is status-aware:
+  - `running` → "worker active, last N messages" + the messages. The
+    agent is mid-flight; use this when a `spawn_unit` / `cycle_review`
+    call has been blocking for many minutes and you want to see whether
+    it's making progress or stuck.
+  - `idle` → "worker completed, final messages" + the messages. The
+    session finished but the orchestrator hasn't observed the terminal
+    marker yet (common after an MCP restart). Read `unit_history` to
+    decide the next step; often `reconcile_unit_pr` is what you want.
+  - `terminated` → "worker dead (reason); last messages before death" +
+    whatever messages were captured pre-crash. The agent crashed. Follow
+    up with `resume_unit` to confirm the session is dead, then escalate
+    the unit to the user — a terminated worker isn't going to recover
+    on its own and needs human triage.
+  - `not_found` → "no session for unit_id/role — likely never spawned".
+    Either you got the role wrong (try the others) or the unit hasn't
+    been spawned yet for that role.
+
+  When to call:
+  - A spawn / cycle has been blocking for ≥10 min and you want to see
+    if the agent is making progress.
+  - The user asks "what's the coder doing right now on U-3?"
+  - You're triaging an escalation and want the last words from the
+    crashed session.
+  - You don't call this proactively on every active unit — it's a peek,
+    not a heartbeat. The dashboard / `show_dashboard` is the running
+    summary.
+
+  Companion to `resume_unit`: `resume_unit` reports *status*,
+  `tail_worker` shows the actual *output*. Use both when triaging a
+  hang.
 
 **Dashboard / status (Stage 7):**
 - `show_dashboard()` — returns a markdown snapshot of the whole orchestrator
@@ -238,8 +272,9 @@ that the orchestrator was restarted, do this FIRST before anything else:
      history with `unit_history` to figure out what happened, then decide:
      spawn the next role manually, or run `reconcile_unit_pr` if merged.
    - `session_status: running` → still working. Note it, move on.
-   - `session_status: terminated` → call this out; user likely needs to
-     escalate this unit manually.
+   - `session_status: terminated` → call `tail_worker(unit_id, role)` for
+     the last messages before death so the user has actionable context,
+     then escalate manually (the worker isn't recovering on its own).
 
 ### When user asks about cost
 

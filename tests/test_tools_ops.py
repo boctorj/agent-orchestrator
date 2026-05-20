@@ -505,6 +505,261 @@ def test_resume_unit_handles_retrieve_error(tmp_state_db, monkeypatch):
     assert "ERROR retrieving session" in msg
 
 
+# --------------------------- tail_worker ---------------------------
+
+
+def test_tail_worker_bad_role(tmp_state_db):
+    msg = ops.tail_worker("U1", role="hacker")
+    assert "ERROR" in msg
+    assert "role must be" in msg
+
+
+def test_tail_worker_no_state(tmp_state_db):
+    msg = ops.tail_worker("nope", role="coder")
+    assert "no state" in msg
+
+
+def test_tail_worker_no_session_id(tmp_state_db):
+    """No session_id stored for the role maps to the 'not_found' format —
+    the lead's mental model is "no session for unit_id/role" regardless of
+    whether the backend never knew or local state never recorded one."""
+    _seed_unit()  # no session ids set
+    msg = ops.tail_worker("U1", role="coder")
+    assert "no session for U1/coder" in msg
+    assert "never spawned" in msg
+
+
+def test_tail_worker_running_status_formatting(tmp_state_db, monkeypatch):
+    """`running` → 'worker active, last N messages' header + messages."""
+    _seed_unit(coder_session_id="sesn_xyz")
+
+    fake_worker = MagicMock()
+    fake_worker.tail_messages.return_value = {
+        "status": "running",
+        "messages": [
+            {"ts": "2025-01-01T12:00:00Z", "role": "agent", "text": "opening branch"},
+            {"ts": "2025-01-01T12:00:01Z", "role": "agent", "text": "running tests"},
+        ],
+        "reason": None,
+    }
+    monkeypatch.setattr("orchestrator.tools.ops.make_worker", lambda role: fake_worker)
+
+    out = ops.tail_worker("U1", role="coder", limit=20)
+    assert "worker active" in out
+    assert "last 2 messages" in out
+    assert "opening branch" in out
+    assert "running tests" in out
+    # ts + role render in each line
+    assert "2025-01-01T12:00:00Z" in out
+    assert "agent" in out
+    fake_worker.tail_messages.assert_called_once_with("sesn_xyz", limit=20)
+
+
+def test_tail_worker_idle_status_formatting(tmp_state_db, monkeypatch):
+    """`idle` → 'worker completed, final messages' header."""
+    _seed_unit(tester_session_id="sesn_t")
+
+    fake_worker = MagicMock()
+    fake_worker.tail_messages.return_value = {
+        "status": "idle",
+        "messages": [
+            {"ts": "2025-01-01T12:00:00Z", "role": "agent", "text": "TESTS_PASS"},
+        ],
+        "reason": None,
+    }
+    monkeypatch.setattr("orchestrator.tools.ops.make_worker", lambda role: fake_worker)
+
+    out = ops.tail_worker("U1", role="tester")
+    assert "worker completed" in out
+    assert "final messages" in out
+    assert "TESTS_PASS" in out
+
+
+def test_tail_worker_terminated_status_formatting(tmp_state_db, monkeypatch):
+    """`terminated` → 'worker dead (reason); last messages before death'."""
+    _seed_unit(reviewer_session_id="sesn_r")
+
+    fake_worker = MagicMock()
+    fake_worker.tail_messages.return_value = {
+        "status": "terminated",
+        "messages": [
+            {"ts": "2025-01-01T12:00:00Z", "role": "agent", "text": "about to crash"},
+        ],
+        "reason": "session.status=terminated",
+    }
+    monkeypatch.setattr("orchestrator.tools.ops.make_worker", lambda role: fake_worker)
+
+    out = ops.tail_worker("U1", role="reviewer")
+    assert "worker dead" in out
+    assert "session.status=terminated" in out
+    assert "before death" in out
+    assert "about to crash" in out
+
+
+def test_tail_worker_terminated_without_reason_still_formats(tmp_state_db, monkeypatch):
+    """If `reason` is somehow None on terminated, fall back to the bare
+    status so the header still parses."""
+    _seed_unit(coder_session_id="sesn_xyz")
+
+    fake_worker = MagicMock()
+    fake_worker.tail_messages.return_value = {
+        "status": "terminated",
+        "messages": [],
+        "reason": None,
+    }
+    monkeypatch.setattr("orchestrator.tools.ops.make_worker", lambda role: fake_worker)
+
+    out = ops.tail_worker("U1", role="coder")
+    assert "worker dead" in out
+    assert "before death" in out
+
+
+def test_tail_worker_not_found_status_formatting(tmp_state_db, monkeypatch):
+    """`not_found` from the backend (session_id stored but provider doesn't
+    know it — e.g. expired managed-agent session) maps to the same 'no
+    session for ...' phrase as the unstored-session branch."""
+    _seed_unit(coder_session_id="sesn_dead")
+
+    fake_worker = MagicMock()
+    fake_worker.tail_messages.return_value = {
+        "status": "not_found",
+        "messages": [],
+        "reason": "session not found",
+    }
+    monkeypatch.setattr("orchestrator.tools.ops.make_worker", lambda role: fake_worker)
+
+    out = ops.tail_worker("U1", role="coder")
+    assert "no session for U1/coder" in out
+    assert "never spawned" in out
+
+
+def test_tail_worker_default_limit_is_20(tmp_state_db, monkeypatch):
+    """Default limit at the MCP layer is 20 (per F-008 spec). Higher
+    backend defaults remain available to power-callers via the kwarg."""
+    _seed_unit(coder_session_id="sesn_xyz")
+
+    fake_worker = MagicMock()
+    fake_worker.tail_messages.return_value = {
+        "status": "running",
+        "messages": [],
+        "reason": None,
+    }
+    monkeypatch.setattr("orchestrator.tools.ops.make_worker", lambda role: fake_worker)
+
+    ops.tail_worker("U1", role="coder")
+    fake_worker.tail_messages.assert_called_once_with("sesn_xyz", limit=20)
+
+
+def test_tail_worker_propagates_custom_limit(tmp_state_db, monkeypatch):
+    _seed_unit(coder_session_id="sesn_xyz")
+
+    fake_worker = MagicMock()
+    fake_worker.tail_messages.return_value = {
+        "status": "running",
+        "messages": [],
+        "reason": None,
+    }
+    monkeypatch.setattr("orchestrator.tools.ops.make_worker", lambda role: fake_worker)
+
+    ops.tail_worker("U1", role="coder", limit=5)
+    fake_worker.tail_messages.assert_called_once_with("sesn_xyz", limit=5)
+
+
+def test_tail_worker_invalid_limit_surfaces_error(tmp_state_db, monkeypatch):
+    """Backend raises ValueError on limit < 1; surface as ERROR string so
+    the lead sees the problem rather than the tool blowing up."""
+    _seed_unit(coder_session_id="sesn_xyz")
+
+    fake_worker = MagicMock()
+    fake_worker.tail_messages.side_effect = ValueError(
+        "tail_messages limit must be an int >= 1, got 0"
+    )
+    monkeypatch.setattr("orchestrator.tools.ops.make_worker", lambda role: fake_worker)
+
+    msg = ops.tail_worker("U1", role="coder", limit=0)
+    assert "ERROR" in msg
+    assert "limit" in msg
+
+
+def test_tail_worker_backend_error_surfaces_as_error(tmp_state_db, monkeypatch):
+    """Unexpected backend failure (e.g. transport error retrieving the
+    session) surfaces as ERROR rather than raising into the MCP loop."""
+    _seed_unit(coder_session_id="sesn_xyz")
+
+    fake_worker = MagicMock()
+    fake_worker.tail_messages.side_effect = RuntimeError("connection reset")
+    monkeypatch.setattr("orchestrator.tools.ops.make_worker", lambda role: fake_worker)
+
+    msg = ops.tail_worker("U1", role="coder")
+    assert "ERROR" in msg
+    assert "connection reset" in msg
+
+
+def test_tail_worker_is_read_only(tmp_state_db, monkeypatch):
+    """No state.db mutations, no events — `tail_worker` is poll-on-demand
+    observability. Compare to `resume_unit` which is also read-only."""
+    _seed_unit(coder_session_id="sesn_xyz")
+
+    fake_worker = MagicMock()
+    fake_worker.tail_messages.return_value = {
+        "status": "running",
+        "messages": [
+            {"ts": "2025-01-01T12:00:00Z", "role": "agent", "text": "working"},
+        ],
+        "reason": None,
+    }
+    monkeypatch.setattr("orchestrator.tools.ops.make_worker", lambda role: fake_worker)
+
+    pre = state.get_unit_state("U1")
+    pre_events = state.list_events("U1")
+
+    ops.tail_worker("U1", role="coder")
+
+    post = state.get_unit_state("U1")
+    assert post.status == pre.status
+    assert post.last_activity == pre.last_activity
+    assert state.list_events("U1") == pre_events
+
+
+def test_tail_worker_running_pluralizes_correctly_for_one_message(tmp_state_db, monkeypatch):
+    """`last N message` (singular) when N=1; the header reads naturally
+    instead of "last 1 messages"."""
+    _seed_unit(coder_session_id="sesn_xyz")
+
+    fake_worker = MagicMock()
+    fake_worker.tail_messages.return_value = {
+        "status": "running",
+        "messages": [{"ts": "2025-01-01T12:00:00Z", "role": "agent", "text": "x"}],
+        "reason": None,
+    }
+    monkeypatch.setattr("orchestrator.tools.ops.make_worker", lambda role: fake_worker)
+
+    out = ops.tail_worker("U1", role="coder")
+    assert "last 1 message" in out
+    assert "last 1 messages" not in out
+
+
+def test_tail_worker_running_with_no_messages_uses_zero(tmp_state_db, monkeypatch):
+    """An in-flight session that hasn't emitted any agent.message yet
+    still tails cleanly — the lead sees the 'worker active' state without
+    a phantom messages section."""
+    _seed_unit(coder_session_id="sesn_xyz")
+
+    fake_worker = MagicMock()
+    fake_worker.tail_messages.return_value = {
+        "status": "running",
+        "messages": [],
+        "reason": None,
+    }
+    monkeypatch.setattr("orchestrator.tools.ops.make_worker", lambda role: fake_worker)
+
+    out = ops.tail_worker("U1", role="coder")
+    assert "worker active" in out
+    # Either "no messages yet" or just an empty messages section is fine;
+    # what we must NOT do is print a phantom "last 0 messages" + nothing.
+    assert "no messages" in out.lower() or "last 0 messages" not in out
+
+
 # --------------------------- reset_cached_resources ---------------------------
 
 

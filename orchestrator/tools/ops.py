@@ -10,6 +10,8 @@ from orchestrator import blocked_hints, cycle_log, github, github_app, repo_veri
 from orchestrator.agents import ManagedAgentWorker
 from orchestrator.models import ACTIVE_UNIT_STATUSES
 from orchestrator.tools import mcp, need_github_token
+from orchestrator.workers import make_worker
+from orchestrator.workers.base import TailMessage
 
 # Active statuses that should not legally observe a merged PR — coding/
 # testing/reviewing/fixing/opening_pr units have an agent mid-flight, so
@@ -346,6 +348,114 @@ def resume_unit(unit_id: str, role: str = "coder") -> str:
         },
         indent=2,
     )
+
+
+# --------------------------- tail_worker (F-008) ---------------------------
+
+
+# Role → ``WorkUnitState`` attribute name. Lifted to module scope so the
+# role-validation message and the session-id lookup share one source of
+# truth. ``resume_unit`` open-codes the same triple; consolidating both
+# call sites is out of scope here.
+_ROLE_TO_SESSION_ATTR = {
+    "coder": "coder_session_id",
+    "tester": "tester_session_id",
+    "reviewer": "reviewer_session_id",
+}
+
+
+def _format_tail_messages(messages: list[TailMessage]) -> str:
+    """Render the message body of a ``tail_worker`` response.
+
+    Empty list returns "(no messages yet)" so the lead can distinguish
+    "session active but silent" from a rendering bug.
+    """
+    if not messages:
+        return "(no messages yet)"
+    lines = [f"[{m['ts']}] {m['role']}: {m['text']}" for m in messages]
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def tail_worker(unit_id: str, role: str = "coder", limit: int = 20) -> str:
+    """Peek at the most recent ``agent.message`` events from a worker's session.
+
+    Calls the worker backend's ``tail_messages`` for the unit's persisted
+    session id and renders the result with status-aware framing:
+
+      * ``running``    → "worker active, last N messages" + messages
+      * ``idle``       → "worker completed, final messages" + messages
+      * ``terminated`` → "worker dead (reason); last messages before death" + messages
+      * ``not_found``  → "no session for unit_id/role — likely never spawned"
+
+    **Read-only.** No state.db writes, no events, no perturbation of the
+    agent's session — safe to call from dashboards, monitors, or the chat
+    flow as often as you like. The companion to ``resume_unit`` (which
+    reports session *status*); ``tail_worker`` shows the actual *output*
+    the agent has produced.
+
+    Backend-aware via ``make_worker(role)`` — works on both
+    ``managed_agents`` and ``docker``. See F-008 spec for the (small)
+    set of paths that are not yet reachable on docker.
+
+    Args:
+        unit_id: The work unit whose worker to tail.
+        role: ``coder`` / ``tester`` / ``reviewer``.
+        limit: Max messages to return (default 20, must be ``>= 1``).
+            The backend protocol's higher default (50) is the technical
+            ceiling; 20 is the ergonomic floor for a chat-friendly reply.
+    """
+    if role not in _ROLE_TO_SESSION_ATTR:
+        return f"ERROR: role must be coder|tester|reviewer, got {role!r}"
+
+    unit_state = state.get_unit_state(unit_id)
+    if not unit_state:
+        return f"ERROR: no state for {unit_id}"
+
+    sid = getattr(unit_state, _ROLE_TO_SESSION_ATTR[role])
+    if not sid:
+        # Unstored session_id and a backend-reported ``not_found`` look the
+        # same to the lead: no live session to tail. Use the same phrasing
+        # as the not_found branch below so the chat output is consistent.
+        return f"no session for {unit_id}/{role} — likely never spawned"
+
+    worker = make_worker(role)
+    try:
+        result = worker.tail_messages(sid, limit=limit)
+    except ValueError as e:
+        # ``_validate_limit`` rejects limit < 1; surface so the caller fixes
+        # the call site rather than the tool crashing into the MCP loop.
+        return f"ERROR: {e}"
+    except Exception as e:  # noqa: BLE001 — observability tool must not crash chat
+        return f"ERROR tailing session {sid}: {e}"
+
+    status = result["status"]
+    messages = result["messages"]
+    reason = result.get("reason")
+
+    if status == "not_found":
+        return f"no session for {unit_id}/{role} — likely never spawned"
+
+    if status == "terminated":
+        cause = reason or "terminated"
+        body = _format_tail_messages(messages)
+        return f"worker dead ({cause}); last messages before death\n\n{body}"
+
+    if status == "idle":
+        body = _format_tail_messages(messages)
+        return f"worker completed, final messages\n\n{body}"
+
+    # Default branch — ``status == 'running'`` (and any future status the
+    # taxonomy adds before this file catches up). ``reason`` is surfaced
+    # in parens when the backend populated it (unknown SDK status carries
+    # the raw value via reason; observability survives drift).
+    n = len(messages)
+    plural = "message" if n == 1 else "messages"
+    header = f"worker active, last {n} {plural}"
+    if reason:
+        header = f"{header} ({reason})"
+    body = _format_tail_messages(messages)
+    return f"{header}\n\n{body}"
 
 
 # --------------------------- repo verification ---------------------------
