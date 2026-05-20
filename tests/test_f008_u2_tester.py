@@ -47,14 +47,12 @@ suite either covers implicitly or not at all:
 from __future__ import annotations
 
 import asyncio
-import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
 from orchestrator import state
 from orchestrator.models import Feature, WorkUnitState
 from orchestrator.tools import mcp, ops
-
 
 # ---------------------------------------------------------------------------
 # Helpers — mirror the coder's _seed_unit so tests read uniformly.
@@ -197,8 +195,7 @@ def test_claude_md_persona_describes_when_to_call():
     # At least one of the canonical when-to-call cues must appear.
     cues = ["blocking", "what's the coder doing", "triag", "hung", "progress"]
     assert any(cue in text for cue in cues), (
-        "persona doc must include at least one 'when to call' usage cue "
-        f"out of {cues}"
+        f"persona doc must include at least one 'when to call' usage cue out of {cues}"
     )
 
 
