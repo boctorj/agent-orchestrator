@@ -67,9 +67,13 @@ def _task_context_kwargs(feature: Feature, unit: WorkUnit) -> dict[str, Any]:
 
     Centralizes the two reads coder/tester/reviewer share so a future change
     to either source (additional fields, alternative summarization) lands in
-    one place. Missing files yield empty values — that's the F-006-U-4
-    "read-side gracefully handles missing files" path; F-006's own in-flight
-    units are expected to inject nothing, not to fail.
+    one place. Missing files yield empty values — each context block then
+    drops out individually at the renderer (see
+    :func:`orchestrator.tools._render_context_blocks`). That's the F-006-U-4
+    "read-side gracefully handles missing files" guarantee: e.g. a feature
+    with no merged predecessors still injects ``## FEATURE SPEC`` once its
+    spec.md exists, but ``## PREDECESSOR UNITS`` stays absent until the
+    first dep's cycle log lands on disk.
     """
     return {
         "feature_spec_text": feature_spec.read_spec(feature.id),

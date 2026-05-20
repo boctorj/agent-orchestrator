@@ -155,15 +155,29 @@ def ensure_verified_for_unit(unit_id: str) -> str | None:
 # defined in docs/PROPOSAL-feature-spec-and-headless-daemon.md
 # § "Role prompt changes":
 #
-#   | block                        | when                             |
-#   | ## FEATURE SPEC              | always (when spec.md exists)     |
-#   | ## PREDECESSOR UNITS         | when deps exist + their logs do  |
-#   | ## THIS UNIT'S CYCLE LOG     | reviewer, retry cycle >= 2       |
+#   | block                        | when                                   |
+#   | ## FEATURE SPEC              | always (when spec.md exists)           |
+#   | ## PREDECESSOR UNITS         | when deps exist AND their summaries    |
+#   |                              |   are non-empty                        |
+#   | ## THIS UNIT'S CYCLE LOG     | reviewer, retry cycle >= 2             |
 #
 # Read-side is graceful: missing files yield empty strings here and the
 # block silently drops out. Callers in execution.py read the files via
 # orchestrator.feature_spec.read_spec / orchestrator.cycle_log.cycle_log_summary
 # / orchestrator.cycle_log.read_cycle_log; this module just renders.
+
+
+# Strip the leading ``# F-XXX-U-N — title`` H1 line from a cycle-log body
+# before nesting it under a ``### <uid>`` predecessor wrapper or a
+# ``## THIS UNIT'S CYCLE LOG`` own-log wrapper. The H1 duplicates the unit
+# identifier the wrapper already carries, and as h1 it outranks the
+# wrapper in the markdown outline (cosmetic but worth fixing — PR #44 N2
+# finding). Idempotent: a body without a leading H1 passes through.
+_LEADING_H1_RE = re.compile(r"\A#\s[^\n]*\n+")
+
+
+def _strip_leading_h1(body: str) -> str:
+    return _LEADING_H1_RE.sub("", body, count=1)
 
 
 def _render_context_blocks(
@@ -180,19 +194,31 @@ def _render_context_blocks(
     Empty predecessor summaries are dropped individually, so the
     ``## PREDECESSOR UNITS`` heading itself disappears if every dep's log
     happens to be missing.
+
+    Predecessor summaries and the own-cycle-log body have their leading
+    ``# `` H1 stripped before wrapping so the embedded headings don't
+    outrank the wrappers above them (see ``_strip_leading_h1``).
+
+    The return value ends with exactly ``\\n\\n`` (one blank line) so the
+    template's ``{feature.description}\\n\\n{context}Follow ...`` spacing
+    produces a single blank line between the inserted blocks and the
+    closing instruction — both when the context is empty and when it isn't.
     """
     blocks: list[str] = []
     if feature_spec_text.strip():
-        blocks.append(f"## FEATURE SPEC\n\n{feature_spec_text.rstrip()}\n")
+        blocks.append(f"## FEATURE SPEC\n\n{feature_spec_text.rstrip()}")
     if predecessor_logs:
-        kept = [(uid, s) for uid, s in predecessor_logs if s.strip()]
+        kept = [(uid, _strip_leading_h1(s).rstrip()) for uid, s in predecessor_logs if s.strip()]
+        kept = [(uid, body) for uid, body in kept if body]
         if kept:
-            parts = ["## PREDECESSOR UNITS\n"]
-            for uid, summary in kept:
-                parts.append(f"\n### {uid}\n\n{summary.rstrip()}\n")
+            parts = ["## PREDECESSOR UNITS"]
+            for uid, body in kept:
+                parts.append(f"\n\n### {uid}\n\n{body}")
             blocks.append("".join(parts))
     if own_cycle_log.strip():
-        blocks.append(f"## THIS UNIT'S CYCLE LOG\n\n{own_cycle_log.rstrip()}\n")
+        own_body = _strip_leading_h1(own_cycle_log).rstrip()
+        if own_body:
+            blocks.append(f"## THIS UNIT'S CYCLE LOG\n\n{own_body}")
     if not blocks:
         return ""
     return "\n\n".join(blocks) + "\n\n"

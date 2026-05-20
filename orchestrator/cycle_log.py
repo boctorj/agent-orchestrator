@@ -38,6 +38,7 @@ from orchestrator.cycle_log_gh import (
     fetch_review_threads,
 )
 from orchestrator.cycle_log_render import (
+    PR_DESCRIPTION_HEADING,
     _feature_id_from_unit_id,
     _unit_basename,
     render_cycle_log,
@@ -296,16 +297,24 @@ def read_cycle_log(unit_id: str, *, base_dir: Path | None = None) -> str:
     resolved_base = base_dir if base_dir is not None else cycle_log_base_dir()
     try:
         return cycle_log_path(unit_id, base_dir=resolved_base).read_text(encoding="utf-8")
-    except (FileNotFoundError, IsADirectoryError, OSError):
+    except OSError:
         return ""
 
 
-# The PR-description block heading rendered by
-# ``orchestrator.cycle_log_render._render_pr_description``. Used to slice the
-# verbatim PR body out of predecessor summaries (it's by far the largest section
-# and reviewers / coders don't need it in the downstream task message — the
-# decision history in "Cycle history" + "Review threads" is what matters).
-_PR_DESCRIPTION_HEADING = "## Coder's PR description"
+# Anchor for ``cycle_log_summary``'s PR-description stripper: the first
+# cycle-log section heading that follows the verbatim PR body. We anchor on
+# the *known section names* (not "any `## ` line") because the PR body is
+# itself verbatim markdown and almost always contains its own `## ` headings
+# — the coder prompt mandates `## What this change does`, `## Manual
+# verification needed`, etc. (PR #44 H1 finding). The renderer at
+# ``cycle_log_render.render_cycle_log`` emits ``## Cycle history`` /
+# ``## Review threads`` after the PR description block today; ``Spec
+# deviations`` / ``Links`` are forward-compat hooks from the proposal
+# § "Per-unit cycle log" example. New cycle-log sections must be added here.
+_CYCLE_LOG_SECTION_AFTER_PR_RE = re.compile(
+    r"^## (Cycle history|Review threads|Spec deviations|Links)\b",
+    re.MULTILINE,
+)
 
 
 def cycle_log_summary(unit_id: str, *, base_dir: Path | None = None) -> str:
@@ -318,20 +327,29 @@ def cycle_log_summary(unit_id: str, *, base_dir: Path | None = None) -> str:
     cycle history + review threads — the parts a downstream coder / tester /
     reviewer actually needs to see "what U-2 decided and where it landed".
 
+    The next section is located via :data:`_CYCLE_LOG_SECTION_AFTER_PR_RE`
+    (an explicit allow-list of cycle-log section names), NOT by "next ``## ``
+    heading" — PR bodies legitimately contain their own ``## `` headings per
+    the coder prompt, and naive `## `-matching would leave a chunk of the PR
+    body in the summary (PR #44 H1 finding).
+
     ``base_dir`` shares :func:`read_cycle_log`'s default of
     :func:`cycle_log_base_dir`.
     """
     full = read_cycle_log(unit_id, base_dir=base_dir)
     if not full:
         return ""
-    start = full.find(_PR_DESCRIPTION_HEADING)
+    start = full.find(PR_DESCRIPTION_HEADING)
     if start == -1:
         return full
-    after = full.find("\n## ", start + len(_PR_DESCRIPTION_HEADING))
-    if after == -1:
-        # PR description was the last block — keep everything before it.
+    after = _CYCLE_LOG_SECTION_AFTER_PR_RE.search(full, start + len(PR_DESCRIPTION_HEADING))
+    if after is None:
+        # PR description was the last identifiable section — keep
+        # everything before it; the renderer always emits Cycle history
+        # next, so reaching this branch indicates a truncated / malformed
+        # cycle log rather than the normal path.
         return full[:start].rstrip() + "\n"
-    return full[:start] + full[after + 1 :]
+    return full[:start] + full[after.start() :]
 
 
 def regenerate_cycle_log(

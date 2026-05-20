@@ -296,6 +296,54 @@ class TestRenderContextBlocksHelper:
         assert "\n\n## PREDECESSOR UNITS" in out
         assert "\n\n## THIS UNIT'S CYCLE LOG" in out
 
+    def test_predecessor_h1_stripped_to_avoid_outranking_wrapper(self):
+        """PR #44 N2 finding: a predecessor summary that starts with
+        ``# F-XXX-U-N — title`` (h1) would out-rank the ``### <uid>``
+        wrapper (h3). The renderer strips the leading H1 before wrapping
+        so the embedded headings sit cleanly under the wrapper."""
+        summary_with_h1 = "# F-006-U-1 — title\n\n## Cycle history\nfoo\n"
+        out = _render_context_blocks(predecessor_logs=[("F-006-U-1", summary_with_h1)])
+        assert "### F-006-U-1" in out
+        # The H1 line itself must be gone — the content nests under the
+        # wrapper instead of competing with it at the document level.
+        assert "# F-006-U-1 — title" not in out
+
+    def test_own_log_h1_stripped_to_avoid_outranking_wrapper(self):
+        """Same H1-strip rule applies to the reviewer's own-cycle-log
+        block: the H1 in a freshly-read cycle log out-ranks the
+        ``## THIS UNIT'S CYCLE LOG`` h2 wrapper."""
+        own_with_h1 = "# F-006-U-X — title\n\n## Cycle history\nfoo\n"
+        out = _render_context_blocks(own_cycle_log=own_with_h1)
+        assert "## THIS UNIT'S CYCLE LOG" in out
+        assert "# F-006-U-X — title" not in out
+
+    def test_ends_with_exactly_one_blank_line_after_content(self):
+        """The trailing newlines must produce *one* blank line between
+        the last block and the next thing the caller appends (typically
+        the closing "Follow your standard workflow..." instruction).
+        A double-blank-line indicates the renderer's per-block trailing
+        ``\\n`` is doubling up with the join's ``\\n\\n`` — PR #44 Copilot
+        finding."""
+        out = _render_context_blocks(feature_spec_text="spec body")
+        # The string ends with exactly two newlines (one blank line) —
+        # not three (would be a double-blank glitch).
+        assert out.endswith("\n\n")
+        assert not out.endswith("\n\n\n")
+
+    def test_no_extra_blank_line_in_compose_output(self):
+        """Composing with a non-empty context produces a single blank line
+        between the inserted block and the closing instruction, matching
+        the empty-context case."""
+        from orchestrator.models import Feature, WorkUnit
+
+        f = Feature(id="F-006", title="t", description="d")
+        u = WorkUnit(id="F-006-U-1", feature_id="F-006", title="u", description="ud")
+        with_ctx = compose_coder_task(f, u, "b", "tok", feature_spec_text="spec body")
+        # Exactly one blank line ("spec body" + "\n\n" + "Follow ...") —
+        # NOT two ("spec body" + "\n\n\n" + "Follow ...").
+        assert "spec body\n\nFollow your standard workflow" in with_ctx
+        assert "spec body\n\n\nFollow your standard workflow" not in with_ctx
+
 
 # --------------------------- read-side: feature_spec.read_spec ---------------------------
 
@@ -373,6 +421,56 @@ class TestCycleLogReaders:
         body = "# F-006-U-1\n\n## PR\n#1\n\n## Cycle history\n1 cycles\n"
         self._seed(tmp_state_db, with_log=True, body=body)
         assert cycle_log.cycle_log_summary("F-006-U-1") == body
+
+    def test_cycle_log_summary_strips_pr_body_with_inner_h2_headings(self, tmp_state_db):
+        """PR #44 H1 regression: the coder prompt mandates ``## What this
+        change does`` / ``## Manual verification needed`` / ``## Decisions``
+        inside the PR body, so the verbatim PR description block legitimately
+        contains its own ``## `` headings. A naive ``find('\\n## ')`` stripper
+        would stop at the first inner heading and leak the rest of the PR
+        body into the summary, blowing the proposal's ~500-token-per-
+        predecessor budget. cycle_log_summary must anchor on the next
+        cycle-log SECTION heading (Cycle history / Review threads / ...),
+        not just any ``## `` line."""
+        body = (
+            "# F-006-U-1 — title\n\n"
+            "## PR\n#1\n\n"
+            "## Coder's PR description (verbatim, as of last capture)\n"
+            "**Unit ID:** F-006-U-1\n\n"
+            "## What this change does\n"
+            "PR-BODY-WHAT-MARKER-MUST-BE-STRIPPED\n\n"
+            "## Manual verification needed\n"
+            "PR-BODY-MANUAL-MARKER-MUST-BE-STRIPPED\n\n"
+            "## Decisions/deviations from the unit description\n"
+            "PR-BODY-DECISIONS-MARKER-MUST-BE-STRIPPED\n\n"
+            "## Cycle history\nKEEP-CYCLE-HISTORY\n\n"
+            "## Review threads\nKEEP-REVIEW-THREADS\n"
+        )
+        self._seed(tmp_state_db, with_log=True, body=body)
+        summary = cycle_log.cycle_log_summary("F-006-U-1")
+        # Every PR-body marker MUST be absent — the stripper has to skip past
+        # all inner `## ` headings to land on the real cycle-log section.
+        assert "PR-BODY-WHAT-MARKER-MUST-BE-STRIPPED" not in summary
+        assert "PR-BODY-MANUAL-MARKER-MUST-BE-STRIPPED" not in summary
+        assert "PR-BODY-DECISIONS-MARKER-MUST-BE-STRIPPED" not in summary
+        assert "## What this change does" not in summary
+        assert "## Manual verification needed" not in summary
+        # Cycle-log sections after the PR body must survive.
+        assert "## Cycle history" in summary
+        assert "KEEP-CYCLE-HISTORY" in summary
+        assert "## Review threads" in summary
+        assert "KEEP-REVIEW-THREADS" in summary
+
+    def test_cycle_log_summary_uses_exported_renderer_heading_constant(self):
+        """The summary stripper must reference the renderer's exported
+        ``PR_DESCRIPTION_HEADING`` constant rather than re-deriving it from
+        a prefix. If the renderer ever changes the heading wording, the
+        import breaks loudly instead of degrading to a no-op stripper."""
+        from orchestrator.cycle_log_render import PR_DESCRIPTION_HEADING
+
+        # Must be the literal heading the renderer emits — full string,
+        # not a prefix.
+        assert PR_DESCRIPTION_HEADING == "## Coder's PR description (verbatim, as of last capture)"
 
 
 # --------------------------- execution.py call sites ---------------------------
