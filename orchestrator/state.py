@@ -397,8 +397,20 @@ def list_unit_states(feature_id: str) -> list[WorkUnitState]:
     return [WorkUnitState(**dict(r)) for r in rows]
 
 
-def touch_unit(unit_id: str, *, status: str | None = None, error: str = "") -> None:
-    """Lightweight status update — bumps last_activity, optionally sets status/error."""
+def touch_unit(
+    unit_id: str,
+    *,
+    status: str | None = None,
+    error: str = "",
+    clear_error: bool = False,
+) -> None:
+    """Lightweight status update — bumps last_activity, optionally sets status/error.
+
+    ``error`` is additive (empty string leaves the column alone). Pass
+    ``clear_error=True`` to explicitly wipe ``last_error`` — used by
+    ``reconcile_unit_pr`` when a previously-escalated unit gets merged.
+    Mutually exclusive with ``error``; ``error`` wins if both are set.
+    """
     with _connect() as conn:
         updates = ["last_activity = ?"]
         params: list = [_now()]
@@ -408,6 +420,9 @@ def touch_unit(unit_id: str, *, status: str | None = None, error: str = "") -> N
         if error:
             updates.append("last_error = ?")
             params.append(error)
+        elif clear_error:
+            updates.append("last_error = ?")
+            params.append("")
         params.append(unit_id)
         # `updates` is built from literal column-name strings in this function;
         # all dynamic values bind via the params list — not user input.

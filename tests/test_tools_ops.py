@@ -62,15 +62,14 @@ def test_check_unit_pr_missing_token(tmp_state_db, no_github_token):
     assert "no GitHub auth" in msg
 
 
-def test_check_unit_pr_flips_to_done_when_merged(tmp_state_db, with_github_token, monkeypatch):
-    _seed_unit(pr_number=5, status="in_ci")
-
+def _stub_pr_merged(monkeypatch, merged_at: str = "2026-05-11T19:00:00Z"):
+    """Stub get_pr_state/get_pr_check_runs to report a merged PR."""
     monkeypatch.setattr(
         "orchestrator.tools.ops.github.get_pr_state",
         lambda url, pr: {
             "state": "closed",
             "merged": True,
-            "merged_at": "2026-05-11T19:00:00Z",
+            "merged_at": merged_at,
             "head_sha": "abc",
         },
     )
@@ -79,14 +78,8 @@ def test_check_unit_pr_flips_to_done_when_merged(tmp_state_db, with_github_token
         lambda url, pr: {"total": 0, "conclusion_counts": {}, "runs": []},
     )
 
-    out = ops.check_unit_pr("U1")
-    parsed = json.loads(out)
-    assert parsed["pr_state"]["merged"] is True
-    assert parsed["orchestrator_status"] == "done"
 
-
-def test_check_unit_pr_keeps_status_when_not_merged(tmp_state_db, with_github_token, monkeypatch):
-    _seed_unit(pr_number=5, status="in_ci")
+def _stub_pr_open(monkeypatch):
     monkeypatch.setattr(
         "orchestrator.tools.ops.github.get_pr_state",
         lambda url, pr: {"state": "open", "merged": False, "head_sha": "abc"},
@@ -96,9 +89,51 @@ def test_check_unit_pr_keeps_status_when_not_merged(tmp_state_db, with_github_to
         lambda url, pr: {"total": 0, "conclusion_counts": {}, "runs": []},
     )
 
+
+def _stub_pr_closed_unmerged(monkeypatch):
+    monkeypatch.setattr(
+        "orchestrator.tools.ops.github.get_pr_state",
+        lambda url, pr: {"state": "closed", "merged": False, "head_sha": "abc"},
+    )
+    monkeypatch.setattr(
+        "orchestrator.tools.ops.github.get_pr_check_runs",
+        lambda url, pr: {"total": 0, "conclusion_counts": {}, "runs": []},
+    )
+
+
+def test_check_unit_pr_is_readonly_on_unmerged(tmp_state_db, with_github_token, monkeypatch):
+    """Unmerged PR: state unchanged, zero new events recorded."""
+    _seed_unit(pr_number=5, status="in_ci")
+    _stub_pr_open(monkeypatch)
+
+    pre = state.get_unit_state("U1")
+    pre_events = state.list_events("U1")
+
     out = ops.check_unit_pr("U1")
     parsed = json.loads(out)
     assert parsed["orchestrator_status"] == "in_ci"
+
+    post = state.get_unit_state("U1")
+    assert post.status == pre.status
+    assert post.last_error == pre.last_error
+    assert state.list_events("U1") == pre_events
+
+
+def test_check_unit_pr_is_readonly_on_merged(tmp_state_db, with_github_token, monkeypatch):
+    """Merged PR: check_unit_pr observes merge but does NOT flip status or
+    emit 'merged'. Advancing state is reconcile_unit_pr's job."""
+    _seed_unit(pr_number=5, status="in_ci")
+    _stub_pr_merged(monkeypatch)
+
+    out = ops.check_unit_pr("U1")
+    parsed = json.loads(out)
+    assert parsed["pr_state"]["merged"] is True
+    # Read-only: status stays in_ci until reconcile_unit_pr runs.
+    assert parsed["orchestrator_status"] == "in_ci"
+    assert state.get_unit_state("U1").status == "in_ci"
+
+    event_types = [e["event_type"] for e in state.list_events("U1")]
+    assert "merged" not in event_types
 
 
 def test_check_unit_pr_handles_github_error(tmp_state_db, with_github_token, monkeypatch):
@@ -111,6 +146,224 @@ def test_check_unit_pr_handles_github_error(tmp_state_db, with_github_token, mon
 
     msg = ops.check_unit_pr("U1")
     assert "ERROR querying GitHub" in msg
+
+
+# --------------------------- reconcile_unit_pr ---------------------------
+
+
+def test_reconcile_in_ci_plus_merged_flips_to_done(tmp_state_db, with_github_token, monkeypatch):
+    _seed_unit(pr_number=5, status="in_ci")
+    _stub_pr_merged(monkeypatch)
+
+    out = ops.reconcile_unit_pr("U1")
+    parsed = json.loads(out)
+    assert parsed["reconciled"] is True
+    assert parsed["action"] == "merged-from-in_ci"
+    assert parsed["orchestrator_status"] == "done"
+    assert state.get_unit_state("U1").status == "done"
+
+    event_types = [e["event_type"] for e in state.list_events("U1")]
+    assert event_types.count("merged") == 1
+
+
+def test_reconcile_escalated_plus_merged_flips_to_done_clearing_error(
+    tmp_state_db, with_github_token, monkeypatch
+):
+    _seed_unit(pr_number=5, status="escalated")
+    state.touch_unit("U1", error="BLOCKED [auth_failure]: 401 from gh")
+    _stub_pr_merged(monkeypatch)
+
+    out = ops.reconcile_unit_pr("U1")
+    parsed = json.loads(out)
+    assert parsed["reconciled"] is True
+    assert parsed["action"] == "merged-from-escalated"
+    assert parsed["orchestrator_status"] == "done"
+
+    refreshed = state.get_unit_state("U1")
+    assert refreshed.status == "done"
+    assert refreshed.last_error == ""
+
+    events = state.list_events("U1")
+    event_types = [e["event_type"] for e in events]
+    assert event_types.count("merged") == 1
+    assert event_types.count("recovered_from_escalated") == 1
+    recovery = next(e for e in events if e["event_type"] == "recovered_from_escalated")
+    # Prior last_error preserved in details for audit.
+    assert "401 from gh" in recovery["details"]
+
+
+def test_reconcile_escalated_plus_open_pr_is_noop(tmp_state_db, with_github_token, monkeypatch):
+    _seed_unit(pr_number=5, status="escalated")
+    state.touch_unit("U1", error="BLOCKED: something")
+    _stub_pr_open(monkeypatch)
+
+    pre_events = state.list_events("U1")
+    out = ops.reconcile_unit_pr("U1")
+    parsed = json.loads(out)
+
+    assert parsed["reconciled"] is False
+    assert parsed["action"] == "no-op-pr-not-merged"
+    refreshed = state.get_unit_state("U1")
+    assert refreshed.status == "escalated"
+    assert refreshed.last_error == "BLOCKED: something"
+    assert state.list_events("U1") == pre_events
+
+
+def test_reconcile_active_status_plus_merged_refuses(tmp_state_db, with_github_token, monkeypatch):
+    """coding/testing/reviewing/fixing/opening_pr + merged = racy; refuse +
+    emit 'reconcile_refused'. Unreachable in practice but explicit.
+
+    ``reconciled`` stays False because the unit's status row is NOT
+    transitioned — the refusal only records an audit event.
+    """
+    _stub_pr_merged(monkeypatch)
+    for status in ("coding", "testing", "reviewing", "fixing", "opening_pr"):
+        unit_id = f"U-{status}"
+        _seed_unit(unit_id=unit_id, pr_number=5, status=status)
+
+        out = ops.reconcile_unit_pr(unit_id)
+        parsed = json.loads(out)
+        assert parsed["reconciled"] is False
+        assert parsed["action"] == f"refused-from-{status}"
+
+        refreshed = state.get_unit_state(unit_id)
+        assert refreshed.status == status  # unchanged
+
+        event_types = [e["event_type"] for e in state.list_events(unit_id)]
+        assert "merged" not in event_types
+        assert event_types.count("reconcile_refused") == 1
+
+
+def test_reconcile_closed_unmerged_is_noop_any_status(tmp_state_db, with_github_token, monkeypatch):
+    """Closed-but-not-merged is a human decision; orchestrator stays out."""
+    _stub_pr_closed_unmerged(monkeypatch)
+    for status in ("in_ci", "escalated", "coding"):
+        unit_id = f"U-{status}"
+        _seed_unit(unit_id=unit_id, pr_number=5, status=status)
+
+        out = ops.reconcile_unit_pr(unit_id)
+        parsed = json.loads(out)
+        assert parsed["reconciled"] is False
+        assert parsed["action"] == "no-op-pr-not-merged"
+        assert state.get_unit_state(unit_id).status == status
+        assert state.list_events(unit_id) == []
+
+
+def test_reconcile_idempotent_on_merged_pr(tmp_state_db, with_github_token, monkeypatch):
+    """Calling twice on the same merged PR emits 'merged' exactly once."""
+    _seed_unit(pr_number=5, status="in_ci")
+    _stub_pr_merged(monkeypatch)
+
+    out1 = ops.reconcile_unit_pr("U1")
+    assert json.loads(out1)["action"] == "merged-from-in_ci"
+
+    out2 = ops.reconcile_unit_pr("U1")
+    parsed2 = json.loads(out2)
+    assert parsed2["reconciled"] is False
+    assert parsed2["action"] == "no-op-already-done"
+
+    event_types = [e["event_type"] for e in state.list_events("U1")]
+    assert event_types.count("merged") == 1
+
+
+def test_reconcile_surfaces_check_unit_pr_errors(tmp_state_db, with_github_token, monkeypatch):
+    """reconcile delegates to check_unit_pr; upstream errors propagate verbatim."""
+    _seed_unit(pr_number=5)
+
+    def boom(*a, **k):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr("orchestrator.tools.ops.github.get_pr_state", boom)
+
+    msg = ops.reconcile_unit_pr("U1")
+    assert "ERROR querying GitHub" in msg
+
+
+def test_reconcile_missing_pr(tmp_state_db):
+    state.save_feature(Feature(id="F", title="t", description=""))
+    state.upsert_unit_state(WorkUnitState(unit_id="U1", feature_id="F", status="coding"))
+    assert "ERROR" in ops.reconcile_unit_pr("U1")
+
+
+def test_reconcile_missing_token(tmp_state_db, no_github_token):
+    _seed_unit(pr_number=5)
+    msg = ops.reconcile_unit_pr("U1")
+    assert "no GitHub auth" in msg
+
+
+def test_reconcile_flag_matrix_pins_per_branch_semantic(
+    tmp_state_db, with_github_token, monkeypatch
+):
+    """Single-shot pin for the ``reconciled`` flag across every branch.
+
+    ``reconciled`` means "this call transitioned the unit's status row to
+    done". True ONLY on the two merging branches; False on every no-op
+    and every refusal (which records an audit event but leaves status
+    untouched). Reviewer M1 on PR #33 caught the prior inconsistency
+    where refused-from-* paths returned True alongside an unchanged
+    status — guard against regressing that.
+    """
+    cases = [
+        # (status, pr-stub, expected reconciled, expected action)
+        ("in_ci", _stub_pr_merged, True, "merged-from-in_ci"),
+        ("escalated", _stub_pr_merged, True, "merged-from-escalated"),
+        ("in_ci", _stub_pr_open, False, "no-op-pr-not-merged"),
+        ("in_ci", _stub_pr_closed_unmerged, False, "no-op-pr-not-merged"),
+        ("done", _stub_pr_merged, False, "no-op-already-done"),
+        ("coding", _stub_pr_merged, False, "refused-from-coding"),
+        ("testing", _stub_pr_merged, False, "refused-from-testing"),
+        ("opening_pr", _stub_pr_merged, False, "refused-from-opening_pr"),
+        ("reviewing", _stub_pr_merged, False, "refused-from-reviewing"),
+        ("fixing", _stub_pr_merged, False, "refused-from-fixing"),
+        ("pending", _stub_pr_merged, False, "refused-from-pending"),
+    ]
+    for i, (status, stub, expected_reconciled, expected_action) in enumerate(cases):
+        unit_id = f"U-mx-{i}"
+        _seed_unit(unit_id=unit_id, pr_number=5, status=status)
+        stub(monkeypatch)
+        parsed = json.loads(ops.reconcile_unit_pr(unit_id))
+        assert parsed["reconciled"] is expected_reconciled, (
+            f"{status!r}/{expected_action!r}: reconciled flag wrong"
+        )
+        assert parsed["action"] == expected_action
+
+
+def test_reconcile_no_op_branches_return_fresh_orchestrator_status(
+    tmp_state_db, with_github_token, monkeypatch
+):
+    """Copilot finding on PR #33: every return path — including the no-op-*
+    early-return branches — must surface the *re-read* orchestrator_status,
+    not the stale value baked into ``check_unit_pr``'s response.
+
+    Simulate the race: ``check_unit_pr`` reports status=in_ci, then a
+    concurrent caller flips the unit to ``done`` before ``reconcile_unit_pr``
+    re-reads. The returned ``orchestrator_status`` must reflect the
+    post-race row.
+    """
+    _seed_unit(pr_number=5, status="in_ci")
+    _stub_pr_open(monkeypatch)
+
+    # Patch check_unit_pr to return a stale orchestrator_status. We don't
+    # also race state.touch_unit because the early-return path doesn't
+    # exercise the post-read transition; the contract is that the final
+    # re-read wins regardless of what the poll observed.
+    stale_payload = json.dumps(
+        {
+            "unit_id": "U1",
+            "pr_number": 5,
+            "pr_state": {"state": "open", "merged": False, "head_sha": "abc"},
+            "checks": {"total": 0, "conclusion_counts": {}, "runs": []},
+            "orchestrator_status": "in_ci",  # stale: the row will be 'done' below
+        },
+        indent=2,
+    )
+    monkeypatch.setattr("orchestrator.tools.ops.check_unit_pr", lambda uid: stale_payload)
+    # Simulate concurrent advance between the poll and reconcile's re-read.
+    state.touch_unit("U1", status="done")
+
+    parsed = json.loads(ops.reconcile_unit_pr("U1"))
+    assert parsed["action"] == "no-op-pr-not-merged"
+    assert parsed["orchestrator_status"] == "done"  # re-read wins, not stale 'in_ci'
 
 
 # --------------------------- list_in_flight ---------------------------

@@ -386,7 +386,7 @@ class TestCheckUnitPrBackfillSemantics:
 
         monkeypatch.setattr("orchestrator.tools.ops.cycle_log.write_cycle_log", spy_write)
 
-        ops.check_unit_pr("F-700-U-2")
+        ops.reconcile_unit_pr("F-700-U-2")
 
         assert captured.get("merge_commit_sha") == "cafef00d"
         msg = captured.get("commit_message", "")
@@ -431,7 +431,7 @@ class TestCheckUnitPrBackfillSemantics:
 
         monkeypatch.setattr("orchestrator.tools.ops.cycle_log.write_cycle_log", spy)
 
-        out = ops.check_unit_pr("F-700-U-2")
+        out = ops.reconcile_unit_pr("F-700-U-2")
         parsed = json.loads(out)
         # Status stays whatever it was — NOT done.
         assert parsed["orchestrator_status"] != "done"
@@ -459,9 +459,9 @@ class TestCheckUnitPrBackfillSemantics:
         _seed(status="in_ci")
         self._seed_merged_responder(monkeypatch, merge_sha="d00ddeeb")
 
-        ops.check_unit_pr("F-700-U-2")
-        ops.check_unit_pr("F-700-U-2")
-        ops.check_unit_pr("F-700-U-2")
+        ops.reconcile_unit_pr("F-700-U-2")
+        ops.reconcile_unit_pr("F-700-U-2")
+        ops.reconcile_unit_pr("F-700-U-2")
 
         log_path = tmp_state_db.parent / "features" / "F-700" / "U-2.md"
         body = log_path.read_text(encoding="utf-8")
@@ -527,7 +527,7 @@ class TestBackfillRaceRecovery:
         )
 
         # Poll 1 — SHA missing, status flips to done, NO backfill yet.
-        ops.check_unit_pr("F-700-U-2")
+        ops.reconcile_unit_pr("F-700-U-2")
         log_path = tmp_state_db.parent / "features" / "F-700" / "U-2.md"
         # No cycle-log file written by check_unit_pr on a null SHA — the
         # backfill is the *only* file write check_unit_pr performs.
@@ -537,7 +537,7 @@ class TestBackfillRaceRecovery:
 
         # Poll 2 — SHA arrives, backfill must run and the file ends up
         # with the merge SHA line.
-        ops.check_unit_pr("F-700-U-2")
+        ops.reconcile_unit_pr("F-700-U-2")
         body = log_path.read_text(encoding="utf-8")
         assert "Merge commit SHA: abc123def456" in body, (
             f"H1 race regression — the second poll must catch up when the SHA arrives.\n"
@@ -577,9 +577,9 @@ class TestBackfillRaceRecovery:
             lambda *a, **k: Path("/dev/null"),
         )
 
-        ops.check_unit_pr("F-700-U-2")
-        ops.check_unit_pr("F-700-U-2")
-        ops.check_unit_pr("F-700-U-2")
+        ops.reconcile_unit_pr("F-700-U-2")
+        ops.reconcile_unit_pr("F-700-U-2")
+        ops.reconcile_unit_pr("F-700-U-2")
 
         merged_events = [
             ev for ev in state.list_events("F-700-U-2") if ev["event_type"] == "merged"
@@ -686,7 +686,7 @@ class TestMergeShaLineAppearsExactlyOnce:
             "orchestrator.tools.ops.github.get_pr_check_runs",
             lambda url, pr: {"total": 0, "conclusion_counts": {}, "runs": []},
         )
-        ops.check_unit_pr("F-700-U-2")
+        ops.reconcile_unit_pr("F-700-U-2")
 
         body_post = log_path.read_text(encoding="utf-8")
         assert body_post.count("Merge commit SHA: 1234abcd5678") == 1, (

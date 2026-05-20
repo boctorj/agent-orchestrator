@@ -679,7 +679,7 @@ def _write_cycle_log_safe(unit_id: str) -> None:
     or a missing ``git`` must never abort ``cycle_review``. Errors are
     intentionally silent here; recovery lives in
     ``cycle_log.regenerate_cycle_log``. The post-merge SHA backfill is
-    handled in ``check_unit_pr`` (ops.py), not here — cycle_review
+    handled in ``reconcile_unit_pr`` (ops.py), not here — cycle_review
     runs strictly before any merge.
     """
     with contextlib.suppress(Exception):

@@ -17,11 +17,12 @@ def next_ready_units(feature_id: str) -> str:
     A unit is 'ready' when:
       - It has no row in work_units yet (never spawned), AND
       - Every unit in its `depends_on` list has work_units.status = 'done'
-        (i.e. its PR has been merged and check_unit_pr has flipped it).
+        (i.e. its PR has been merged and reconcile_unit_pr has flipped it).
 
-    Call this whenever a unit transitions to 'done' (typically after the user
-    merges and `check_unit_pr` is run). For each unit returned, spawn it
-    (spawn_unit → cycle_review) one at a time, or batch via parallel_units.
+    Call this whenever a unit transitions to 'done' (typically after the
+    user merges and `reconcile_unit_pr` is run). For each unit returned,
+    spawn it (spawn_unit → cycle_review) one at a time, or batch via
+    parallel_units.
     """
     plan = state.get_plan(feature_id)
     if not plan:

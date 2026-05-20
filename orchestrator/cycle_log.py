@@ -219,7 +219,7 @@ def write_cycle_log(
          pushes — push policy is operator-driven (see proposal §
          "Persistence and commit strategy").
 
-    ``merge_commit_sha`` is the post-merge backfill knob: ``check_unit_pr``
+    ``merge_commit_sha`` is the post-merge backfill knob: ``reconcile_unit_pr``
     re-invokes this writer once it confirms the PR has merged, supplying
     ``mergeCommit.oid`` so the finalized log records the commit on main.
     This is the only post-finalization edit allowed (proposal § "Per-unit
@@ -267,7 +267,7 @@ def write_cycle_log(
 def _extract_merge_sha(markdown: str) -> str | None:
     """Return the ``Merge commit SHA`` value from an existing cycle log.
 
-    The renderer emits ``Merge commit SHA: <sha>`` only when ``check_unit_pr``
+    The renderer emits ``Merge commit SHA: <sha>`` only when ``reconcile_unit_pr``
     has backfilled the post-merge SHA. ``regenerate_cycle_log`` calls
     this to preserve that field across an offline re-render — otherwise
     re-running the recovery tool on a merged unit silently strips the

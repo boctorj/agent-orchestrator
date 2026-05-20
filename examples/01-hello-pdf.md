@@ -21,7 +21,7 @@ lead → coder → tester → reviewer → PR → merge.
 6. Lead reports `approved_awaiting_merge` with PR URL
 7. You merge on github.com
 8. You: "I merged F-001-U-1"
-9. Lead calls `check_unit_pr` → flips to `done`
+9. Lead calls `reconcile_unit_pr` → flips to `done`
 
 ## What it exercises
 

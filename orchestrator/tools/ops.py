@@ -11,6 +11,13 @@ from orchestrator.agents import ManagedAgentWorker
 from orchestrator.models import ACTIVE_UNIT_STATUSES
 from orchestrator.tools import mcp, need_github_token
 
+# Active statuses that should not legally observe a merged PR — coding/
+# testing/reviewing/fixing/opening_pr units have an agent mid-flight, so
+# a merged PR would mean the agent is racing with a human merge. Treat as
+# unreachable in practice; reconcile_unit_pr emits 'reconcile_refused' to
+# document the policy rather than silently flipping to done.
+_RECONCILE_REFUSED_STATUSES: frozenset[str] = ACTIVE_UNIT_STATUSES - {"in_ci"}
+
 
 @mcp.tool()
 def hello_world_test() -> str:
@@ -30,7 +37,16 @@ def hello_world_test() -> str:
 
 @mcp.tool()
 def check_unit_pr(unit_id: str) -> str:
-    """Poll GitHub for the PR's state + check_runs. Flips unit to 'done' if merged."""
+    """Poll GitHub for the PR's state + check_runs. **Read-only.**
+
+    Returns the observed PR state and CI checks alongside the orchestrator's
+    current ``status`` for the unit. Does NOT mutate state — safe to call
+    from dashboards, diagnostics, or monitors as often as you like.
+
+    To advance a unit's state when its PR has been merged, call
+    ``reconcile_unit_pr(unit_id)`` instead. That tool reads via this one
+    and then applies the (PR-state, unit-status) transitions.
+    """
     unit_state = state.get_unit_state(unit_id)
     if not unit_state or not unit_state.pr_number:
         return f"ERROR: unit {unit_id} has no PR"
@@ -48,34 +64,157 @@ def check_unit_pr(unit_id: str) -> str:
     except Exception as e:  # noqa: BLE001
         return f"ERROR querying GitHub: {e}"
 
-    if pr_state.get("merged"):
-        if unit_state.status != "done":
-            state.touch_unit(unit_id, status="done")
-            state.record_event(
-                unit_id,
-                unit_state.feature_id,
-                "merged",
-                source="human",
-                cycle_number=unit_state.review_round,
-                summary=f"PR #{unit_state.pr_number} merged at {pr_state.get('merged_at')}",
-            )
-        # Post-merge SHA backfill — the one and only edit allowed after
-        # the cycle log has been finalized at terminal review state (see
-        # proposal § "Per-unit cycle log"). ``merge_commit_sha`` diverges
-        # from ``head_sha`` for squash- and rebase-merge strategies.
-        #
-        # GitHub populates ``merge_commit_sha`` asynchronously — the REST
-        # response right after a merge can carry ``merged=True`` with a
-        # still-null ``merge_commit_sha``, then populate it within seconds.
-        # We therefore re-attempt the backfill on every merged poll until
-        # the SHA arrives; ``_git_commit_local`` is idempotent on identical
-        # content (``git diff --cached --quiet`` returns 0 → no commit)
-        # so repeated runs with the same SHA produce no extra commits.
-        # The "amends once" contract is enforced at the file-content
-        # level (the SHA line appears exactly once), not by call count.
-        # Best-effort wrt transport: a missing ``gh``, non-repo workdir,
-        # or disk error must not block ``check_unit_pr`` from returning
-        # the merged state.
+    return json.dumps(
+        {
+            "unit_id": unit_id,
+            "pr_number": unit_state.pr_number,
+            "pr_state": pr_state,
+            "checks": checks,
+            "orchestrator_status": unit_state.status,
+        },
+        indent=2,
+    )
+
+
+@mcp.tool()
+def reconcile_unit_pr(unit_id: str) -> str:
+    """Reconcile orchestrator state with the PR's actual status on GitHub.
+
+    Reads via ``check_unit_pr`` (which never mutates), then applies state
+    transitions based on the (PR state, orchestrator status) pair:
+
+      merged + in_ci      → status='done'; emit 'merged'.
+      merged + escalated  → status='done'; emit 'merged' AND
+                            'recovered_from_escalated' (details = prior
+                            ``last_error``). ``last_error`` is cleared.
+      merged + coding/testing/opening_pr/reviewing/fixing
+                          → no-op + emit 'reconcile_refused' (unreachable
+                            in practice; explicit refusal documents policy).
+      open PR + any state → no-op, no events.
+      closed-unmerged + any state → no-op (human decision; orchestrator
+                            stays out).
+
+    Idempotent: a second call after the unit has already flipped to ``done``
+    re-reads the PR but emits no further events.
+
+    Return shape matches ``check_unit_pr`` plus an ``action`` slug naming
+    the branch taken and a ``reconciled`` flag that is ``True`` **only**
+    when the unit's ``status`` row was actually transitioned to ``done``
+    on this call. The ``no-op-*`` and ``refused-from-*`` branches all
+    return ``reconciled=False`` (status unchanged); consult ``action``
+    for the precise sub-case.
+
+    Side effect: on every merged poll (whether this call flipped the
+    status or a prior call already did) we re-invoke the cycle-log
+    writer with the observed ``mergeCommit.oid`` so the finalized cycle
+    log records the commit on main. Idempotent at the file layer; runs
+    on every merged poll so the null→populated ``merge_commit_sha``
+    race that GitHub's REST API can hit catches up on a subsequent
+    call. See ``orchestrator.cycle_log.write_cycle_log``.
+    """
+    poll_result = check_unit_pr(unit_id)
+    # Surface upstream errors verbatim (no PR, no feature, no token, GH error).
+    if poll_result.startswith("ERROR"):
+        return poll_result
+
+    try:
+        poll = json.loads(poll_result)
+    except json.JSONDecodeError:
+        return poll_result  # defensive — check_unit_pr returns JSON on success
+
+    # Re-read state after the poll so any race with another caller is reflected.
+    unit_state = state.get_unit_state(unit_id)
+    if not unit_state:
+        return f"ERROR: unit {unit_id} disappeared between poll and reconcile"
+
+    pr_state = poll.get("pr_state", {})
+    merged = bool(pr_state.get("merged"))
+    status = unit_state.status
+    cycle = unit_state.review_round
+    reconciled = False  # only the two status-flipping branches below set True
+
+    if not merged:
+        # Open PR or closed-unmerged: orchestrator stays out.
+        action = "no-op-pr-not-merged"
+    elif status == "done":
+        # Idempotency guard: a prior reconcile already flipped to done.
+        action = "no-op-already-done"
+    elif status == "in_ci":
+        summary = f"PR #{unit_state.pr_number} merged at {pr_state.get('merged_at')}"
+        state.touch_unit(unit_id, status="done")
+        state.record_event(
+            unit_id,
+            unit_state.feature_id,
+            "merged",
+            source="human",
+            cycle_number=cycle,
+            summary=summary,
+        )
+        action = "merged-from-in_ci"
+        reconciled = True
+    elif status == "escalated":
+        summary = f"PR #{unit_state.pr_number} merged at {pr_state.get('merged_at')}"
+        prior_error = unit_state.last_error
+        state.touch_unit(unit_id, status="done", clear_error=True)
+        state.record_event(
+            unit_id,
+            unit_state.feature_id,
+            "merged",
+            source="human",
+            cycle_number=cycle,
+            summary=summary,
+        )
+        state.record_event(
+            unit_id,
+            unit_state.feature_id,
+            "recovered_from_escalated",
+            source="human",
+            cycle_number=cycle,
+            summary="merged after escalation; last_error cleared",
+            details=prior_error,
+        )
+        action = "merged-from-escalated"
+        reconciled = True
+    elif status in _RECONCILE_REFUSED_STATUSES:
+        # Merged while an agent role is mid-flight is racy enough that the
+        # right policy is "refuse and let the human investigate" — never
+        # silently advance a unit whose coder/tester/reviewer is still live.
+        # Unit status stays unchanged; reconciled=False matches the no-op
+        # branches' "row not transitioned" semantic.
+        state.record_event(
+            unit_id,
+            unit_state.feature_id,
+            "reconcile_refused",
+            source="human",
+            cycle_number=cycle,
+            summary=f"refusing to advance unit in active status {status!r} to done",
+        )
+        action = f"refused-from-{status}"
+    else:
+        # 'pending', 'approved_awaiting_merge' (F-009-U-4 will add this
+        # branch), or any future status we haven't taught reconcile about.
+        state.record_event(
+            unit_id,
+            unit_state.feature_id,
+            "reconcile_refused",
+            source="human",
+            cycle_number=cycle,
+            summary=f"refusing to advance unit in status {status!r} to done",
+        )
+        action = f"refused-from-{status}"
+
+    if action.startswith("merged-from-") or action == "no-op-already-done":
+        # F-006-U-3 SHA backfill — runs on every merged observation, not
+        # just the status-flipping transition. GitHub populates
+        # ``merge_commit_sha`` asynchronously, so the first poll right
+        # after a merge can carry ``merged=True`` with a still-null SHA;
+        # subsequent polls (where ``action == "no-op-already-done"``)
+        # catch up once the SHA arrives. ``write_cycle_log`` is
+        # idempotent at the file layer (``git diff --cached --quiet``
+        # → no commit on identical content), so repeated runs with the
+        # same SHA produce no extra commits. Best-effort wrt transport:
+        # a missing ``gh``, non-repo workdir, or disk error must not
+        # break the reconcile response the lead is waiting on.
         merge_sha = pr_state.get("merge_commit_sha")
         if merge_sha:
             with contextlib.suppress(Exception):
@@ -86,15 +225,17 @@ def check_unit_pr(unit_id: str) -> str:
                     commit_message=f"cycle-log: backfill merge SHA for {unit_id}",
                 )
 
-    # Re-read after potential touch_unit above to surface latest status
+    # Single return path through a fresh re-read so every branch reflects
+    # the post-transition row — including the no-op-* / refused-* branches
+    # where a concurrent caller may have advanced the unit between
+    # check_unit_pr's read and ours.
     refreshed = state.get_unit_state(unit_id)
     return json.dumps(
         {
-            "unit_id": unit_id,
-            "pr_number": unit_state.pr_number,
-            "pr_state": pr_state,
-            "checks": checks,
+            **poll,
             "orchestrator_status": refreshed.status if refreshed else "unknown",
+            "reconciled": reconciled,
+            "action": action,
         },
         indent=2,
     )

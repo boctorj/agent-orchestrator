@@ -32,7 +32,7 @@ After all three merge: U-5 becomes ready.
 
 - ✅ Multi-unit DAG planning
 - ✅ `parallel_units` for batches of ready units
-- ✅ `check_unit_pr` flipping merged units to done
+- ✅ `reconcile_unit_pr` flipping merged units to done
 - ✅ `next_ready_units` finding newly-unblocked work
 - ✅ The full review cycle on each unit (5x)
 

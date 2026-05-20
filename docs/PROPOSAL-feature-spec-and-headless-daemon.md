@@ -150,7 +150,7 @@ Path: `features/F-XXX/U-N.md`. Schema:
 #42 · https://github.com/owner/repo/pull/42
 Status: merged (2026-05-15 14:32 UTC)
 PR head SHA: <headRefOid at terminal state>
-Merge commit SHA: <mergeCommit.oid, captured when check_unit_pr confirms merged>
+Merge commit SHA: <mergeCommit.oid, captured when reconcile_unit_pr confirms merged>
 
 ## Coder's PR description (verbatim, as of merge)
 [full PR body text captured at terminal state]
@@ -194,9 +194,10 @@ None.  (or: "see spec.md commit <sha> — Fernet scope clarified")
     log is first finalized (`REVIEW_RECOMMEND_MERGE` / `REVIEW_COMMENT` /
     escalation).
   - `mergeCommit.oid` (the actual commit on main) — captured later when
-    `check_unit_pr` confirms the PR has been merged. Diverges from
-    `headRefOid` for squash and rebase merges. The cycle log is amended
-    once to add this field; that's the only post-finalization edit.
+    `reconcile_unit_pr` confirms the PR has been merged (or the read-only
+    `check_unit_pr` on a diagnostic call). Diverges from `headRefOid`
+    for squash and rebase merges. The cycle log is amended once to add
+    this field; that's the only post-finalization edit.
 
 **Storage decision:** markdown files, NOT state.db. PR descriptions can
 be 5–10KB; markdown is human-readable; git history of the file is a
@@ -456,9 +457,9 @@ Daemon resumes U-3 on next poll.
 ### Status check
 
 ```
-"What's in flight?" → show_dashboard()   (read-only, <2K tokens)
-"I merged U-2."     → check_unit_pr()    (flips to done, daemon picks
-                                          up U-4 on next poll)
+"What's in flight?" → show_dashboard()      (read-only, <2K tokens)
+"I merged U-2."     → reconcile_unit_pr()   (flips to done, daemon picks
+                                             up U-4 on next poll)
 ```
 
 ## Decisions
@@ -575,7 +576,7 @@ Phases ship in 1 → 2 → 3 order. Each is independently useful.
    rejected cron-driven cycle scheduler) can patch missing logs.
 5. **PR description drift after capture.** User edits the PR description
    on GitHub after the cycle log was written. Mitigation: capture
-   timestamp + final SHA in the log; re-capture on `check_unit_pr`
+   timestamp + final SHA in the log; re-capture on `reconcile_unit_pr`
    merged-state confirmation.
 
 ## Rejected alternatives
