@@ -365,15 +365,13 @@ _ROLE_TO_SESSION_ATTR = {
 
 
 def _format_tail_messages(messages: list[TailMessage]) -> str:
-    """Render the message body of a ``tail_worker`` response.
+    """Join ``[ts] role: text`` lines for the non-empty branches.
 
-    Empty list returns "(no messages yet)" so the lead can distinguish
-    "session active but silent" from a rendering bug.
+    Empty input is special-cased by ``tail_worker`` per-status (so the
+    header phrasing matches reality) rather than handled here; calling
+    this with ``messages == []`` returns the empty string.
     """
-    if not messages:
-        return "(no messages yet)"
-    lines = [f"[{m['ts']}] {m['role']}: {m['text']}" for m in messages]
-    return "\n".join(lines)
+    return "\n".join(f"[{m['ts']}] {m['role']}: {m['text']}" for m in messages)
 
 
 @mcp.tool()
@@ -387,6 +385,10 @@ def tail_worker(unit_id: str, role: str = "coder", limit: int = 20) -> str:
       * ``idle``       → "worker completed, final messages" + messages
       * ``terminated`` → "worker dead (reason); last messages before death" + messages
       * ``not_found``  → "no session for unit_id/role — likely never spawned"
+
+    Each non-``not_found`` branch swaps to an "— no messages yet/emitted/
+    before death" tail when the backend returned zero messages, so the
+    header never promises N messages that aren't in the body.
 
     **Read-only.** No state.db writes, no events, no perturbation of the
     agent's session — safe to call from dashboards, monitors, or the chat
@@ -406,7 +408,8 @@ def tail_worker(unit_id: str, role: str = "coder", limit: int = 20) -> str:
             ceiling; 20 is the ergonomic floor for a chat-friendly reply.
     """
     if role not in _ROLE_TO_SESSION_ATTR:
-        return f"ERROR: role must be coder|tester|reviewer, got {role!r}"
+        valid = "|".join(_ROLE_TO_SESSION_ATTR)
+        return f"ERROR: role must be {valid}, got {role!r}"
 
     unit_state = state.get_unit_state(unit_id)
     if not unit_state:
@@ -419,12 +422,16 @@ def tail_worker(unit_id: str, role: str = "coder", limit: int = 20) -> str:
         # as the not_found branch below so the chat output is consistent.
         return f"no session for {unit_id}/{role} — likely never spawned"
 
-    worker = make_worker(role)
+    # ``make_worker`` raises ValueError for an unknown ORCH_WORKER_BACKEND
+    # value — keep it inside the try so a misconfigured env doesn't crash
+    # the MCP loop just because the lead asked to tail an active unit.
     try:
+        worker = make_worker(role)
         result = worker.tail_messages(sid, limit=limit)
     except ValueError as e:
-        # ``_validate_limit`` rejects limit < 1; surface so the caller fixes
-        # the call site rather than the tool crashing into the MCP loop.
+        # Two callers raise ValueError here: ``_validate_limit`` (limit < 1)
+        # and ``make_worker`` (unknown backend). Both are recoverable
+        # configuration errors the lead can act on.
         return f"ERROR: {e}"
     except Exception as e:  # noqa: BLE001 — observability tool must not crash chat
         return f"ERROR tailing session {sid}: {e}"
@@ -432,16 +439,22 @@ def tail_worker(unit_id: str, role: str = "coder", limit: int = 20) -> str:
     status = result["status"]
     messages = result["messages"]
     reason = result.get("reason")
+    empty = not messages
+    reason_suffix = f" ({reason})" if reason else ""
 
     if status == "not_found":
         return f"no session for {unit_id}/{role} — likely never spawned"
 
     if status == "terminated":
         cause = reason or "terminated"
+        if empty:
+            return f"worker dead ({cause}) — no messages before death"
         body = _format_tail_messages(messages)
         return f"worker dead ({cause}); last messages before death\n\n{body}"
 
     if status == "idle":
+        if empty:
+            return "worker completed — no messages emitted"
         body = _format_tail_messages(messages)
         return f"worker completed, final messages\n\n{body}"
 
@@ -449,11 +462,11 @@ def tail_worker(unit_id: str, role: str = "coder", limit: int = 20) -> str:
     # taxonomy adds before this file catches up). ``reason`` is surfaced
     # in parens when the backend populated it (unknown SDK status carries
     # the raw value via reason; observability survives drift).
+    if empty:
+        return f"worker active — no messages yet{reason_suffix}"
     n = len(messages)
     plural = "message" if n == 1 else "messages"
-    header = f"worker active, last {n} {plural}"
-    if reason:
-        header = f"{header} ({reason})"
+    header = f"worker active, last {n} {plural}{reason_suffix}"
     body = _format_tail_messages(messages)
     return f"{header}\n\n{body}"
 
