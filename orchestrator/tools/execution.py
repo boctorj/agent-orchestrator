@@ -14,7 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from orchestrator import ci_wait, cycle_log, github, ntfy, state
+from orchestrator import ci_wait, cycle_log, feature_spec, github, ntfy, state
 from orchestrator.agents import ManagedAgentWorker
 from orchestrator.blocked_reasons import parse_blocked_marker
 from orchestrator.models import ACTIVE_UNIT_STATUSES, Feature, WorkUnit, WorkUnitState
@@ -46,6 +46,48 @@ from orchestrator.tools import (
     safe_submit_pr_review,
     tail,
 )
+
+# --------------------------- task-message context helpers ---------------------------
+
+
+def _predecessor_summaries(unit: WorkUnit) -> list[tuple[str, str]]:
+    """``(unit_id, cycle-log summary)`` for every declared predecessor.
+
+    Empty summaries (missing cycle log on disk) are preserved here so callers
+    can see which deps were declared regardless of materialization state;
+    :func:`_render_context_blocks` drops the empties when rendering. This
+    keeps the "graceful missing-file" contract from F-006-U-4 explicit at
+    both layers.
+    """
+    return [(dep_id, cycle_log.cycle_log_summary(dep_id)) for dep_id in unit.depends_on]
+
+
+def _task_context_kwargs(feature: Feature, unit: WorkUnit) -> dict[str, Any]:
+    """Common ``compose_*_task`` injection kwargs: spec text + predecessor logs.
+
+    Centralizes the two reads coder/tester/reviewer share so a future change
+    to either source (additional fields, alternative summarization) lands in
+    one place. Missing files yield empty values — each context block then
+    drops out individually at the renderer (see
+    :func:`orchestrator.tools._render_context_blocks`). That's the F-006-U-4
+    "read-side gracefully handles missing files" guarantee: e.g. a feature
+    with no merged predecessors still injects ``## FEATURE SPEC`` once its
+    spec.md exists, but ``## PREDECESSOR UNITS`` stays absent until the
+    first dep's cycle log lands on disk.
+    """
+    return {
+        "feature_spec_text": feature_spec.read_spec(feature.id),
+        "predecessor_logs": _predecessor_summaries(unit),
+    }
+
+
+# Reviewer retry threshold for injecting the unit's own cycle log
+# (PROPOSAL § "Role prompt changes" — reviewer gets ``## THIS UNIT'S CYCLE LOG``
+# only on retry cycle >= 2; the first reviewer turn has no prior cycle to
+# read). Pulled out as a constant so the proposal-spec semantics are
+# greppable from anywhere.
+REVIEWER_OWN_LOG_MIN_ROUND = 2
+
 
 # --------------------------- spawn_unit (coder) ---------------------------
 
@@ -89,7 +131,9 @@ def spawn_unit(feature_id: str, unit_id: str) -> str:
     github_token = get_agent_token()
 
     branch = branch_for(feature, unit)
-    task = compose_coder_task(feature, unit, branch, github_token)
+    task = compose_coder_task(
+        feature, unit, branch, github_token, **_task_context_kwargs(feature, unit)
+    )
 
     state.upsert_unit_state(
         WorkUnitState(unit_id=unit_id, feature_id=feature_id, status="coding", branch=branch)
@@ -261,7 +305,14 @@ def spawn_tester(feature_id: str, unit_id: str) -> str:
         return err
     github_token = get_agent_token()
 
-    task = compose_tester_task(feature, unit, unit_state.branch, unit_state.pr_number, github_token)
+    task = compose_tester_task(
+        feature,
+        unit,
+        unit_state.branch,
+        unit_state.pr_number,
+        github_token,
+        **_task_context_kwargs(feature, unit),
+    )
     state.touch_unit(unit_id, status="testing")
     state.record_event(
         unit_id,
@@ -406,7 +457,12 @@ def spawn_reviewer(feature_id: str, unit_id: str) -> str:
         return err
     github_token = get_agent_token()
 
-    task = compose_reviewer_task(feature, unit, unit_state.pr_number, github_token)
+    reviewer_kwargs = _task_context_kwargs(feature, unit)
+    if unit_state.review_round >= REVIEWER_OWN_LOG_MIN_ROUND:
+        reviewer_kwargs["own_cycle_log"] = cycle_log.read_cycle_log(unit_id)
+    task = compose_reviewer_task(
+        feature, unit, unit_state.pr_number, github_token, **reviewer_kwargs
+    )
     state.touch_unit(unit_id, status="reviewing")
     state.record_event(
         unit_id,

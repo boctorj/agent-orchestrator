@@ -23,10 +23,12 @@ Concretely the assertions below cover:
   4. The spec-format reference doc `docs/SPEC-FORMAT.md` exists, names
      every template section, and documents the `Why:` commit-message
      pattern as the decision log.
-  5. "Pure additive" guard: no MCP tool named `feature_memory` is
-     registered yet, and the `compose_*_task` templates do not inject
-     spec.md content yet — both are intentionally deferred to later
-     units of F-006.
+  5. "Pure additive" guard for the deferred surfaces: no MCP tool named
+     `feature_memory` is registered yet. (The compose_*_task injections
+     shipped in F-006-U-4 — earlier revisions of this file also asserted
+     the absence of the `## FEATURE SPEC` block, but that guard is
+     retired with U-4 and the equivalent positive coverage lives in
+     `tests/test_f006_u4_spec.py`.)
   6. spec.md is seeded regardless of whether `repo_path` is supplied
      (planning is free; the verification gate is orthogonal).
 """
@@ -36,15 +38,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from orchestrator import feature_spec
-from orchestrator.models import Feature, WorkUnit
-from orchestrator.tools import (
-    compose_coder_task,
-    compose_fix_task,
-    compose_reviewer_task,
-    compose_tester_task,
-    mcp,
-    planning,
-)
+from orchestrator.tools import mcp, planning
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SPEC_FORMAT_DOC = REPO_ROOT / "docs" / "SPEC-FORMAT.md"
@@ -262,44 +256,6 @@ def test_no_feature_memory_mcp_tool_registered_yet():
         "feature_memory MCP tool is registered but the F-006-U-1 unit "
         "description marks it deferred to a later unit (pure additive)"
     )
-
-
-def test_compose_task_templates_do_not_inject_spec_content_yet(tmp_state_db):
-    """compose_*_task templates fan FEATURE CONTEXT (description) into the
-    coder/tester/reviewer task — but they MUST NOT yet inline `spec.md`
-    contents or read the file. Wiring those injections is a later unit
-    of F-006; doing it here would break the 'no consumers yet' clause."""
-    feature = Feature(
-        id="F-001",
-        title="t",
-        description="d",
-        repo_path="https://github.com/o/r",
-        branch_prefix="feat/F-001",
-    )
-    unit = WorkUnit(id="F-001-U-1", feature_id="F-001", title="u", description="ud")
-
-    rendered = [
-        compose_coder_task(feature, unit, branch="feat/F-001-x", github_token="tok"),
-        compose_tester_task(feature, unit, branch="feat/F-001-x", pr_number=1, github_token="tok"),
-        compose_reviewer_task(feature, unit, pr_number=1, github_token="tok"),
-        compose_fix_task(
-            feature, unit, branch="feat/F-001-x", pr_number=1, source="tester", feedback="f"
-        ),
-    ]
-    for body in rendered:
-        # None of the task templates should be injecting the durable
-        # spec.md content yet. The proposal calls the injected block
-        # `## FEATURE SPEC` (see PROPOSAL §"Role prompt changes"); the
-        # absence of that header here means "no consumer wired".
-        assert "## FEATURE SPEC" not in body, (
-            "compose_*_task is injecting a `## FEATURE SPEC` block, "
-            "but F-006-U-1 is the seeder-only unit (no consumers yet)"
-        )
-        # Reading the file would be a side-effect injection too.
-        assert "spec.md" not in body, (
-            "compose_*_task references `spec.md`, but the consumer "
-            "wiring is deferred to a later unit of F-006"
-        )
 
 
 def test_planning_module_does_not_read_spec_md_on_import(tmp_state_db):
