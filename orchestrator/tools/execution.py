@@ -595,14 +595,19 @@ def _format_reviewer_marker_response(
 def address_review(unit_id: str, source: str, feedback: str) -> str:
     """Resume the coder session to address feedback (from tester/reviewer/ci/human).
 
-    **Idempotent on units in any non-terminal status, including ``escalated``.**
+    **Idempotent on any status with a ``coder_session_id``, EXCEPT ``done``.**
     The session_id is the source of truth — as long as ``coder_session_id``
-    is set, the coder thread is resumed and the unit transitions back to
-    ``fixing``. This is the standard recovery path for Gap-C (cleared
-    blocker after escalation): the human surfaces feedback via this call
-    and the coder picks up exactly where it left off. No guard rejects an
-    escalated unit — the prior ``last_error`` is the *reason* the human
-    is calling now.
+    is set and the unit is not merged, the coder thread is resumed and the
+    unit transitions back to ``fixing``. This is the standard recovery path
+    for Gap-C (cleared blocker after escalation): the human surfaces
+    feedback via this call and the coder picks up exactly where it left
+    off. No guard rejects an escalated unit — the prior ``last_error`` is
+    the *reason* the human is calling now.
+
+    Refuses on ``status='done'`` to avoid silently re-opening a merged unit.
+    NB: ``escalated`` is listed in ``TERMINAL_UNIT_STATUSES`` alongside
+    ``done`` but is deliberately *not* refused here — that's the audit
+    Gap-C contract.
 
     Increments review_round. BLOCKS for minutes.
     Returns coder's response — should end with FIX_PUSHED or BLOCKED.
@@ -622,6 +627,17 @@ def address_review(unit_id: str, source: str, feedback: str) -> str:
         return f"ERROR: no coder session for {unit_id}"
     if not unit_state.pr_number:
         return f"ERROR: no PR for unit {unit_id} — spawn coder first"
+    # Done units have a merged PR — re-opening via a coder resume would
+    # silently flip status away from terminal. Recovery for merged units
+    # goes through reconcile_unit_pr (which is idempotent and read-only
+    # against the worker session). Symmetric to the `done` guard in
+    # `_resume_role_for_recovery`.
+    if unit_state.status == "done":
+        return (
+            f"ERROR: unit {unit_id} is already done (PR merged). "
+            f"Refusing to resume coder — use reconcile_unit_pr to refresh "
+            f"state if needed."
+        )
 
     feature = state.get_feature(unit_state.feature_id)
     plan = state.get_plan(unit_state.feature_id)
@@ -1305,7 +1321,15 @@ def _resume_role_for_recovery(
     ``_format_reviewer_marker_response``) so callers don't need to
     special-case the resume path.
 
-    Status handling:
+    **Refuses on ``status='done'``** — the old duplicate-spawn-guard wall
+    incidentally protected merged units from being silently re-opened; the
+    resume contract preserves that. Recovery is for the escalated/active
+    states (Gap-C / Gap-D); a merged unit needs ``reconcile_unit_pr``, not
+    resume. (``escalated`` is recoverable — it's *terminal* per
+    ``TERMINAL_UNIT_STATUSES`` but the audit gap C is exactly the
+    post-escalation recovery path, so we deliberately allow it here.)
+
+    Status handling on the recoverable branches:
       - flips to ``testing`` / ``reviewing`` while the worker runs;
       - clears ``last_error`` on entry — we're starting a fresh attempt and
         the marker chain will repopulate it if the worker BLOCKS again;
@@ -1313,6 +1337,18 @@ def _resume_role_for_recovery(
         the summary suffix) before the resume call so operators see the
         recovery branch was chosen.
     """
+    # `done` units have a merged PR — re-engaging the worker session would
+    # silently flip status away from terminal, re-trigger ntfy pushes, and
+    # pollute the lead's scheduling view. The pre-F-009-U-3 refusal wall
+    # incidentally caught this; the resume contract has to as well.
+    if unit_state.status == "done":
+        return (
+            f"ERROR: unit {unit_state.unit_id} is already done (PR merged). "
+            f"Refusing to resume {role} — use reconcile_unit_pr to refresh "
+            f"state if needed, or clear the session id manually if you "
+            f"intend to re-open."
+        )
+
     # Callers (spawn_tester / spawn_reviewer) gate on pr_number before
     # routing here; assert keeps mypy honest about the narrowing.
     pr_number = unit_state.pr_number
@@ -1415,11 +1451,29 @@ def _resume_or_spawn_tester(feature_id: str, unit_id: str) -> str:
     if unit_state is None or not unit_state.tester_session_id:
         return spawn_tester(feature_id, unit_id)
 
+    # Symmetric to the `done` guard in ``_resume_role_for_recovery`` — a
+    # merged unit's tester session must not be silently re-engaged, even
+    # from cycle_review's internal retry path.
+    if unit_state.status == "done":
+        return (
+            f"ERROR: unit {unit_id} is already done (PR merged). "
+            f"Refusing to resume tester — use reconcile_unit_pr to refresh "
+            f"state if needed, or clear tester_session_id manually if you "
+            f"intend to re-open."
+        )
+
     session_id = unit_state.tester_session_id
     cycle_number = unit_state.review_round
     feature = state.get_feature(feature_id)
 
-    state.touch_unit(unit_id, status="testing")
+    # Derive the reason from current status so an escalated unit gets the
+    # post-escalation prompt (with interpolated last_error) instead of the
+    # "your previous response was lost" transient-retry script. Mirrors
+    # ``_resume_role_for_recovery``. Clearing last_error on entry matches
+    # the same helper — touch_unit's `error=""` default is a no-op, so the
+    # explicit ``clear_error=True`` is what actually wipes the column.
+    reason = _derive_recovery_reason(unit_state)
+    state.touch_unit(unit_id, status="testing", clear_error=True)
     state.record_event(
         unit_id,
         feature_id,
@@ -1427,14 +1481,14 @@ def _resume_or_spawn_tester(feature_id: str, unit_id: str) -> str:
         source="orchestrator",
         cycle_number=cycle_number,
         session_id=session_id,
-        summary="Resuming orphaned tester session",
+        summary=f"Resuming orphaned tester session ({reason})",
     )
 
     try:
         response = _resume_role_session(
             "tester",
             session_id,
-            build_recovery_prompt("tester", "transient-retry"),
+            build_recovery_prompt("tester", reason, last_error=unit_state.last_error),
         )
     except Exception as e:  # noqa: BLE001 — surface as orchestrator error
         state.touch_unit(unit_id, status="escalated", error=str(e))

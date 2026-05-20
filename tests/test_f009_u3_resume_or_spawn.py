@@ -594,3 +594,190 @@ class TestCycleReviewTransientRetry:
             f"second cycle_review must recover from orphaned tester session; got {parsed!r}"
         )
         assert "unexpected outcome: RAW" not in parsed.get("message", "")
+
+
+# =========================================================================
+# `done` status guard — refuses resume on merged units
+# =========================================================================
+
+
+class TestResumeRefusesOnDone:
+    """Reviewer finding H1 / Copilot #1: the resume path dropped the
+    duplicate-spawn-guard wall that incidentally protected merged units
+    from being silently re-opened. The contract restores the protection
+    on the ``done`` status while preserving recovery for escalated/active.
+
+    A merged unit with a still-populated ``{role}_session_id`` (orphaned
+    from the pre-merge cycle) must refuse resume on all four surfaces:
+    ``spawn_tester``, ``spawn_reviewer``, ``address_review``, and the
+    interior ``_resume_or_spawn_tester`` helper that ``cycle_review`` uses.
+    """
+
+    def test_spawn_tester_refuses_resume_on_done(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        _seed_unit(status="done", tester_session_id="orphan-from-before-merge")
+        instances = _install_workers(
+            monkeypatch, per_role={"tester": {"resume_response": "TESTS_PASS"}}
+        )
+        _stub_github(monkeypatch)
+
+        out = execution.spawn_tester("F-001", "F-001-U-1")
+
+        assert "ERROR" in out, f"must refuse on done; got {out!r}"
+        assert "already done" in out
+        assert "reconcile_unit_pr" in out, "error must point at the right next step"
+
+        # No worker constructed at all — refusal happens before any factory
+        # call, so the role entry never materialises in `instances`.
+        assert "tester" not in instances, (
+            "ManagedAgentWorker must not even be instantiated on a done unit"
+        )
+
+        # Status is unchanged — the unit stays done.
+        assert state.get_unit_state("F-001-U-1").status == "done"
+
+    def test_spawn_reviewer_refuses_resume_on_done(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        _seed_unit(status="done", reviewer_session_id="orphan-reviewer")
+        instances = _install_workers(
+            monkeypatch,
+            per_role={"reviewer": {"resume_response": "REVIEW_RECOMMEND_MERGE: clean"}},
+        )
+        _stub_github(monkeypatch)
+
+        out = execution.spawn_reviewer("F-001", "F-001-U-1")
+
+        assert "ERROR" in out, f"must refuse on done; got {out!r}"
+        assert "already done" in out
+        assert "reconcile_unit_pr" in out
+        assert "reviewer" not in instances
+        assert state.get_unit_state("F-001-U-1").status == "done"
+
+    def test_address_review_refuses_on_done(self, tmp_state_db, with_github_token, monkeypatch):
+        """Reviewer finding M2: ``address_review`` previously had no guard
+        against ``status='done'`` either — calling it on a merged unit
+        would flip status to ``fixing``. The docstring's "non-terminal"
+        promise now matches behaviour."""
+        _seed_unit(status="done")
+        instances = _install_workers(
+            monkeypatch, per_role={"coder": {"resume_response": "FIX_PUSHED"}}
+        )
+        _stub_github(monkeypatch)
+
+        out = execution.address_review("F-001-U-1", "human", "try again")
+
+        assert "ERROR" in out, f"must refuse on done; got {out!r}"
+        assert "already done" in out
+        assert "reconcile_unit_pr" in out
+        assert "coder" not in instances
+        assert state.get_unit_state("F-001-U-1").status == "done"
+
+    def test_resume_or_spawn_tester_refuses_on_done(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """The interior helper that cycle_review's _tester_phase calls must
+        also refuse — otherwise a stray cycle_review on a merged unit would
+        re-open it via the F-013-U-1 path even though the F-009-U-3 surface
+        protects it."""
+        _seed_unit(status="done", tester_session_id="orphan-tester")
+        instances = _install_workers(
+            monkeypatch, per_role={"tester": {"resume_response": "TESTS_PASS"}}
+        )
+        _stub_github(monkeypatch)
+
+        out = execution._resume_or_spawn_tester("F-001", "F-001-U-1")
+
+        assert "ERROR" in out
+        assert "already done" in out
+        assert "tester" not in instances
+        assert state.get_unit_state("F-001-U-1").status == "done"
+
+
+# =========================================================================
+# `_resume_or_spawn_tester` — derive reason + clear last_error (M1)
+# =========================================================================
+
+
+class TestResumeOrSpawnTesterPostEscalationContract:
+    """Reviewer finding M1 / Copilot #2: ``_resume_or_spawn_tester`` used to
+    hardcode the transient-retry recovery prompt and never cleared
+    ``last_error``. On an escalated unit with an orphaned tester session,
+    that meant: (a) the worker got a "network timeout" prompt for a hard
+    failure, and (b) a successful TESTS_PASS recovery left the stale
+    ``last_error`` populated on the dashboard.
+
+    The fix derives the reason from ``unit_state.status`` (matching
+    ``_resume_role_for_recovery``) and clears ``last_error`` on entry.
+    """
+
+    def test_escalated_unit_gets_post_escalation_prompt_with_last_error(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        _seed_unit(
+            status="escalated",
+            tester_session_id="orphan-tester",
+            last_error="cap-3 hit on tester bug",
+        )
+        instances = _install_workers(
+            monkeypatch, per_role={"tester": {"resume_response": "TESTS_PASS"}}
+        )
+        _stub_github(monkeypatch)
+
+        execution._resume_or_spawn_tester("F-001", "F-001-U-1")
+
+        tw = instances["tester"]
+        assert len(tw.resume_calls) == 1
+        _, msg = tw.resume_calls[0]
+        # The post-escalation template references "escalated" and interpolates
+        # the unit's last_error. The transient-retry template says "lost to a
+        # network timeout" — must NOT appear here.
+        assert "escalated" in msg.lower(), (
+            f"post-escalation prompt must reference the prior escalation; got msg={msg!r}"
+        )
+        assert "cap-3 hit on tester bug" in msg, "last_error must be interpolated"
+        assert "network timeout" not in msg.lower(), (
+            "transient-retry prompt sent on an escalated unit — wrong reason derived"
+        )
+
+    def test_in_ci_unit_still_gets_transient_retry_prompt(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """Sanity: the in_ci path (Gap-D — F-013-U-1's original scope) still
+        gets the transient-retry script. The "network timeout" phrasing is
+        load-bearing for the F-013 contract assertion."""
+        _seed_unit(status="in_ci", tester_session_id="orphan-tester")
+        instances = _install_workers(
+            monkeypatch, per_role={"tester": {"resume_response": "TESTS_PASS"}}
+        )
+        _stub_github(monkeypatch)
+
+        execution._resume_or_spawn_tester("F-001", "F-001-U-1")
+
+        tw = instances["tester"]
+        _, msg = tw.resume_calls[0]
+        assert "network timeout" in msg.lower(), (
+            f"in_ci → transient-retry; the F-013 contract requires this phrase; got msg={msg!r}"
+        )
+
+    def test_successful_recovery_clears_stale_last_error(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """After a TESTS_PASS recovery on an escalated unit, ``last_error``
+        must be empty — otherwise the dashboard shows a stale escalation
+        reason for a now-passing unit."""
+        _seed_unit(
+            status="escalated",
+            tester_session_id="orphan-tester",
+            last_error="cap-3 hit on tester bug",
+        )
+        _install_workers(monkeypatch, per_role={"tester": {"resume_response": "TESTS_PASS"}})
+        _stub_github(monkeypatch)
+
+        execution._resume_or_spawn_tester("F-001", "F-001-U-1")
+
+        s = state.get_unit_state("F-001-U-1")
+        assert s.last_error == "", (
+            f"last_error must be cleared on successful recovery; got {s.last_error!r}"
+        )
