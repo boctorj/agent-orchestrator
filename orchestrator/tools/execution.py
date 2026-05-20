@@ -467,8 +467,8 @@ def spawn_reviewer(feature_id: str, unit_id: str) -> str:
 def _format_reviewer_marker_response(
     *,
     unit_id: str,
-    repo_path: str,
-    pr_number: int,
+    repo_path: str | None,
+    pr_number: int | None,
     session_id: str,
     response: str,
     marker: dict[str, Any],
@@ -479,16 +479,22 @@ def _format_reviewer_marker_response(
     same shape so ``cycle_review`` consumers (``_record_step``, history
     entries) don't need to special-case the retry path.
 
-    Side effect: posts the recommendation / BLOCKED comment to the PR.
+    Side effect: posts the recommendation / BLOCKED comment to the PR when
+    ``repo_path`` and ``pr_number`` are both set. The degenerate case where
+    ``_resume_or_spawn_reviewer`` resumes on a row whose ``pr_number`` /
+    feature record was lost gracefully skips the PR-side write rather than
+    falling through to ``_escalate_no_marker`` for a marker that already
+    parsed cleanly.
     """
     if marker["marker"] == "REVIEW_RECOMMEND_MERGE":
         reason = marker["reason"]
-        safe_comment_pr(
-            repo_path,
-            pr_number,
-            f"🤖 **Reviewer endorsed for merge** (self-approval blocked, posted as comment).\n\n"
-            f"_{reason}_\n_Session: `{session_id}`_",
-        )
+        if repo_path and pr_number is not None:
+            safe_comment_pr(
+                repo_path,
+                pr_number,
+                f"🤖 **Reviewer endorsed for merge** (self-approval blocked, posted as comment).\n\n"
+                f"_{reason}_\n_Session: `{session_id}`_",
+            )
         return json.dumps(
             {
                 "unit_id": unit_id,
@@ -525,11 +531,12 @@ def _format_reviewer_marker_response(
 
     # marker["marker"] == "BLOCKED"
     payload = marker["payload"]
-    safe_comment_pr(
-        repo_path,
-        pr_number,
-        f"🚨 **Reviewer BLOCKED [{payload.reason}]:** {payload.prose}\n_Escalated to human._",
-    )
+    if repo_path and pr_number is not None:
+        safe_comment_pr(
+            repo_path,
+            pr_number,
+            f"🚨 **Reviewer BLOCKED [{payload.reason}]:** {payload.prose}\n_Escalated to human._",
+        )
     return f"BLOCKED — reviewer for {unit_id} [{payload.reason}]: {payload.prose}"
 
 
@@ -1614,21 +1621,15 @@ def _resume_or_spawn_reviewer(feature_id: str, unit_id: str) -> str:
             indent=2,
         )
 
-    if feature is None or unit_state.pr_number is None:
-        # Shouldn't happen — _reviewer_phase only runs after spawn_unit has
-        # opened a PR — but degrade gracefully rather than crash mid-cycle.
-        return _escalate_no_marker(
-            unit_id=unit_id,
-            feature_id=feature_id,
-            role="reviewer",
-            cycle_number=cycle_number,
-            session_id=session_id,
-            response=response,
-        )
-
+    # REVIEW_RECOMMEND_MERGE / REVIEW_REQUEST_CHANGES / REVIEW_COMMENT — the
+    # marker is already parsed and recorded; degrade gracefully when feature
+    # or pr_number is missing rather than escalating a clean verdict via
+    # _escalate_no_marker. The formatter guards its PR-side writes on the
+    # Optional repo_path/pr_number, so a None pair skips the PR comment but
+    # still returns the JSON outcome _record_step expects.
     return _format_reviewer_marker_response(
         unit_id=unit_id,
-        repo_path=feature.repo_path,
+        repo_path=feature.repo_path if feature else None,
         pr_number=unit_state.pr_number,
         session_id=session_id,
         response=response,
@@ -1641,18 +1642,16 @@ def _reviewer_phase(ctx: CycleContext) -> tuple[bool, str | None]:
 
     Returns (approved, escalation_msg). Iterates the fix-loop on
     REVIEW_REQUEST_CHANGES, respecting CAP_3. The *first* reviewer turn is a
-    cold-start ``spawn_reviewer``; every retry is a session resume via
+    spawn-or-resume via ``_resume_or_spawn_reviewer`` — a cold-start
+    ``spawn_reviewer`` when no ``reviewer_session_id`` is on the unit, or a
+    cheap verdict re-emission when an orphaned session is present (typical
+    after a previous cycle died on a network timeout; symmetric to the
+    ``_tester_phase`` recovery added in F-013-U-1). Every subsequent retry
+    inside the REVIEW_REQUEST_CHANGES fix-loop is a session resume via
     ``_resume_reviewer_for_delta`` (F-012-U-2 — avoids re-paying the ~900s
     clone+inventory on every cycle).
 
     Each coder fix push waits for CI green before re-running the reviewer.
-
-    On entry, an orphaned ``reviewer_session_id`` (typical after a previous
-    cycle died on a network timeout) is resumed via
-    ``_resume_or_spawn_reviewer`` for a cheap verdict re-emission instead of
-    a fresh ``spawn_reviewer`` call (which would error "session already
-    exists"). Symmetric to the ``_tester_phase`` recovery added in
-    F-013-U-1.
     """
     reviewer_out = _record_step(
         ctx, "reviewer", _resume_or_spawn_reviewer(ctx.feature_id, ctx.unit_id)
