@@ -860,6 +860,11 @@ def _emit_terminal(ctx: CycleContext, outcome: str, msg: str) -> str:
     if outcome == "escalated":
         ntfy.push_escalation(ctx.unit_id, msg, pr_url=pr_url)
     elif outcome == "approved_awaiting_merge":
+        # Persist the awaiting-merge status before pushing — the ntfy listener
+        # follows the URL to the dashboard, which reads this row. The flip is
+        # gated on an active from-state so a stray re-entry can't drift a
+        # `done` unit back to `approved_awaiting_merge` (F-009-U-4).
+        _flip_status_if_active(ctx.unit_id, target="approved_awaiting_merge")
         ntfy.push_ready_to_merge(ctx.unit_id, pr_url or "(no PR url)", summary=msg)
 
     final_state_json = get_unit_status(ctx.unit_id)
@@ -921,13 +926,22 @@ class _MarkerSpec:
         ``{"marker": <name>}``.
       - ``event_kwargs`` is the keyword payload for ``state.record_event``
         (``summary`` / ``details`` — the rest is filled by the loop).
+
+    ``target_status`` is the status the unit transitions to when this marker
+    matches (and the unit is currently in an active state — see
+    :func:`_flip_status_if_active`). ``None`` means "leave status alone"
+    (BUG_FOUND / REVIEW_REQUEST_CHANGES — the caller's loop owns the next
+    transition). Most success-side markers target ``"in_ci"``;
+    ``REVIEW_RECOMMEND_MERGE`` targets ``"approved_awaiting_merge"`` so the
+    reviewer's endorsement lands the unit in the same status cycle_review's
+    ``_emit_terminal`` would set — closes audit Gap H (F-009-U-4).
     """
 
     role: str
     marker: str
     pattern: re.Pattern[str]
     event_type: str
-    flips_in_ci: bool
+    target_status: str | None
     build: Callable[[re.Match[str], str], tuple[dict[str, Any], dict[str, str]]]
 
 
@@ -978,16 +992,19 @@ def _build_review_comment(
 # Ordered per role: PR_URL before FIX_PUSHED for the coder branch matches the
 # pre-refactor precedence (the spawn_unit path checks PR_URL first too).
 _MARKER_SPECS: tuple[_MarkerSpec, ...] = (
-    _MarkerSpec("coder", "PR_URL", PR_URL_RE, "pr_opened", True, _build_pr_url),
-    _MarkerSpec("coder", "FIX_PUSHED", FIX_PUSHED_RE, "fix_pushed", True, _build_fix_pushed),
-    _MarkerSpec("tester", "TESTS_PASS", TESTS_PASS_RE, "tests_pass", True, _build_tests_pass),
-    _MarkerSpec("tester", "BUG_FOUND", BUG_FOUND_RE, "tester_bug_found", False, _build_bug_found),
+    _MarkerSpec("coder", "PR_URL", PR_URL_RE, "pr_opened", "in_ci", _build_pr_url),
+    _MarkerSpec("coder", "FIX_PUSHED", FIX_PUSHED_RE, "fix_pushed", "in_ci", _build_fix_pushed),
+    _MarkerSpec("tester", "TESTS_PASS", TESTS_PASS_RE, "tests_pass", "in_ci", _build_tests_pass),
+    _MarkerSpec("tester", "BUG_FOUND", BUG_FOUND_RE, "tester_bug_found", None, _build_bug_found),
     _MarkerSpec(
         "reviewer",
         "REVIEW_RECOMMEND_MERGE",
         REVIEW_RECOMMEND_MERGE_RE,
         "reviewer_recommend_merge",
-        True,
+        # Reviewer endorsement is terminal for the cycle — land directly in
+        # the awaiting-merge bucket so send_to_unit(reviewer) endorsements
+        # match cycle_review's terminal state (audit Gap H, F-009-U-4).
+        "approved_awaiting_merge",
         _build_recommend_merge,
     ),
     _MarkerSpec(
@@ -995,7 +1012,7 @@ _MARKER_SPECS: tuple[_MarkerSpec, ...] = (
         "REVIEW_REQUEST_CHANGES",
         REVIEW_CHANGES_RE,
         "reviewer_request_changes",
-        False,
+        None,
         _build_request_changes,
     ),
     _MarkerSpec(
@@ -1003,7 +1020,7 @@ _MARKER_SPECS: tuple[_MarkerSpec, ...] = (
         "REVIEW_COMMENT",
         REVIEW_COMMENT_RE,
         "reviewer_comment",
-        True,
+        "in_ci",
         _build_review_comment,
     ),
 )
@@ -1071,8 +1088,8 @@ def _record_terminal_marker(
         if not match:
             continue
         extras, event_kwargs = spec.build(match, response)
-        if spec.flips_in_ci:
-            _flip_status_if_active(unit_id, target="in_ci")
+        if spec.target_status is not None:
+            _flip_status_if_active(unit_id, target=spec.target_status)
         state.record_event(
             unit_id,
             feature_id,

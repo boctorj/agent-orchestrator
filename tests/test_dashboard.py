@@ -76,16 +76,41 @@ class TestDataFetchers:
         assert unit_ids == {"U1"}
 
     def test_awaiting_merge_picks_up_endorsed_units(self, tmp_state_db):
+        """F-009-U-4: the bucket is now driven by
+        ``status='approved_awaiting_merge'`` — the canonical source of truth
+        written by cycle_review's terminal and the send_to_unit marker
+        helper (audit Gap H)."""
         state.save_feature(Feature(id="F", title="t", description=""))
         state.upsert_unit_state(
-            WorkUnitState(unit_id="U1", feature_id="F", status="in_ci", pr_number=5)
+            WorkUnitState(
+                unit_id="U1",
+                feature_id="F",
+                status="approved_awaiting_merge",
+                pr_number=5,
+            )
         )
-        state.record_event("U1", "F", "reviewer_recommend_merge", source="reviewer")
 
         rows = dashboard._awaiting_merge_data()
         assert len(rows) == 1
         assert rows[0]["pr"] == "#5"
         assert rows[0]["unit_id"] == "U1"
+
+    def test_awaiting_merge_excludes_non_status_units(self, tmp_state_db):
+        """Units with a stale ``reviewer_recommend_merge`` event but a
+        non-``approved_awaiting_merge`` status (e.g. ``done`` after merge,
+        or legacy units pre-dating F-009-U-4) must NOT appear in the
+        bucket — status is authoritative."""
+        state.save_feature(Feature(id="F", title="t", description=""))
+        state.upsert_unit_state(
+            WorkUnitState(unit_id="U-done", feature_id="F", status="done", pr_number=5)
+        )
+        state.record_event("U-done", "F", "reviewer_recommend_merge", source="reviewer")
+        state.upsert_unit_state(
+            WorkUnitState(unit_id="U-in-ci", feature_id="F", status="in_ci", pr_number=6)
+        )
+
+        rows = dashboard._awaiting_merge_data()
+        assert rows == []
 
     def test_escalated_data_orders_by_recency(self, tmp_state_db):
         import time
@@ -197,8 +222,14 @@ class TestRenderMarkdown:
         state.save_plan(
             "F-001", [WorkUnit(id="F-001-U-1", feature_id="F-001", title="u1", description="")]
         )
+        # Status-driven awaiting-merge bucket (F-009-U-4).
         state.upsert_unit_state(
-            WorkUnitState(unit_id="F-001-U-1", feature_id="F-001", status="in_ci", pr_number=5)
+            WorkUnitState(
+                unit_id="F-001-U-1",
+                feature_id="F-001",
+                status="approved_awaiting_merge",
+                pr_number=5,
+            )
         )
         state.record_event("F-001-U-1", "F-001", "reviewer_recommend_merge", source="reviewer")
 

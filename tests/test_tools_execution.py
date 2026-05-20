@@ -710,26 +710,37 @@ class TestSendToUnitTerminalMarker:
     # --- success markers per role flip status to in_ci AND record both events
 
     @pytest.mark.parametrize(
-        ("role", "from_status", "response", "expected_event"),
+        ("role", "from_status", "response", "expected_event", "expected_status"),
         [
             (
                 "reviewer",
                 "reviewing",
                 "looks good\nREVIEW_RECOMMEND_MERGE: tests cover the new path",
                 "reviewer_recommend_merge",
+                # Reviewer endorsement is terminal: lands directly in the
+                # awaiting-merge bucket (F-009-U-4, audit Gap H).
+                "approved_awaiting_merge",
             ),
-            ("tester", "testing", "all assertions hold\nTESTS_PASS", "tests_pass"),
+            ("tester", "testing", "all assertions hold\nTESTS_PASS", "tests_pass", "in_ci"),
             (
                 "reviewer",
                 "reviewing",
                 "comment only\nREVIEW_COMMENT",
                 "reviewer_comment",
+                "in_ci",
             ),
-            ("coder", "fixing", "pushed\nFIX_PUSHED", "fix_pushed"),
+            ("coder", "fixing", "pushed\nFIX_PUSHED", "fix_pushed", "in_ci"),
         ],
     )
-    def test_success_marker_records_event_and_flips_to_in_ci(
-        self, tmp_state_db, monkeypatch, role, from_status, response, expected_event
+    def test_success_marker_records_event_and_flips_status(
+        self,
+        tmp_state_db,
+        monkeypatch,
+        role,
+        from_status,
+        response,
+        expected_event,
+        expected_status,
     ):
         _seed_unit_for_role(role, status=from_status)
         _install_fake_worker(monkeypatch, resume_response=response)
@@ -738,7 +749,7 @@ class TestSendToUnitTerminalMarker:
         assert out == response  # worker output still returned verbatim
 
         s = state.get_unit_state("F-001-U-1")
-        assert s.status == "in_ci"
+        assert s.status == expected_status
 
         # Both events recorded (structured marker first, manual_message second
         # — chronological replay order).
@@ -965,14 +976,15 @@ class TestSendToUnitTerminalMarker:
 
     def test_active_status_flip_still_works_after_guard(self, tmp_state_db, monkeypatch):
         """Regression guard for the guard: on an `in_ci` unit (active), the
-        helper must still bump to `in_ci` — the gate allows transitions
-        from any active state, not just non-terminal ones."""
+        helper must still flip — the gate allows transitions from any active
+        state, not just non-terminal ones. REVIEW_RECOMMEND_MERGE targets
+        ``approved_awaiting_merge`` (F-009-U-4)."""
         _seed_unit_for_role("reviewer", status="in_ci")
         _install_fake_worker(monkeypatch, resume_response="REVIEW_RECOMMEND_MERGE: looks good")
 
         execution.send_to_unit("F-001-U-1", "reviewer", "carry on")
 
-        assert state.get_unit_state("F-001-U-1").status == "in_ci"
+        assert state.get_unit_state("F-001-U-1").status == "approved_awaiting_merge"
         types = [e["event_type"] for e in state.list_events("F-001-U-1")]
         assert "reviewer_recommend_merge" in types
 

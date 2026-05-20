@@ -187,7 +187,13 @@ class TestRecordTerminalMarkerHelper:
         assert ev["session_id"] == "sesn-tester"
         assert ev["cycle_number"] == 2
 
-    def test_reviewer_recommend_merge_flips_to_in_ci_and_records_reason(self, tmp_state_db):
+    def test_reviewer_recommend_merge_flips_to_awaiting_merge_and_records_reason(
+        self, tmp_state_db
+    ):
+        """F-009-U-4 promoted REVIEW_RECOMMEND_MERGE's target from ``in_ci`` to
+        ``approved_awaiting_merge``: the marker is terminal for the cycle, so
+        the unit lands in the bucket that cycle_review's ``_emit_terminal``
+        would otherwise have set."""
         _seed_unit_with_session(role="reviewer", status="reviewing")
 
         out = execution._record_terminal_marker(
@@ -202,7 +208,7 @@ class TestRecordTerminalMarkerHelper:
         assert out is not None
         assert out["marker"] == "REVIEW_RECOMMEND_MERGE"
         assert "tests cover the new path" in out["reason"]
-        assert state.get_unit_state("F-001-U-1").status == "in_ci"
+        assert state.get_unit_state("F-001-U-1").status == "approved_awaiting_merge"
         ev = _event_of("F-001-U-1", "reviewer_recommend_merge")
         assert ev is not None
         assert "tests cover the new path" in ev["summary"]
@@ -439,21 +445,36 @@ class TestSendToUnitWiring:
     """
 
     @pytest.mark.parametrize(
-        ("role", "from_status", "response", "expected_event"),
+        ("role", "from_status", "response", "expected_event", "expected_status"),
         [
             (
                 "reviewer",
                 "reviewing",
                 "endorsed\nREVIEW_RECOMMEND_MERGE: ship it",
                 "reviewer_recommend_merge",
+                # Reviewer endorsement is terminal — F-009-U-4.
+                "approved_awaiting_merge",
             ),
-            ("tester", "testing", "all clean\nTESTS_PASS\n", "tests_pass"),
-            ("reviewer", "reviewing", "comment only\nREVIEW_COMMENT\n", "reviewer_comment"),
-            ("coder", "fixing", "pushed\nFIX_PUSHED\n", "fix_pushed"),
+            ("tester", "testing", "all clean\nTESTS_PASS\n", "tests_pass", "in_ci"),
+            (
+                "reviewer",
+                "reviewing",
+                "comment only\nREVIEW_COMMENT\n",
+                "reviewer_comment",
+                "in_ci",
+            ),
+            ("coder", "fixing", "pushed\nFIX_PUSHED\n", "fix_pushed", "in_ci"),
         ],
     )
-    def test_success_marker_writes_structured_event_AND_manual_message_AND_flips_in_ci(
-        self, tmp_state_db, monkeypatch, role, from_status, response, expected_event
+    def test_success_marker_writes_structured_event_AND_manual_message_AND_flips_status(
+        self,
+        tmp_state_db,
+        monkeypatch,
+        role,
+        from_status,
+        response,
+        expected_event,
+        expected_status,
     ):
         _seed_unit_with_session(role=role, status=from_status)
         _install_worker_factory(monkeypatch, resume_response=response)
@@ -463,8 +484,9 @@ class TestSendToUnitWiring:
         # 1. send_to_unit still returns the worker's raw response verbatim.
         assert ret == response
 
-        # 2. status flipped to in_ci.
-        assert state.get_unit_state("F-001-U-1").status == "in_ci"
+        # 2. status flipped per marker-spec target (REVIEW_RECOMMEND_MERGE ->
+        #    approved_awaiting_merge; the rest -> in_ci).
+        assert state.get_unit_state("F-001-U-1").status == expected_status
 
         # 3. BOTH events recorded — structured marker, then manual_message.
         types = _event_types("F-001-U-1")
@@ -661,6 +683,9 @@ class TestRefactorInvariant:
     def test_spawn_reviewer_recommend_merge_records_event(
         self, tmp_state_db, with_github_token, monkeypatch
     ):
+        """F-009-U-4: spawn_reviewer's REVIEW_RECOMMEND_MERGE path now lands
+        the unit in ``approved_awaiting_merge`` (same status cycle_review's
+        terminal would set)."""
         _seed_unit_with_session(role="coder", status="in_ci")
         _install_worker_factory(
             monkeypatch,
@@ -670,7 +695,7 @@ class TestRefactorInvariant:
 
         execution.spawn_reviewer("F-001", "F-001-U-1")
 
-        assert state.get_unit_state("F-001-U-1").status == "in_ci"
+        assert state.get_unit_state("F-001-U-1").status == "approved_awaiting_merge"
         ev = _event_of("F-001-U-1", "reviewer_recommend_merge")
         assert ev is not None
         assert "tests cover everything" in ev["summary"]

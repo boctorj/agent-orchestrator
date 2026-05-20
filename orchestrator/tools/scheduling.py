@@ -6,6 +6,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from orchestrator import state
+from orchestrator.models import READY_TO_MERGE_STATUSES
 from orchestrator.tools import ensure_verified_for_feature, mcp
 from orchestrator.tools.execution import cycle_review, spawn_unit
 
@@ -19,6 +20,14 @@ def next_ready_units(feature_id: str) -> str:
       - Every unit in its `depends_on` list has work_units.status = 'done'
         (i.e. its PR has been merged and reconcile_unit_pr has flipped it).
 
+    A dep in ``approved_awaiting_merge`` keeps downstream units blocked —
+    the cycle finished but the human's merge click hasn't landed yet, so
+    the dep can still be re-opened with changes. The
+    ``approved_awaiting_merge`` unit itself is reported under
+    ``awaiting_merge`` (a bucket distinct from ``in_flight``: no agent is
+    running, but the lead should know the human still owes a merge click).
+    See :data:`READY_TO_MERGE_STATUSES`. F-009-U-4, audit Gap H.
+
     Call this whenever a unit transitions to 'done' (typically after the
     user merges and `reconcile_unit_pr` is run). For each unit returned,
     spawn it (spawn_unit → cycle_review) one at a time, or batch via
@@ -29,9 +38,13 @@ def next_ready_units(feature_id: str) -> str:
         return json.dumps({"error": f"no plan for {feature_id}"})
 
     unit_states = {s.unit_id: s for s in state.list_unit_states(feature_id)}
+    # Only 'done' counts as a satisfied dep — ``approved_awaiting_merge``
+    # is explicitly excluded (F-009-U-4): a PR awaiting merge can still be
+    # closed unmerged or rebased, so downstream work shouldn't start until
+    # the human's merge click has landed.
     done_ids = {uid for uid, s in unit_states.items() if s.status == "done"}
 
-    ready, blocked, in_flight = [], [], []
+    ready, blocked, in_flight, awaiting_merge = [], [], [], []
 
     for unit in plan.units:
         if unit.id in unit_states:
@@ -40,6 +53,8 @@ def next_ready_units(feature_id: str) -> str:
                 continue
             elif s.status == "escalated":
                 blocked.append({"unit_id": unit.id, "reason": s.last_error or "escalated"})
+            elif s.status in READY_TO_MERGE_STATUSES:
+                awaiting_merge.append({"unit_id": unit.id, "status": s.status})
             else:
                 in_flight.append({"unit_id": unit.id, "status": s.status})
             continue
@@ -59,6 +74,7 @@ def next_ready_units(feature_id: str) -> str:
             "feature_id": feature_id,
             "ready_to_spawn": ready,
             "in_flight": in_flight,
+            "awaiting_merge": awaiting_merge,
             "escalated": blocked,
             "total_ready": len(ready),
         },
@@ -80,6 +96,7 @@ def next_ready_units_all() -> str:
     aggregated: dict[str, list] = {
         "ready_to_spawn": [],
         "in_flight": [],
+        "awaiting_merge": [],
         "escalated": [],
     }
     for f in state.list_features():
@@ -91,7 +108,7 @@ def next_ready_units_all() -> str:
             continue
         if "error" in per_feat:
             continue
-        for key in ("ready_to_spawn", "in_flight", "escalated"):
+        for key in aggregated:
             for entry in per_feat.get(key, []):
                 entry = dict(entry)
                 entry.setdefault("feature_id", f.id)
@@ -101,6 +118,7 @@ def next_ready_units_all() -> str:
         {
             "total_ready": len(aggregated["ready_to_spawn"]),
             "total_in_flight": len(aggregated["in_flight"]),
+            "total_awaiting_merge": len(aggregated["awaiting_merge"]),
             "total_escalated": len(aggregated["escalated"]),
             **aggregated,
         },

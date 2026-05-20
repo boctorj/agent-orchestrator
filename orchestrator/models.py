@@ -19,6 +19,7 @@ UnitStatus = Literal[
     "in_ci",  # PR open, CI running, no review yet
     "reviewing",  # reviewer session active
     "fixing",  # coder addressing review comments
+    "approved_awaiting_merge",  # reviewer endorsed; awaits human merge
     "done",  # merged (by human) or otherwise complete
     "escalated",  # cap-3 hit or hard error; awaits human
 ]
@@ -35,6 +36,10 @@ ACTIVE_UNIT_STATUSES: frozenset[str] = frozenset(
         "fixing",
     }
 )
+# Endorsed by the reviewer, CI green, but not yet merged by a human. Neither
+# active (no agent running) nor terminal (the dep chain stays blocked until
+# the merge flips it to ``done``) — sits in its own bucket. F-009-U-4.
+READY_TO_MERGE_STATUSES: frozenset[str] = frozenset({"approved_awaiting_merge"})
 TERMINAL_UNIT_STATUSES: frozenset[str] = frozenset({"done", "escalated"})
 
 

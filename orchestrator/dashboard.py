@@ -42,6 +42,7 @@ STATUS_STYLE: dict[str, tuple[str, str]] = {
     "in_ci": ("magenta", "🔵"),
     "reviewing": ("yellow", "👀"),
     "fixing": ("yellow", "🔧"),
+    "approved_awaiting_merge": ("green", "🟢"),
     "done": ("green", "✅"),
     "escalated": ("bold red", "🚨"),
     "in_progress": ("yellow", "🔄"),
@@ -146,20 +147,27 @@ def _in_flight_data() -> list[dict]:
 
 
 def _awaiting_merge_data() -> list[dict]:
+    """Units whose reviewer endorsed the PR but the human hasn't merged yet.
+
+    Authoritative source: ``work_units.status == 'approved_awaiting_merge'``
+    (written by ``cycle_review._emit_terminal`` and by ``send_to_unit`` via
+    ``_record_terminal_marker``). The legacy event-driven heuristic
+    (:func:`_is_awaiting_merge`) is preserved for direct callers but the
+    bucket query uses status now — Gap H, F-009-U-4.
+    """
     with contextlib.closing(_open_db_ro()) as conn:
         rows = conn.execute(
-            "SELECT * FROM work_units "
-            "WHERE status NOT IN ('done', 'escalated') AND pr_number IS NOT NULL"
+            "SELECT * FROM work_units WHERE status = 'approved_awaiting_merge' "
+            "ORDER BY last_activity DESC"
         ).fetchall()
     return [
         {
-            "pr": f"#{r['pr_number']}",
+            "pr": f"#{r['pr_number']}" if r["pr_number"] else "—",
             "unit_id": r["unit_id"],
             "feature_id": r["feature_id"],
             "branch": r["branch"] or "—",
         }
         for r in rows
-        if _is_awaiting_merge(r["unit_id"])
     ]
 
 
