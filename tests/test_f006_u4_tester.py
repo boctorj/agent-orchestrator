@@ -169,9 +169,7 @@ class TestSpawnTesterCallSiteWired:
     sites — it must thread `feature_spec_text` + `predecessor_logs` into
     `compose_tester_task` so the worker actually sees the new blocks."""
 
-    def test_spec_block_appears_in_tester_task(
-        self, tmp_state_db, with_github_token, monkeypatch
-    ):
+    def test_spec_block_appears_in_tester_task(self, tmp_state_db, with_github_token, monkeypatch):
         _seed_feature_with_unit(unit_id="F-006-U-X", feature_id="F-006")
         feature_spec.write_spec_if_missing("F-006", "spec title", "spec body intent")
         _install_capturing_worker(monkeypatch)
@@ -197,9 +195,7 @@ class TestSpawnTesterCallSiteWired:
         # forward it into the task.
         _write_predecessor_log(
             "F-006-U-1",
-            "# F-006-U-1 — title\n\n"
-            "## PR\n#1\n\n"
-            "## Cycle history\nPREDECESSOR-MARKER-XYZ\n",
+            "# F-006-U-1 — title\n\n## PR\n#1\n\n## Cycle history\nPREDECESSOR-MARKER-XYZ\n",
         )
         _install_capturing_worker(monkeypatch)
         _stub_github(monkeypatch)
@@ -211,9 +207,7 @@ class TestSpawnTesterCallSiteWired:
         assert "### F-006-U-1" in task
         assert "PREDECESSOR-MARKER-XYZ" in task
 
-    def test_no_own_cycle_log_in_tester_task(
-        self, tmp_state_db, with_github_token, monkeypatch
-    ):
+    def test_no_own_cycle_log_in_tester_task(self, tmp_state_db, with_github_token, monkeypatch):
         """Tester never gets `## THIS UNIT'S CYCLE LOG` (reviewer-only per
         proposal). Even if an own log exists on disk, the tester task
         must not include the block."""
@@ -244,9 +238,7 @@ class TestSpawnReviewerOwnLogGate:
     def test_own_log_omitted_when_round_below_threshold(
         self, tmp_state_db, with_github_token, monkeypatch, review_round
     ):
-        _seed_feature_with_unit(
-            unit_id="F-006-U-X", feature_id="F-006", review_round=review_round
-        )
+        _seed_feature_with_unit(unit_id="F-006-U-X", feature_id="F-006", review_round=review_round)
         _write_own_log(
             "F-006-U-X",
             "# F-006-U-X\n\n## Cycle history\nFIRST-CYCLE-NOTES-MARKER\n",
@@ -267,9 +259,7 @@ class TestSpawnReviewerOwnLogGate:
     def test_own_log_included_when_round_at_or_above_threshold(
         self, tmp_state_db, with_github_token, monkeypatch, review_round
     ):
-        _seed_feature_with_unit(
-            unit_id="F-006-U-X", feature_id="F-006", review_round=review_round
-        )
+        _seed_feature_with_unit(unit_id="F-006-U-X", feature_id="F-006", review_round=review_round)
         _write_own_log(
             "F-006-U-X",
             "# F-006-U-X\n\n## Cycle history\nFIRST-CYCLE-NOTES-MARKER\n",
@@ -312,9 +302,7 @@ class TestSpawnReviewerCallSiteWired:
     review_round (the spec block is "always", not gated on retry). The
     own-cycle-log is the only retry-gated block."""
 
-    def test_spec_block_on_first_review_round(
-        self, tmp_state_db, with_github_token, monkeypatch
-    ):
+    def test_spec_block_on_first_review_round(self, tmp_state_db, with_github_token, monkeypatch):
         _seed_feature_with_unit(unit_id="F-006-U-X", feature_id="F-006", review_round=0)
         feature_spec.write_spec_if_missing("F-006", "spec title", "REVIEWER-SPEC-CONTENT")
         _install_capturing_worker(monkeypatch, response_by_role={"reviewer": "REVIEW_COMMENT"})
@@ -337,8 +325,7 @@ class TestSpawnReviewerCallSiteWired:
         )
         _write_predecessor_log(
             "F-006-U-2",
-            "# F-006-U-2 — title\n\n## PR\n#2\n\n"
-            "## Cycle history\nREVIEWER-PRED-MARKER\n",
+            "# F-006-U-2 — title\n\n## PR\n#2\n\n## Cycle history\nREVIEWER-PRED-MARKER\n",
         )
         _install_capturing_worker(monkeypatch, response_by_role={"reviewer": "REVIEW_COMMENT"})
         _stub_github(monkeypatch)
@@ -537,9 +524,7 @@ class TestCycleLogSummaryShape:
     drops the PR description (the largest block) but preserves the actual
     decision artefacts a downstream unit needs."""
 
-    def test_pr_description_block_dropped_but_subsequent_blocks_preserved(
-        self, tmp_state_db
-    ):
+    def test_pr_description_block_dropped_but_subsequent_blocks_preserved(self, tmp_state_db):
         state.save_feature(
             Feature(id="F-006", title="t", description="d", repo_path="https://github.com/o/r")
         )
