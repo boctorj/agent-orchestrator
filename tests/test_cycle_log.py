@@ -409,6 +409,73 @@ class TestRenderCycleLog:
         assert "3 cycles · cap-3 not hit" in md
         assert "### Cycle 3 — reviewer: REVIEW_RECOMMEND_MERGE" in md
 
+    def test_ultrareview_events_render_in_cycle_history(self, tmp_state_db: Path) -> None:
+        # F-007-U-3 regression: ``ultrareview_*`` events were recorded but the
+        # renderer's ``_EVENT_HEADINGS`` allow-list dropped them, so a unit
+        # that escalated *because* of ultrareview FAIL silently looked like
+        # the reviewer endorsed and the unit then mysteriously escalated.
+        # All three event names from the gate must surface, and the FAILED
+        # summary must reach the rendered markdown so the committed log
+        # explains the escalation.
+        _seed(
+            status="escalated",
+            events=[
+                {
+                    "event_type": "reviewer_recommend_merge",
+                    "cycle_number": 0,
+                    "summary": "endorsed",
+                },
+                {
+                    "event_type": "ultrareview_started",
+                    "source": "ultrareview",
+                    "cycle_number": 0,
+                    "summary": "firing /ultrareview",
+                },
+                {
+                    "event_type": "ultrareview_failed",
+                    "source": "ultrareview",
+                    "cycle_number": 0,
+                    "summary": "ultrareview failed with 2 findings",
+                },
+            ],
+        )
+        md = cycle_log.render_cycle_log("F-007-U-2", pr_info={}, review_threads=[])
+        assert "### Cycle 0 — ultrareview: STARTED" in md
+        assert "### Cycle 0 — ultrareview: FAILED" in md
+        assert "ultrareview failed with 2 findings" in md, (
+            "FAILED event summary must reach the rendered markdown — the "
+            "committed cycle log is the only on-disk record of why the unit "
+            "escalated"
+        )
+
+    def test_ultrareview_passed_event_renders(self, tmp_state_db: Path) -> None:
+        # Symmetric to the FAILED test: PASS path must also surface so a
+        # successful ultrareview gate run shows up in the committed log
+        # (cost-attribution / postmortem queries read this).
+        _seed(
+            status="in_ci",
+            events=[
+                {
+                    "event_type": "reviewer_recommend_merge",
+                    "cycle_number": 0,
+                    "summary": "endorsed",
+                },
+                {
+                    "event_type": "ultrareview_started",
+                    "cycle_number": 0,
+                    "summary": "firing /ultrareview",
+                },
+                {
+                    "event_type": "ultrareview_passed",
+                    "cycle_number": 0,
+                    "summary": "ultrareview passed",
+                },
+            ],
+        )
+        md = cycle_log.render_cycle_log("F-007-U-2", pr_info={}, review_threads=[])
+        assert "### Cycle 0 — ultrareview: STARTED" in md
+        assert "### Cycle 0 — ultrareview: PASSED" in md
+
 
 # --------------------------- writing ---------------------------
 

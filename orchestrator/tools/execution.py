@@ -1573,6 +1573,34 @@ def _reviewer_phase(ctx: CycleContext) -> tuple[bool, str | None, str | None]:
     return False, f"reviewer ended with unexpected outcome: {outcome}", outcome
 
 
+def _truncate_findings_for_details(findings: list[str], budget: int = 1500) -> str:
+    """Join ``findings`` newline-separated, keeping whole entries up to ``budget`` chars.
+
+    Char-slicing the joined blob (``"\\n".join(findings)[:budget]``) cuts mid-
+    finding for long lists, leaving event-log readers with a corrupted final
+    entry. Slicing per-finding instead preserves complete entries and appends
+    an explicit ``... (N more findings truncated)`` marker so the cost-
+    attribution / postmortem queries that read ``unit_events.details`` see
+    that the list was capped rather than mistaking the missing items for
+    "ultrareview only found this many".
+    """
+    if not findings:
+        return "(no findings reported)"
+    kept: list[str] = []
+    used = 0
+    for f in findings:
+        # +1 for the newline between this entry and the previous one (only
+        # charged when there's already at least one entry — matches the
+        # char count of "\n".join).
+        sep = 1 if kept else 0
+        if used + sep + len(f) > budget and kept:
+            kept.append(f"... ({len(findings) - len(kept)} more findings truncated)")
+            break
+        kept.append(f)
+        used += sep + len(f)
+    return "\n".join(kept)
+
+
 def _ultrareview_phase(ctx: CycleContext) -> tuple[bool, str | None]:
     """Fire ``/ultrareview`` as the terminal pre-merge gate (F-007).
 
@@ -1589,19 +1617,34 @@ def _ultrareview_phase(ctx: CycleContext) -> tuple[bool, str | None]:
     Events recorded for cost attribution + cycle-log entries:
       * ``ultrareview_started`` — always, just before trigger.
       * ``ultrareview_passed`` — on PASS verdict.
-      * ``ultrareview_failed`` — on FAIL verdict OR wrapper exception, with
-        findings (or the exception message) in ``details``.
+      * ``ultrareview_failed`` — on every False-return path (verdict FAIL,
+        wrapper exception, defensive missing-PR-URL), with findings (or the
+        exception message) in ``details``. Every escalation has an event
+        trail explaining why.
 
     Fail-closed on wrapper exceptions: a missing CLI, parse error, or any
     other ``ultrareview`` raise is treated as a failed gate, never as a
     silent endorsement.
     """
     unit_state = state.get_unit_state(ctx.unit_id)
+    cycle_number = unit_state.review_round if unit_state else 0
     pr_url = _pr_url_for(ctx.feature_id, unit_state)
     if pr_url is None:
+        # Defensive: a reviewer that endorsed has a PR, so this branch is
+        # nearly unreachable. Still record an ultrareview_failed event so
+        # every False-return path leaves a telemetry trail — the resulting
+        # escalation should never land in the user's notification with no
+        # event log explaining why.
+        state.record_event(
+            ctx.unit_id,
+            ctx.feature_id,
+            "ultrareview_failed",
+            source="ultrareview",
+            cycle_number=cycle_number,
+            summary="ultrareview gate: no PR URL available",
+        )
+        ctx.history.append({"step": "ultrareview", "outcome": "error", "error": "no PR URL"})
         return False, "ultrareview gate: no PR URL available"
-
-    cycle_number = unit_state.review_round if unit_state else 0
 
     state.record_event(
         ctx.unit_id,
@@ -1650,7 +1693,7 @@ def _ultrareview_phase(ctx: CycleContext) -> tuple[bool, str | None]:
         source="ultrareview",
         cycle_number=cycle_number,
         summary=f"ultrareview failed with {len(findings)} findings",
-        details=findings_text[:1500],
+        details=_truncate_findings_for_details(findings),
     )
     ctx.history.append({"step": "ultrareview", "outcome": "failed", "findings": findings})
     return False, f"ultrareview failed:\n{findings_text}"

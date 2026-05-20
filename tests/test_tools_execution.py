@@ -1403,6 +1403,75 @@ class TestCycleReviewUltrareviewGate:
         types = [e["event_type"] for e in state.list_events("F-001-U-1")]
         assert "ultrareview_failed" in types
 
+    def test_missing_pr_url_records_failed_event(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """Reviewer M1 regression: the defensive ``pr_url is None`` escape
+        must record an ``ultrareview_failed`` event before returning. Without
+        it the escalation ntfy push lands with no event trail explaining why
+        — every False-return path in ``_ultrareview_phase`` is supposed to
+        be fail-closed *with evidence*.
+        """
+        _seed_coded_unit()
+        _enable_ultrareview()
+        # Wipe the PR number to force ``_pr_url_for`` to return None.
+        s = state.get_unit_state("F-001-U-1")
+        s.pr_number = None
+        state.upsert_unit_state(s)
+
+        ctx = execution.CycleContext(feature_id="F-001", unit_id="F-001-U-1", history=[])
+        passed, msg = execution._ultrareview_phase(ctx)
+
+        assert passed is False
+        assert "no PR URL" in msg
+
+        events = state.list_events("F-001-U-1")
+        types = [e["event_type"] for e in events]
+        assert "ultrareview_failed" in types, (
+            "every False-return path must leave an ultrareview_failed event "
+            "trail (fail-closed with evidence)"
+        )
+        assert "ultrareview_started" not in types, (
+            "the started event fires after the PR-URL check; a missing PR "
+            "means we never reached the trigger"
+        )
+
+    def test_failed_event_details_truncates_per_finding_not_mid_string(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """Reviewer M2 regression: the FAIL-path event ``details`` must keep
+        whole findings up to the budget and append a `(N more findings
+        truncated)` marker, not char-slice the joined blob mid-finding.
+        """
+        self._seed_for_reviewer_recommend(monkeypatch)
+        _enable_ultrareview()
+        # Each finding is 100 chars; 30 of them = 3000+ chars when joined —
+        # well over the 1500-char budget, so truncation must kick in.
+        findings = [f"src/file_{i:03d}.py:42 — " + "x" * 70 for i in range(30)]
+        _stub_ultrareview(monkeypatch, passed=False, findings=findings)
+
+        execution.cycle_review("F-001", "F-001-U-1")
+
+        events = state.list_events("F-001-U-1")
+        failed_evt = next(e for e in events if e["event_type"] == "ultrareview_failed")
+        details = failed_evt["details"]
+
+        # Every line in details must be either a complete finding from the
+        # input or the truncation marker — no partial findings (which would
+        # be the char-slice failure mode).
+        complete_findings = set(findings)
+        for line in details.splitlines():
+            if line.startswith("..."):
+                continue
+            assert line in complete_findings, (
+                f"truncated mid-finding: {line!r} is not a complete finding "
+                "from the input list (char-slice bug regressed)"
+            )
+
+        # And the marker must appear, naming how many were dropped.
+        assert "more findings truncated" in details
+        assert "(no findings reported)" not in details
+
 
 # --------------------------- _resume_reviewer_for_delta (F-012-U-2) ---------------------------
 
