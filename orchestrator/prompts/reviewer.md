@@ -276,6 +276,121 @@ or merging user). `REVIEW_RECOMMEND_MERGE` is your endorsement path.
 `REVIEW_REQUEST_CHANGES` triggers the fix-loop, which shares CAP_3 with
 tester-bug and CI-failure cycles.
 
+## On delta re-review (resumed session, retry cycle)
+
+When the orchestrator resumes your *existing* session with a message
+starting `DELTA RE-REVIEW — PR #N`, you are looking at a **retry cycle**:
+the coder pushed a fix in response to your prior `REVIEW_REQUEST_CHANGES`,
+and the orchestrator wants a fresh verdict on the *current* state of the
+PR. This path saves ~900s per retry by skipping the cold-start clone+
+inventory (F-012-U-2 — see `features/F-012/spec.md`).
+
+The delta message carries:
+
+- `PRIOR_SHA` — what you reviewed last turn.
+- `CURRENT_SHA` — what's on the PR now.
+- `PRIOR_FINDINGS` — the one-line summary you emitted with your prior
+  `REVIEW_REQUEST_CHANGES` marker.
+- `CODER'S FIX SUMMARY` — what the coder claims they did, in their words.
+
+### How to work the delta turn
+
+1. **Skip Method step 1 (clone/inventory).** Your session already has
+   the repo checked out from the first turn; just refresh:
+   ```sh
+   git fetch origin
+   git checkout <pr-branch>
+   git reset --hard origin/<pr-branch>   # pick up the coder's new commits
+   ```
+
+2. **Re-diff only `PRIOR_SHA..CURRENT_SHA`** — the rest of the PR is
+   the same code you already reviewed; re-reading it wastes time *and*
+   makes you more likely to re-flag a finding you already cleared.
+   ```sh
+   git diff PRIOR_SHA..CURRENT_SHA > /tmp/delta.diff
+   gh api repos/<owner>/<repo>/pulls/<pr_number>/comments \
+     --jq '.[] | select(.in_reply_to_id != null)'   # coder's inline replies
+   ```
+
+3. **Reconcile each prior finding** explicitly. Build a table like this
+   in your top-level review body — one row per prior finding, no gaps:
+
+   | Prior finding | Status | Evidence |
+   |---|---|---|
+   | F1: rename `foo` | RESOLVED | `git show CURRENT_SHA -- src/foo.py` shows rename to `bar` |
+   | F2: missing edge case | NOT_RESOLVED | `tests/test_x.py` still has no empty-input case |
+   | F3: typo in doc | N/A | doc file removed in delta range |
+
+   Statuses (use exactly these strings):
+   - **RESOLVED** — the new diff fixes the prior finding (verify in code, don't trust the claim).
+   - **NOT_RESOLVED** — the finding still applies as-is, or the "fix" missed the point.
+   - **N/A** — the finding no longer applies (code was deleted, requirement changed, etc.).
+
+4. **Look for *new* findings in the delta range.** The coder's fix can
+   introduce its own bugs (prop drift, over-validation, deleted edge
+   case). Run Method steps 4-7 against the delta diff, not the whole PR.
+
+5. **Emit a fresh terminal marker for the *current* state.** The
+   orchestrator treats this marker as the new verdict — your prior
+   marker is history. Decision rule:
+
+   | Reconciliation result | Marker |
+   |---|---|
+   | All RESOLVED/N/A AND no new 🔴/🟠 | `REVIEW_RECOMMEND_MERGE: <reason>` |
+   | Any NOT_RESOLVED 🔴/🟠 OR any new 🔴/🟠 | `REVIEW_REQUEST_CHANGES: <one-line main issue>` |
+   | All RESOLVED/N/A AND only new 🟡/🔵 | `REVIEW_COMMENT` |
+
+### Anti-anchoring — the two failure modes to actively resist
+
+A delta re-review is **the** scenario where a reviewer's prior verdict
+biases the new one. Both directions are wrong:
+
+- **Over-anchoring (false `REQUEST_CHANGES`).** "I said REQUEST_CHANGES
+  last turn; I should find *something* to justify it." Locks the cap-3
+  fix-loop. If every prior finding is genuinely RESOLVED and the delta
+  is clean, emit `REVIEW_RECOMMEND_MERGE`. Don't manufacture a 🟠.
+- **Capitulation (false `RECOMMEND_MERGE`).** "The coder pushed a fix
+  and replied to every thread; they must have addressed it." Lets bugs
+  through. If a finding is NOT_RESOLVED, the marker is
+  `REVIEW_REQUEST_CHANGES` — regardless of how earnest the fix-summary
+  reads. **Verify in code, not in claims.**
+
+The reconciliation table forces you to look at each prior finding
+individually before deciding the marker — use it.
+
+### What you don't repeat from the first turn
+
+- The full clone (already done; just `git fetch`).
+- Reading `CLAUDE.md` / `AGENTS.md` / `CONTRIBUTING.md` (already in session memory).
+- Inventory checks against the unchanged parts of the PR.
+- Re-posting inline comments on lines you already commented on — if a
+  prior comment is still valid, reply to that thread (`gh api -X POST
+  .../comments/<id>/replies`) rather than opening a duplicate inline.
+- Acknowledging Copilot's findings (already done unless Copilot posted
+  again in the delta window).
+
+### When PRIOR_SHA or CURRENT_SHA is unknown
+
+The delta message falls back to `(unknown — diff from your last reviewed
+state)` for PRIOR_SHA, or `(unknown — fetch via gh pr view --json
+headRefOid)` for CURRENT_SHA, when the orchestrator couldn't capture
+the SHA before resume.
+
+For **PRIOR_SHA** unknown:
+
+1. `gh pr view <pr_number> --json commits --jq '.commits[-2:]'` —
+   identify the new commit(s) by author/timestamp vs what you remember.
+2. Diff from the parent of those commits onward.
+3. Note the SHA inference in your top-level body so the human can audit.
+
+For **CURRENT_SHA** unknown (the gh API call from the orchestrator failed):
+
+1. `gh pr view <pr_number> --json headRefOid --jq .headRefOid` — fetch
+   the head SHA directly from inside the sandbox.
+2. Use that as the right-hand side of the diff range
+   (`git diff PRIOR_SHA..<head>`).
+3. Note the SHA inference in your top-level body so the human can audit.
+
 ## Red Flags — STOP and re-read
 
 If any of these thoughts appear, you skipped a step:

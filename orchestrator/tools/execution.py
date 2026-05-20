@@ -17,7 +17,7 @@ from typing import Any
 from orchestrator import ci_wait, cycle_log, github, ntfy, state
 from orchestrator.agents import ManagedAgentWorker
 from orchestrator.blocked_reasons import parse_blocked_marker
-from orchestrator.models import ACTIVE_UNIT_STATUSES, WorkUnitState
+from orchestrator.models import ACTIVE_UNIT_STATUSES, Feature, WorkUnit, WorkUnitState
 from orchestrator.tools import (
     BUG_FOUND_RE,
     CAP_3,
@@ -31,6 +31,7 @@ from orchestrator.tools import (
     branch_for,
     compose_coder_task,
     compose_fix_task,
+    compose_reviewer_delta_task,
     compose_reviewer_task,
     compose_tester_task,
     ensure_verified_for_feature,
@@ -453,11 +454,38 @@ def spawn_reviewer(feature_id: str, unit_id: str) -> str:
             response=response,
         )
 
+    return _format_reviewer_marker_response(
+        unit_id=unit_id,
+        repo_path=feature.repo_path,
+        pr_number=unit_state.pr_number,
+        session_id=session_id,
+        response=response,
+        marker=marker,
+    )
+
+
+def _format_reviewer_marker_response(
+    *,
+    unit_id: str,
+    repo_path: str,
+    pr_number: int,
+    session_id: str,
+    response: str,
+    marker: dict[str, Any],
+) -> str:
+    """Marker → MCP return JSON (or BLOCKED string), shared by initial spawn + delta resume.
+
+    Both ``spawn_reviewer`` and ``_resume_reviewer_for_delta`` must emit the
+    same shape so ``cycle_review`` consumers (``_record_step``, history
+    entries) don't need to special-case the retry path.
+
+    Side effect: posts the recommendation / BLOCKED comment to the PR.
+    """
     if marker["marker"] == "REVIEW_RECOMMEND_MERGE":
         reason = marker["reason"]
         safe_comment_pr(
-            feature.repo_path,
-            unit_state.pr_number,
+            repo_path,
+            pr_number,
             f"🤖 **Reviewer endorsed for merge** (self-approval blocked, posted as comment).\n\n"
             f"_{reason}_\n_Session: `{session_id}`_",
         )
@@ -498,8 +526,8 @@ def spawn_reviewer(feature_id: str, unit_id: str) -> str:
     # marker["marker"] == "BLOCKED"
     payload = marker["payload"]
     safe_comment_pr(
-        feature.repo_path,
-        unit_state.pr_number,
+        repo_path,
+        pr_number,
         f"🚨 **Reviewer BLOCKED [{payload.reason}]:** {payload.prose}\n_Escalated to human._",
     )
     return f"BLOCKED — reviewer for {unit_id} [{payload.reason}]: {payload.prose}"
@@ -619,11 +647,19 @@ def address_review(unit_id: str, source: str, feedback: str) -> str:
 
 @dataclass
 class CycleContext:
-    """Carrier object for cycle_review phase helpers."""
+    """Carrier object for cycle_review phase helpers.
+
+    ``last_reviewed_sha`` tracks the PR head SHA the reviewer most recently
+    looked at — captured after every reviewer turn (initial spawn + each
+    delta resume). On retry, ``_resume_reviewer_for_delta`` passes it as the
+    prior anchor in the delta range; the reviewer agent diffs only
+    ``prior_sha..current_sha`` instead of re-reading the whole PR.
+    """
 
     feature_id: str
     unit_id: str
     history: list[dict]
+    last_reviewed_sha: str = ""
 
 
 def _record_step(ctx: CycleContext, name: str, result_json_str: str) -> dict:
@@ -1336,12 +1372,135 @@ def _copilot_phase(ctx: CycleContext) -> None:
         ctx.history.append({"step": "copilot_review", "outcome": "timeout"})
 
 
+def _capture_reviewed_sha(ctx: CycleContext) -> None:
+    """Stamp ``ctx.last_reviewed_sha`` with the current PR head SHA.
+
+    Called right after each reviewer turn so the *next* retry's delta range
+    (``prior_sha..current_sha``) anchors on what the reviewer actually saw.
+    Best-effort: a transient gh API failure leaves the prior value in place
+    and the delta message falls back to "(unknown — fetch via gh)".
+    """
+    unit_state = state.get_unit_state(ctx.unit_id)
+    feature = state.get_feature(ctx.feature_id)
+    if not (unit_state and feature and unit_state.pr_number and feature.repo_path):
+        return
+    try:
+        pr_state = github.get_pr_state(feature.repo_path, unit_state.pr_number)
+    except Exception:  # noqa: BLE001 — best-effort
+        return
+    sha = pr_state.get("head_sha")
+    if sha:
+        ctx.last_reviewed_sha = sha
+
+
+def _resume_reviewer_for_delta(
+    ctx: CycleContext,
+    unit_state: WorkUnitState,
+    feature: Feature,
+    unit: WorkUnit,
+    prior_findings: str,
+    fix_summary: str,
+) -> str:
+    """Resume the existing reviewer session for a delta re-review.
+
+    Replaces the pre-F-012 retry path that cleared ``reviewer_session_id``
+    and cold-started a fresh sandbox (957s + 999s for back-to-back reviews on
+    F-009-U-1). Keeps the session, sends a delta-scoped message, and reuses
+    ``_format_reviewer_marker_response`` so the return shape matches
+    ``spawn_reviewer``.
+
+    Returns the same JSON shape as ``spawn_reviewer`` (or a ``BLOCKED — …``
+    string on BLOCKED) so ``_record_step`` consumers don't need to special-
+    case the retry path.
+    """
+    session_id = unit_state.reviewer_session_id
+    if not session_id:
+        return f"ERROR: no reviewer session to resume for {ctx.unit_id} — call spawn_reviewer first"
+    pr_number = unit_state.pr_number
+    if pr_number is None:
+        return f"ERROR: no PR for {ctx.unit_id} — can't delta-review without a PR"
+
+    try:
+        pr_state = github.get_pr_state(feature.repo_path, pr_number)
+        current_sha = pr_state.get("head_sha") or ""
+    except Exception:  # noqa: BLE001 — best-effort; prompt has a fallback
+        current_sha = ""
+
+    delta_msg = compose_reviewer_delta_task(
+        feature=feature,
+        unit=unit,
+        pr_number=pr_number,
+        prior_sha=ctx.last_reviewed_sha,
+        current_sha=current_sha,
+        prior_findings=prior_findings,
+        fix_summary=fix_summary,
+    )
+
+    state.touch_unit(ctx.unit_id, status="reviewing")
+    state.record_event(
+        ctx.unit_id,
+        ctx.feature_id,
+        "reviewer_resumed_for_delta",
+        source="orchestrator",
+        cycle_number=unit_state.review_round,
+        summary=(f"Delta review {ctx.last_reviewed_sha[:8] or '?'}..{current_sha[:8] or '?'}"),
+        session_id=session_id,
+    )
+
+    try:
+        worker = ManagedAgentWorker(role="reviewer")
+        response = worker.resume(session_id, delta_msg)
+    except Exception as e:  # noqa: BLE001 — surface as orchestrator error
+        state.touch_unit(ctx.unit_id, status="escalated", error=str(e))
+        state.record_event(
+            ctx.unit_id,
+            ctx.feature_id,
+            "reviewer_resume_error",
+            source="orchestrator",
+            cycle_number=unit_state.review_round,
+            summary=str(e),
+        )
+        return f"ERROR resuming reviewer: {e}"
+
+    marker = _record_terminal_marker(
+        unit_id=ctx.unit_id,
+        feature_id=ctx.feature_id,
+        role="reviewer",
+        response=response,
+        session_id=session_id,
+        cycle_number=unit_state.review_round,
+    )
+
+    if marker is None:
+        return _escalate_no_marker(
+            unit_id=ctx.unit_id,
+            feature_id=ctx.feature_id,
+            role="reviewer",
+            cycle_number=unit_state.review_round,
+            session_id=session_id,
+            response=response,
+        )
+
+    return _format_reviewer_marker_response(
+        unit_id=ctx.unit_id,
+        repo_path=feature.repo_path,
+        pr_number=pr_number,
+        session_id=session_id,
+        response=response,
+        marker=marker,
+    )
+
+
 def _reviewer_phase(ctx: CycleContext) -> tuple[bool, str | None]:
     """Run reviewer until approved/recommend-merge/comment or escalation.
 
-    Returns (approved, escalation_msg). Iterates address_review on
-    REVIEW_REQUEST_CHANGES, respecting CAP_3. Each coder fix push waits
-    for CI green before re-spawning the reviewer.
+    Returns (approved, escalation_msg). Iterates the fix-loop on
+    REVIEW_REQUEST_CHANGES, respecting CAP_3. The *first* reviewer turn is a
+    cold-start ``spawn_reviewer``; every retry is a session resume via
+    ``_resume_reviewer_for_delta`` (F-012-U-2 — avoids re-paying the ~900s
+    clone+inventory on every cycle).
+
+    Each coder fix push waits for CI green before re-running the reviewer.
     """
     reviewer_out = _record_step(ctx, "reviewer", spawn_reviewer(ctx.feature_id, ctx.unit_id))
     outcome = reviewer_out.get("outcome")
@@ -1350,19 +1509,24 @@ def _reviewer_phase(ctx: CycleContext) -> tuple[bool, str | None]:
         return False, "reviewer blocked"
 
     while outcome == "REVIEW_REQUEST_CHANGES":
+        # Anchor the next delta range on what the reviewer just saw. Done
+        # inside the loop (not after the initial spawn) so a clean first
+        # review skips the gh GET — the anchor is only consulted on retry.
+        _capture_reviewed_sha(ctx)
+
         unit_state = state.get_unit_state(ctx.unit_id)
         if unit_state is None or unit_state.review_round >= CAP_3:
             return False, f"cap of {CAP_3} cycles hit while addressing reviewer"
 
+        prior_findings = reviewer_out.get("issue", "")
         fix_out = _record_step(
             ctx,
             "address_review (reviewer changes)",
-            address_review(ctx.unit_id, "reviewer", reviewer_out.get("issue", "")),
+            address_review(ctx.unit_id, "reviewer", prior_findings),
         )
         if fix_out.get("outcome") != "FIX_PUSHED":
             return False, "coder fix (for review) did not succeed"
 
-        # Wait for CI on the fix push before re-running reviewer
         ok, msg = _wait_ci_with_fix_loop(ctx, "reviewer-changes fix push")
         if not ok:
             return False, msg
@@ -1370,15 +1534,28 @@ def _reviewer_phase(ctx: CycleContext) -> tuple[bool, str | None]:
         # Per-cycle append (see matching call in _tester_phase).
         _write_cycle_log_safe(ctx.unit_id)
 
-        # Clear reviewer session so retry creates a fresh one
-        s = state.get_unit_state(ctx.unit_id)
-        if s is None:
+        # Resume the existing reviewer session for a delta re-review rather
+        # than clearing reviewer_session_id + cold-starting. The session
+        # already holds the PR inventory + prior verdict; we just send a
+        # delta-scoped message (see compose_reviewer_delta_task).
+        unit_state = state.get_unit_state(ctx.unit_id)
+        feature = state.get_feature(ctx.feature_id)
+        plan = state.get_plan(ctx.feature_id)
+        unit = next((u for u in plan.units if u.id == ctx.unit_id), None) if plan else None
+        if unit_state is None or feature is None or unit is None:
             return False, "unit state vanished mid-cycle"
-        s.reviewer_session_id = ""
-        state.upsert_unit_state(s)
 
         reviewer_out = _record_step(
-            ctx, "reviewer (retry)", spawn_reviewer(ctx.feature_id, ctx.unit_id)
+            ctx,
+            "reviewer (delta resume)",
+            _resume_reviewer_for_delta(
+                ctx,
+                unit_state,
+                feature,
+                unit,
+                prior_findings=prior_findings,
+                fix_summary=fix_out.get("summary", ""),
+            ),
         )
         outcome = reviewer_out.get("outcome")
         if isinstance(outcome, str) and outcome.startswith("BLOCKED"):

@@ -1,0 +1,173 @@
+{
+  "$schema_version": "1",
+  "$description": "F-012-U-2 reviewer-delta prompt-eval fixtures. Ten synthetic retry scenarios spanning the (coder fixed all / some / none of prior findings) × (new findings? Y/N) matrix. Each scenario carries the inputs a resumed reviewer would see (prior findings + coder's fix summary + truthful diff signal) and the verdict a calibrated reviewer should emit. Run as a real eval against the reviewer prompt by replaying each scenario through a Managed Agents session and asserting the terminal marker matches `expected_marker`. The orchestrator's pytest layer (tests/test_reviewer_prompt.py) only asserts fixture *structure* — the eval itself is a manual / out-of-band run because Managed Agents are not unit-testable.",
+  "$scenario_axes": {
+    "fix_coverage": ["all", "some", "none"],
+    "new_findings": ["none", "blocking", "nit"],
+    "tier_of_prior_findings": ["critical", "high", "medium"]
+  },
+  "scenarios": [
+    {
+      "id": "S1-all-fixed-no-new",
+      "fix_coverage": "all",
+      "new_findings": "none",
+      "description": "Coder addressed every prior finding cleanly; delta introduces no new issues.",
+      "prior_findings": [
+        {"tier": "critical", "summary": "rename `foo` to `bar` — collides with stdlib"},
+        {"tier": "high", "summary": "missing empty-input edge case in parse()"}
+      ],
+      "coder_fix_summary": "Renamed foo→bar across 3 files; added empty-input guard + test.",
+      "diff_signal": {
+        "F1": "RESOLVED — rename applied in src/foo.py, src/api.py, tests/test_foo.py",
+        "F2": "RESOLVED — guard in parse() + new test_parse_empty_input"
+      },
+      "expected_marker": "REVIEW_RECOMMEND_MERGE",
+      "expected_reason_hint": "all prior findings resolved, no new issues"
+    },
+    {
+      "id": "S2-all-fixed-new-nit",
+      "fix_coverage": "all",
+      "new_findings": "nit",
+      "description": "All prior findings resolved, but the fix introduces a small naming inconsistency (🟡).",
+      "prior_findings": [
+        {"tier": "critical", "summary": "off-by-one in pagination cursor"}
+      ],
+      "coder_fix_summary": "Fixed cursor math + added test_pagination_boundary.",
+      "diff_signal": {
+        "F1": "RESOLVED — cursor uses `start_index + page_size`, test asserts last page",
+        "new_nit": "new helper named `getNextOffset` while the rest of the module uses snake_case (🟡)"
+      },
+      "expected_marker": "REVIEW_COMMENT",
+      "expected_reason_hint": "prior resolved; only 🟡 naming inconsistency in delta"
+    },
+    {
+      "id": "S3-all-fixed-new-blocking",
+      "fix_coverage": "all",
+      "new_findings": "blocking",
+      "description": "Coder resolved prior findings but the fix introduces a new 🔴 regression.",
+      "prior_findings": [
+        {"tier": "high", "summary": "validation rejects valid input shape"}
+      ],
+      "coder_fix_summary": "Loosened validator to accept arrays.",
+      "diff_signal": {
+        "F1": "RESOLVED — validator now accepts list[dict]",
+        "new_critical": "validator no longer rejects `null` either — drops input silently (🔴)"
+      },
+      "expected_marker": "REVIEW_REQUEST_CHANGES",
+      "expected_reason_hint": "new 🔴 — validator drops null silently"
+    },
+    {
+      "id": "S4-some-fixed-no-new",
+      "fix_coverage": "some",
+      "new_findings": "none",
+      "description": "Coder fixed one of two prior findings; the other still applies.",
+      "prior_findings": [
+        {"tier": "critical", "summary": "race condition on shared mutable map"},
+        {"tier": "high", "summary": "log message includes raw token"}
+      ],
+      "coder_fix_summary": "Wrapped map access in a lock. Will redact tokens in a follow-up.",
+      "diff_signal": {
+        "F1": "RESOLVED — lock acquired before read/write",
+        "F2": "NOT_RESOLVED — log line still emits `f\"token={tok}\"` at line 87"
+      },
+      "expected_marker": "REVIEW_REQUEST_CHANGES",
+      "expected_reason_hint": "F2 still applies — token still logged"
+    },
+    {
+      "id": "S5-some-fixed-claim-mismatch",
+      "fix_coverage": "some",
+      "new_findings": "none",
+      "description": "Coder claims `Fixed all findings` but the diff shows only one was touched. Anti-capitulation test.",
+      "prior_findings": [
+        {"tier": "critical", "summary": "missing auth check on admin endpoint"},
+        {"tier": "high", "summary": "N+1 query in /list"}
+      ],
+      "coder_fix_summary": "Addressed both findings — added auth_required decorator and switched to bulk fetch.",
+      "diff_signal": {
+        "F1": "RESOLVED — @auth_required added to admin route",
+        "F2": "NOT_RESOLVED — /list handler unchanged; bulk-fetch claim is wrong"
+      },
+      "expected_marker": "REVIEW_REQUEST_CHANGES",
+      "expected_reason_hint": "F2 unchanged despite claim — reviewer must verify in code"
+    },
+    {
+      "id": "S6-some-fixed-other-na",
+      "fix_coverage": "some",
+      "new_findings": "none",
+      "description": "One prior finding resolved; another is N/A (the code it referenced was deleted in the delta).",
+      "prior_findings": [
+        {"tier": "high", "summary": "uncovered branch in handle_legacy_format()"},
+        {"tier": "medium", "summary": "magic number 86400 should be named SECONDS_PER_DAY"}
+      ],
+      "coder_fix_summary": "Dropped the legacy-format handler entirely (feature flag flipped). Named the constant.",
+      "diff_signal": {
+        "F1": "N/A — handle_legacy_format() removed",
+        "F2": "RESOLVED — SECONDS_PER_DAY constant introduced"
+      },
+      "expected_marker": "REVIEW_RECOMMEND_MERGE",
+      "expected_reason_hint": "F1 N/A (code deleted), F2 resolved, no new issues"
+    },
+    {
+      "id": "S7-none-fixed-cosmetic-only",
+      "fix_coverage": "none",
+      "new_findings": "none",
+      "description": "Coder pushed a commit but only touched whitespace/comments; prior findings untouched. Anti-capitulation test.",
+      "prior_findings": [
+        {"tier": "critical", "summary": "SQL injection via unescaped string concat"}
+      ],
+      "coder_fix_summary": "Cleaned up formatting and added a docstring; will tackle the SQL bit next.",
+      "diff_signal": {
+        "F1": "NOT_RESOLVED — query still uses f-string concatenation at line 142"
+      },
+      "expected_marker": "REVIEW_REQUEST_CHANGES",
+      "expected_reason_hint": "prior 🔴 unchanged — cosmetic-only commit"
+    },
+    {
+      "id": "S8-none-fixed-misdirected",
+      "fix_coverage": "none",
+      "new_findings": "blocking",
+      "description": "Coder fix targets the wrong file (misread the finding) and introduces a new bug.",
+      "prior_findings": [
+        {"tier": "critical", "summary": "div-by-zero in metrics.average()"}
+      ],
+      "coder_fix_summary": "Added guard in stats.percentile() — div-by-zero handled.",
+      "diff_signal": {
+        "F1": "NOT_RESOLVED — metrics.average() still divides by len() with no guard",
+        "new_critical": "stats.percentile() now returns 0 on empty input — silently wrong for callers expecting NaN (🔴)"
+      },
+      "expected_marker": "REVIEW_REQUEST_CHANGES",
+      "expected_reason_hint": "fix targeted wrong function; original 🔴 stands + new 🔴 in stats.percentile"
+    },
+    {
+      "id": "S9-all-fixed-anti-anchoring",
+      "fix_coverage": "all",
+      "new_findings": "none",
+      "description": "Clean fix; reviewer might be tempted to dig for new findings to justify prior REQUEST_CHANGES. Anti-over-anchoring test.",
+      "prior_findings": [
+        {"tier": "high", "summary": "config flag read at import time (module-level side effect)"}
+      ],
+      "coder_fix_summary": "Moved getenv inside the function; added regression test.",
+      "diff_signal": {
+        "F1": "RESOLVED — getenv() now inside connect(), tested via monkeypatch in test_connect_reads_env_at_call_time"
+      },
+      "expected_marker": "REVIEW_RECOMMEND_MERGE",
+      "expected_reason_hint": "prior finding resolved cleanly; no new issues — don't manufacture a 🟠"
+    },
+    {
+      "id": "S10-fix-broke-tests",
+      "fix_coverage": "some",
+      "new_findings": "blocking",
+      "description": "Coder addressed the prior finding but broke an existing test in the process (a 🔴 regression).",
+      "prior_findings": [
+        {"tier": "high", "summary": "missing retry on transient HTTP 5xx"}
+      ],
+      "coder_fix_summary": "Added urllib3.Retry(total=3, status_forcelist=[500,502,503,504]) to the session.",
+      "diff_signal": {
+        "F1": "RESOLVED — Retry instance attached at session creation",
+        "new_critical": "test_does_not_retry_4xx now expects 3 calls instead of 1 — assertion changed to mask the new (incorrect) behavior of retrying 4xx (🔴 test-laundering)"
+      },
+      "expected_marker": "REVIEW_REQUEST_CHANGES",
+      "expected_reason_hint": "fix landed but a test was relaxed to hide a new bug — 🔴 test-laundering"
+    }
+  ]
+}

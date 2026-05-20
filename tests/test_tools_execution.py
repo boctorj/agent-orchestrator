@@ -101,6 +101,10 @@ def _stub_github(monkeypatch, copilot_review=None):
         "orchestrator.tools.execution.github.parse_repo_url",
         lambda url: ("owner", "repo"),
     )
+    monkeypatch.setattr(
+        "orchestrator.tools.execution.github.get_pr_state",
+        lambda *a, **k: {"head_sha": "deadbeefcafe", "state": "open", "merged": False},
+    )
 
 
 def _setup_feature(feature_id="F-001", repo="https://github.com/o/r"):
@@ -1042,29 +1046,38 @@ class TestCycleReview:
     def test_reviewer_request_changes_then_approve(
         self, tmp_state_db, with_github_token, monkeypatch
     ):
+        """First reviewer turn = cold spawn_reviewer; retry = delta resume.
+
+        F-012-U-2 split the retry onto _resume_reviewer_for_delta so the
+        existing reviewer session can be reused; this test exercises both
+        legs and confirms cycle_review terminates approved.
+        """
         _seed_coded_unit()
         monkeypatch.setattr(
             execution,
             "spawn_tester",
             lambda f, u: json.dumps({"unit_id": u, "outcome": "TESTS_PASS"}),
         )
-        reviewer_responses = iter(
-            [
-                json.dumps(
-                    {"unit_id": "U", "outcome": "REVIEW_REQUEST_CHANGES", "issue": "rename x"}
-                ),
-                json.dumps({"unit_id": "U", "outcome": "REVIEW_RECOMMEND_MERGE"}),
-            ]
-        )
         monkeypatch.setattr(
             execution,
             "spawn_reviewer",
-            lambda f, u: next(reviewer_responses),
+            lambda f, u: json.dumps(
+                {"unit_id": u, "outcome": "REVIEW_REQUEST_CHANGES", "issue": "rename x"}
+            ),
+        )
+        monkeypatch.setattr(
+            execution,
+            "_resume_reviewer_for_delta",
+            lambda *a, **k: json.dumps(
+                {"unit_id": "U", "outcome": "REVIEW_RECOMMEND_MERGE", "reason": "fix landed"}
+            ),
         )
         monkeypatch.setattr(
             execution,
             "address_review",
-            lambda u, src, fb: json.dumps({"outcome": "FIX_PUSHED", "cycle": 1}),
+            lambda u, src, fb: json.dumps(
+                {"outcome": "FIX_PUSHED", "cycle": 1, "summary": "renamed x to y"}
+            ),
         )
         _stub_github(monkeypatch)
         monkeypatch.setattr(
@@ -1075,6 +1088,10 @@ class TestCycleReview:
         out = execution.cycle_review("F-001", "F-001-U-1")
         parsed = json.loads(out)
         assert parsed["outcome"] == "approved_awaiting_merge"
+        steps = [s.get("step") for s in parsed["history"]]
+        assert "reviewer (delta resume)" in steps, (
+            "retry must go through _resume_reviewer_for_delta, not cold spawn"
+        )
 
     def test_copilot_review_recorded(self, tmp_state_db, with_github_token, monkeypatch):
         _seed_coded_unit()
@@ -1199,6 +1216,209 @@ class TestCycleReview:
         parsed = json.loads(out)
         assert parsed["outcome"] == "approved_awaiting_merge"
         assert len(calls) == 2, f"expected 2 CI waits on clean run, got {len(calls)}"
+
+
+# --------------------------- _resume_reviewer_for_delta (F-012-U-2) ---------------------------
+
+
+class TestResumeReviewerForDelta:
+    """The delta-resume helper replaces the cold-start spawn_reviewer call on
+    retry. It must:
+      - reuse the existing reviewer_session_id (no fresh sandbox)
+      - send a delta-scoped message via compose_reviewer_delta_task
+      - record reviewer_resumed_for_delta + the marker event
+      - return JSON in the same shape as spawn_reviewer
+    """
+
+    def _seed_reviewing_unit(self, reviewer_session_id="sesn-r-existing"):
+        _seed_coded_unit()
+        s = state.get_unit_state("F-001-U-1")
+        s.status = "reviewing"
+        s.reviewer_session_id = reviewer_session_id
+        state.upsert_unit_state(s)
+        return s
+
+    def _build_ctx(self, prior_sha="cafe1234abcd"):
+        ctx = execution.CycleContext(
+            feature_id="F-001",
+            unit_id="F-001-U-1",
+            history=[],
+            last_reviewed_sha=prior_sha,
+        )
+        return ctx
+
+    def _unit_and_feature(self):
+        feature = state.get_feature("F-001")
+        plan = state.get_plan("F-001")
+        unit = next(u for u in plan.units if u.id == "F-001-U-1")
+        return unit, feature
+
+    def test_recommend_merge_on_resume_returns_approved_json(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        self._seed_reviewing_unit()
+        workers = _install_fake_worker(
+            monkeypatch,
+            resume_response="all addressed\nREVIEW_RECOMMEND_MERGE: prior fix landed cleanly",
+        )
+        _stub_github(monkeypatch)
+        ctx = self._build_ctx()
+        unit, feature = self._unit_and_feature()
+        unit_state = state.get_unit_state("F-001-U-1")
+
+        out = execution._resume_reviewer_for_delta(
+            ctx,
+            unit_state,
+            feature,
+            unit,
+            prior_findings="rename x",
+            fix_summary="renamed x to y in 3 files",
+        )
+
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "REVIEW_RECOMMEND_MERGE"
+        assert parsed["session_id"] == "sesn-r-existing"
+        # The reviewer worker was *resumed*, not spawned
+        reviewer_worker = workers["reviewer"]
+        assert reviewer_worker.resume_calls, "expected worker.resume to fire"
+        sid, msg = reviewer_worker.resume_calls[0]
+        assert sid == "sesn-r-existing"
+        assert "DELTA RE-REVIEW" in msg
+        assert "cafe1234abcd" in msg  # prior_sha echoed
+        assert "deadbeefcafe" in msg  # current_sha from stub
+        assert "renamed x to y" in msg  # fix_summary echoed
+        assert not reviewer_worker.spawn_calls, "delta path must never cold-spawn"
+
+    def test_request_changes_on_resume(self, tmp_state_db, with_github_token, monkeypatch):
+        self._seed_reviewing_unit()
+        _install_fake_worker(
+            monkeypatch,
+            resume_response="still missing edge case\nREVIEW_REQUEST_CHANGES: empty input still crashes",
+        )
+        _stub_github(monkeypatch)
+        ctx = self._build_ctx()
+        unit, feature = self._unit_and_feature()
+        unit_state = state.get_unit_state("F-001-U-1")
+
+        out = execution._resume_reviewer_for_delta(
+            ctx,
+            unit_state,
+            feature,
+            unit,
+            prior_findings="empty input",
+            fix_summary="added guard",
+        )
+
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "REVIEW_REQUEST_CHANGES"
+        assert parsed["issue"] == "empty input still crashes"
+
+    def test_records_resumed_for_delta_event(self, tmp_state_db, with_github_token, monkeypatch):
+        self._seed_reviewing_unit()
+        _install_fake_worker(monkeypatch, resume_response="REVIEW_RECOMMEND_MERGE: ok")
+        _stub_github(monkeypatch)
+        ctx = self._build_ctx()
+        unit, feature = self._unit_and_feature()
+        unit_state = state.get_unit_state("F-001-U-1")
+
+        execution._resume_reviewer_for_delta(
+            ctx, unit_state, feature, unit, prior_findings="x", fix_summary="y"
+        )
+
+        types = [e["event_type"] for e in state.list_events("F-001-U-1")]
+        assert "reviewer_resumed_for_delta" in types
+        # And the marker event landed too
+        assert "reviewer_recommend_merge" in types
+
+    def test_no_session_id_errors_cleanly(self, tmp_state_db, with_github_token, monkeypatch):
+        """Defensive: caller must have spawned the reviewer first.
+
+        Programming bug if reached; helper returns an ERROR string rather
+        than blowing up inside ManagedAgentWorker.resume() with an empty id.
+        """
+        self._seed_reviewing_unit(reviewer_session_id="")
+        _stub_github(monkeypatch)
+        ctx = self._build_ctx()
+        unit, feature = self._unit_and_feature()
+        unit_state = state.get_unit_state("F-001-U-1")
+
+        out = execution._resume_reviewer_for_delta(
+            ctx, unit_state, feature, unit, prior_findings="x", fix_summary="y"
+        )
+        assert "ERROR" in out
+        assert "no reviewer session" in out
+
+    def test_worker_resume_exception_escalates(self, tmp_state_db, with_github_token, monkeypatch):
+        self._seed_reviewing_unit()
+
+        class BlowUp:
+            def __init__(self, role):
+                pass
+
+            def resume(self, *a, **k):
+                raise RuntimeError("session expired")
+
+        monkeypatch.setattr("orchestrator.tools.execution.ManagedAgentWorker", BlowUp)
+        _stub_github(monkeypatch)
+        ctx = self._build_ctx()
+        unit, feature = self._unit_and_feature()
+        unit_state = state.get_unit_state("F-001-U-1")
+
+        out = execution._resume_reviewer_for_delta(
+            ctx, unit_state, feature, unit, prior_findings="x", fix_summary="y"
+        )
+
+        assert "ERROR resuming reviewer" in out
+        s = state.get_unit_state("F-001-U-1")
+        assert s.status == "escalated"
+        types = [e["event_type"] for e in state.list_events("F-001-U-1")]
+        assert "reviewer_resume_error" in types
+
+
+class TestReviewerPhasePreservesSession:
+    """End-to-end: _reviewer_phase must NOT clear reviewer_session_id on retry.
+
+    Pre-F-012 behavior cleared the id + cold-started spawn_reviewer (957s +
+    999s on F-009-U-1). The new behavior keeps the session and resumes.
+    """
+
+    def test_reviewer_session_id_survives_retry(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        # Force spawn_reviewer to actually populate reviewer_session_id by
+        # routing through a FakeWorker (rather than monkeypatching the whole
+        # spawn_reviewer function).
+        _install_fake_worker(
+            monkeypatch,
+            spawn_response="REVIEW_REQUEST_CHANGES: needs a fix",
+            resume_response="REVIEW_RECOMMEND_MERGE: delta clean",
+        )
+        monkeypatch.setattr(
+            execution,
+            "spawn_tester",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "TESTS_PASS"}),
+        )
+        monkeypatch.setattr(
+            execution,
+            "address_review",
+            lambda u, src, fb: json.dumps(
+                {"outcome": "FIX_PUSHED", "cycle": 1, "summary": "fixed"}
+            ),
+        )
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_ready_to_merge",
+            lambda *a, **k: True,
+        )
+
+        execution.cycle_review("F-001", "F-001-U-1")
+
+        s = state.get_unit_state("F-001-U-1")
+        # Session id is the SAME one set by the initial spawn; not cleared
+        # between turns. (FakeWorker assigns "sesn-reviewer-0" on the first
+        # spawn; if the retry had cold-spawned, it would be "sesn-reviewer-1".)
+        assert s.reviewer_session_id == "sesn-reviewer-0", (
+            f"retry must reuse the existing reviewer session, got {s.reviewer_session_id!r}"
+        )
 
 
 # --------------------------- internal helpers ---------------------------
