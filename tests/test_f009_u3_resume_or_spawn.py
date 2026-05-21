@@ -392,7 +392,12 @@ class TestSpawnReviewerResumesOnPriorSession:
         assert "REVIEW_REQUEST_CHANGES" in msg
 
         s = state.get_unit_state("F-001-U-1")
-        assert s.status == "in_ci"
+        # F-009-U-4 retargeted REVIEW_RECOMMEND_MERGE from in_ci to
+        # approved_awaiting_merge (the marker is terminal for the cycle —
+        # land directly in the awaiting-merge bucket cycle_review's
+        # _emit_terminal would otherwise set). The escalated → resume →
+        # endorse path goes through the same marker helper.
+        assert s.status == "approved_awaiting_merge"
         assert s.last_error == ""
 
     def test_active_unit_resumes_with_transient_retry_prompt(

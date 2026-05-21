@@ -42,6 +42,7 @@ STATUS_STYLE: dict[str, tuple[str, str]] = {
     "in_ci": ("magenta", "🔵"),
     "reviewing": ("yellow", "👀"),
     "fixing": ("yellow", "🔧"),
+    "approved_awaiting_merge": ("green", "🟢"),
     "done": ("green", "✅"),
     "escalated": ("bold red", "🚨"),
     "in_progress": ("yellow", "🔄"),
@@ -131,6 +132,13 @@ def _in_flight_data() -> list[dict]:
             f"SELECT * FROM work_units WHERE status IN ({placeholders}) ORDER BY last_activity DESC",  # noqa: S608  # nosec B608
             tuple(ACTIVE_STATUSES),
         ).fetchall()
+    # ``approved_awaiting_merge`` is the dedicated bucket for endorsed-but-
+    # not-merged units (F-009-U-4) and is NOT in ``ACTIVE_STATUSES``, so the
+    # SQL filter already excludes it. The old post-filter against
+    # ``_is_awaiting_merge`` (event-driven) was redundant for the new design
+    # and additionally hid transitional rows (``in_ci`` + stale
+    # ``reviewer_recommend_merge`` event from the pre-F-009-U-4 send_to_unit
+    # path) from both panels — drop it.
     return [
         {
             "unit_id": r["unit_id"],
@@ -141,25 +149,32 @@ def _in_flight_data() -> list[dict]:
             "cycle": r["review_round"],
         }
         for r in rows
-        if not _is_awaiting_merge(r["unit_id"])
     ]
 
 
 def _awaiting_merge_data() -> list[dict]:
+    """Units whose reviewer endorsed the PR but the human hasn't merged yet.
+
+    Authoritative source: ``work_units.status == 'approved_awaiting_merge'``
+    (written by ``cycle_review._emit_terminal`` and by ``send_to_unit`` via
+    ``_record_terminal_marker``). Closes audit Gap H (F-009-U-4) — the
+    pre-existing event-driven heuristic (:func:`_is_awaiting_merge`) is
+    no longer consulted by either bucket query and remains only as a
+    diagnostic helper.
+    """
     with contextlib.closing(_open_db_ro()) as conn:
         rows = conn.execute(
-            "SELECT * FROM work_units "
-            "WHERE status NOT IN ('done', 'escalated') AND pr_number IS NOT NULL"
+            "SELECT * FROM work_units WHERE status = 'approved_awaiting_merge' "
+            "ORDER BY last_activity DESC"
         ).fetchall()
     return [
         {
-            "pr": f"#{r['pr_number']}",
+            "pr": f"#{r['pr_number']}" if r["pr_number"] else "—",
             "unit_id": r["unit_id"],
             "feature_id": r["feature_id"],
             "branch": r["branch"] or "—",
         }
         for r in rows
-        if _is_awaiting_merge(r["unit_id"])
     ]
 
 

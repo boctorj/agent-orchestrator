@@ -218,8 +218,9 @@ orchestrator/
 ├── state.py                     SQLite layer: features, plans, work_units,
 │                                unit_events, cached_resources
 ├── models.py                    Feature, Plan, WorkUnit, WorkUnitState
-│                                + UnitStatus Literal + ACTIVE_/TERMINAL_
-│                                UNIT_STATUSES frozensets
+│                                + UnitStatus Literal + ACTIVE_/
+│                                READY_TO_MERGE_/TERMINAL_UNIT_STATUSES
+│                                frozensets
 ├── github.py                    REST helpers (PR comments / reviews /
 │                                check_runs / Copilot review fetch+wait)
 ├── github_app.py                GitHub App: JWT signing, installation
@@ -466,6 +467,7 @@ Lead → orchestrator:  cycle_review(F-001, F-001-U-1)
            REVIEW_APPROVED / RECOMMEND_MERGE / COMMENT / REQUEST_CHANGES
        loop on REQUEST_CHANGES via address_review (cap 3)
    _emit_terminal('approved_awaiting_merge', ...)
+                      → unit status flips to 'approved_awaiting_merge'
                       → ntfy push to your phone
 Lead → You:           "✅ F-001-U-1 → PR #N, awaiting your merge"
 You → github.com:     click merge

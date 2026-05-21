@@ -8,7 +8,7 @@ import sqlite3
 
 from orchestrator import blocked_hints, cycle_log, github, github_app, repo_verify, state
 from orchestrator.agents import ManagedAgentWorker
-from orchestrator.models import ACTIVE_UNIT_STATUSES
+from orchestrator.models import ACTIVE_UNIT_STATUSES, READY_TO_MERGE_STATUSES
 from orchestrator.tools import mcp, need_github_token
 from orchestrator.workers import make_worker
 from orchestrator.workers.base import TailMessage
@@ -19,6 +19,11 @@ from orchestrator.workers.base import TailMessage
 # unreachable in practice; reconcile_unit_pr emits 'reconcile_refused' to
 # document the policy rather than silently flipping to done.
 _RECONCILE_REFUSED_STATUSES: frozenset[str] = ACTIVE_UNIT_STATUSES - {"in_ci"}
+
+# Statuses surfaced by list_in_flight as "needs attention but no agent
+# running". The default is the agent-active set; READY_TO_MERGE adds the
+# approved-awaiting-merge bucket (awaiting human action, not idle).
+_LIST_IN_FLIGHT_STATUSES: frozenset[str] = ACTIVE_UNIT_STATUSES | READY_TO_MERGE_STATUSES
 
 
 @mcp.tool()
@@ -86,6 +91,9 @@ def reconcile_unit_pr(unit_id: str) -> str:
     transitions based on the (PR state, orchestrator status) pair:
 
       merged + in_ci      → status='done'; emit 'merged'.
+      merged + approved_awaiting_merge
+                          → status='done'; emit 'merged' (the cycle was
+                            already waiting on this merge — F-009-U-4).
       merged + escalated  → status='done'; emit 'merged' AND
                             'recovered_from_escalated' (details = prior
                             ``last_error``). ``last_error`` is cleared.
@@ -154,6 +162,21 @@ def reconcile_unit_pr(unit_id: str) -> str:
         )
         action = "merged-from-in_ci"
         reconciled = True
+    elif status == "approved_awaiting_merge":
+        # The reviewer endorsed and CI was green at terminal; the human's
+        # merge click is the only thing the cycle was waiting on. F-009-U-4.
+        summary = f"PR #{unit_state.pr_number} merged at {pr_state.get('merged_at')}"
+        state.touch_unit(unit_id, status="done")
+        state.record_event(
+            unit_id,
+            unit_state.feature_id,
+            "merged",
+            source="human",
+            cycle_number=cycle,
+            summary=summary,
+        )
+        action = "merged-from-approved_awaiting_merge"
+        reconciled = True
     elif status == "escalated":
         summary = f"PR #{unit_state.pr_number} merged at {pr_state.get('merged_at')}"
         prior_error = unit_state.last_error
@@ -193,8 +216,8 @@ def reconcile_unit_pr(unit_id: str) -> str:
         )
         action = f"refused-from-{status}"
     else:
-        # 'pending', 'approved_awaiting_merge' (F-009-U-4 will add this
-        # branch), or any future status we haven't taught reconcile about.
+        # 'pending' or any future status we haven't taught reconcile about.
+        # (approved_awaiting_merge has its own branch above.)
         state.record_event(
             unit_id,
             unit_state.feature_id,
@@ -253,7 +276,12 @@ def list_in_flight(reason: str = "") -> str:
     `resume_unit(unit_id, role)` to query the session's current status.
 
     Returns units with status in: coding, testing, opening_pr, in_ci,
-    reviewing, fixing.
+    reviewing, fixing, approved_awaiting_merge.
+
+    ``approved_awaiting_merge`` units have no agent running but are
+    awaiting a human merge click, so they're surfaced alongside agent-
+    active ones — the lead needs them to remind the user what's pending
+    (F-009-U-4, audit Gap H).
 
     ``reason``: when non-empty (e.g. ``"auth_failure"``,
     ``"branch_protection_blocked_push"``) the active-status set is
@@ -263,9 +291,10 @@ def list_in_flight(reason: str = "") -> str:
     the lead ask "show me everything blocked on auth" in one call. Each
     matching row gets an extra ``reason`` field so the lead can see
     which slug matched. Empty string (the default) preserves the
-    original active-only behaviour.
+    agent-active + awaiting-merge set described above (no escalation
+    rows, no reason filter).
     """
-    statuses: tuple[str, ...] = tuple(ACTIVE_UNIT_STATUSES)
+    statuses: tuple[str, ...] = tuple(_LIST_IN_FLIGHT_STATUSES)
     if reason:
         statuses = statuses + ("escalated",)
     placeholders = ",".join("?" * len(statuses))
