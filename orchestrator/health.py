@@ -42,7 +42,7 @@ rules.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol, runtime_checkable
@@ -74,6 +74,49 @@ _STATUSES_WHERE_RED_CI_IS_EXPECTED: frozenset[str] = frozenset({"coding", "fixin
 # observation here means the human merged while a worker was mid-flight;
 # refuse with an event rather than racing the agent.
 _REFUSE_MERGE_FROM_STATUSES: frozenset[str] = ACTIVE_UNIT_STATUSES - {"in_ci"}
+
+# Statuses for which ``ops.reconcile_unit_pr`` calls ``write_cycle_log``
+# after observing a merge: the three status-flipping transitions plus the
+# idempotent re-render on the post-``done`` SHA-backfill poll. ``merged +
+# active-role`` (reconcile_refused) and ``merged + pending`` are excluded
+# because finalising a log from an in-flight ``unit_events`` tail would
+# capture a partial cycle.
+_LOG_WRITABLE_STATUSES: frozenset[str] = frozenset(
+    {"in_ci", "approved_awaiting_merge", "escalated", "done"}
+)
+
+# Statuses where the ``merged → done`` transition fires (vs. the
+# escalated path that also clears ``last_error`` and emits the recovered
+# event). Used to keep ``_merge_transitions`` data-driven instead of
+# branching three times on the same status set.
+_MERGED_TRANSITION_STATUSES: frozenset[str] = frozenset(
+    {"in_ci", "approved_awaiting_merge", "escalated"}
+)
+
+
+# --------------------------- time helpers ---------------------------
+
+
+def _parse_iso(ts: str | None) -> datetime | None:
+    if not ts:
+        return None
+    try:
+        # ``datetime.fromisoformat`` accepts ``Z`` only on Python 3.11+ with
+        # a ``+00:00`` replacement. Normalize so older fixtures (and
+        # GitHub's own ``2026-...Z`` returns) parse.
+        normalized = ts.replace("Z", "+00:00") if ts.endswith("Z") else ts
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+
+def _age_seconds(ts: str | None, now: datetime) -> int | None:
+    parsed = _parse_iso(ts)
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return int((now - parsed).total_seconds())
 
 
 # --------------------------- client protocols ---------------------------
@@ -164,6 +207,31 @@ class PRSnapshot:
     merged_at: str | None
     base: str | None
 
+    @classmethod
+    def from_dict(cls, pr: dict | None) -> PRSnapshot | None:
+        """Build from the dict :meth:`GitHubHealthClient.get_pr` returns.
+
+        ``None`` propagates as ``None`` so callers can use the snapshot
+        as a "PR exists?" guard. ``conflict_files`` is a GH-side
+        enrichment (not part of the vanilla PR payload) — the
+        production client populates it when ``mergeable_state``
+        indicates a conflict, otherwise an absent key means "no list
+        available".
+        """
+        if pr is None:
+            return None
+        return cls(
+            state=pr.get("state"),
+            merged=bool(pr.get("merged")),
+            mergeable=pr.get("mergeable"),
+            mergeable_state=pr.get("mergeable_state"),
+            conflict_files=list(pr.get("conflict_files") or []),
+            head_sha=pr.get("head_sha"),
+            merge_commit_sha=pr.get("merge_commit_sha"),
+            merged_at=pr.get("merged_at"),
+            base=pr.get("base"),
+        )
+
 
 @dataclass(frozen=True)
 class GitSnapshot:
@@ -181,6 +249,15 @@ class CheckRunInfo:
     conclusion: str | None
     details_url: str | None
 
+    @classmethod
+    def from_dict(cls, r: dict) -> CheckRunInfo:
+        return cls(
+            name=r.get("name", ""),
+            status=r.get("status"),
+            conclusion=r.get("conclusion"),
+            details_url=r.get("details_url"),
+        )
+
 
 @dataclass(frozen=True)
 class CISnapshot:
@@ -189,6 +266,28 @@ class CISnapshot:
     failing: list[str]
     required: list[str]
     missing_required: list[str]
+
+    @classmethod
+    def from_lists(cls, check_runs: list[dict], required: list[str]) -> CISnapshot:
+        """Build from raw ``check_runs`` + ``required`` lists.
+
+        Conclusion taxonomy is shared with ``ci_wait``: ``skipped`` /
+        ``neutral`` pass; ``cancelled`` / ``timed_out`` /
+        ``action_required`` / ``stale`` fail alongside ``failure``.
+        Reusing the canonical sets avoids divergent drift / shadow rules
+        across the two modules.
+        """
+        runs = [CheckRunInfo.from_dict(r) for r in check_runs]
+        pending = [r.name for r in runs if r.conclusion is None and r.status != "completed"]
+        failing = [r.name for r in runs if r.conclusion in FAILURE_CONCLUSIONS]
+        actual_names = {r.name for r in runs}
+        return cls(
+            runs=runs,
+            pending=pending,
+            failing=failing,
+            required=list(required),
+            missing_required=[name for name in required if name not in actual_names],
+        )
 
 
 @dataclass(frozen=True)
@@ -201,12 +300,73 @@ class ReviewSnapshot:
     copilot_present: bool
     copilot_state: str | None
 
+    @classmethod
+    def from_lists(
+        cls,
+        reviews: list[dict],
+        review_threads: list[dict],
+        requested_reviewers: dict,
+        copilot_review: dict | None,
+    ) -> ReviewSnapshot:
+        """Build from the four GitHub-side review-domain dicts.
+
+        Outdated threads are GH's signal that the diff moved past the
+        comment's anchor — not "open work the coder needs to address"
+        — so they're excluded from the unresolved count. Teams get a
+        ``team:`` prefix to disambiguate from user logins (a team name
+        and a user login can collide).
+        """
+        approvals = sum(
+            1 for r in reviews if r.get("state") == "APPROVED" and not r.get("dismissed")
+        )
+        changes_requested = sum(
+            1 for r in reviews if r.get("state") == "CHANGES_REQUESTED" and not r.get("dismissed")
+        )
+        dismissed = sum(1 for r in reviews if r.get("dismissed") or r.get("state") == "DISMISSED")
+        unresolved = sum(
+            1 for t in review_threads if not t.get("is_resolved") and not t.get("is_outdated")
+        )
+        users = list(requested_reviewers.get("users") or [])
+        teams = [f"team:{t}" for t in (requested_reviewers.get("teams") or [])]
+        return cls(
+            approvals=approvals,
+            changes_requested=changes_requested,
+            dismissed=dismissed,
+            unresolved_threads=unresolved,
+            codeowner_requested=users + teams,
+            copilot_present=copilot_review is not None,
+            copilot_state=copilot_review.get("state") if copilot_review else None,
+        )
+
 
 @dataclass(frozen=True)
 class WorkerSessionInfo:
     role: str
     session_id: str
     session_status: str | None
+
+    @classmethod
+    def collect(
+        cls, local_state: WorkUnitState, anthropic_client: AnthropicHealthClient
+    ) -> list[WorkerSessionInfo]:
+        """One :class:`WorkerSessionInfo` per role whose session_id is set.
+
+        Skipping the missing-session rows (rather than emitting
+        ``not_found`` placeholders) keeps the report focused on roles
+        that have actually been spawned for this unit. The MCP tool
+        that surfaces the report can phrase "tester not yet spawned"
+        from the absence rather than from a noisy entry.
+        """
+        role_to_sid = (
+            ("coder", local_state.coder_session_id),
+            ("tester", local_state.tester_session_id),
+            ("reviewer", local_state.reviewer_session_id),
+        )
+        return [
+            cls(role=role, session_id=sid, session_status=anthropic_client.get_session_status(sid))
+            for role, sid in role_to_sid
+            if sid
+        ]
 
 
 @dataclass(frozen=True)
@@ -217,6 +377,24 @@ class OrchestratorSnapshot:
     last_activity: str
     last_activity_age_seconds: int | None
     downstream_blocked: int
+
+    @classmethod
+    def build(
+        cls,
+        local_state: WorkUnitState,
+        *,
+        downstream_blocked: int,
+        cycle_cap: int,
+        now: datetime,
+    ) -> OrchestratorSnapshot:
+        return cls(
+            cycle=local_state.review_round,
+            cycle_cap=cycle_cap,
+            cycles_remaining=max(0, cycle_cap - local_state.review_round),
+            last_activity=local_state.last_activity,
+            last_activity_age_seconds=_age_seconds(local_state.last_activity, now),
+            downstream_blocked=downstream_blocked,
+        )
 
 
 @dataclass(frozen=True)
@@ -275,6 +453,21 @@ class _FrozenDict(dict):
     setdefault = _readonly
 
 
+def _freeze_dict_field(instance: object, field_name: str) -> None:
+    """Wrap ``instance.<field_name>`` in :class:`_FrozenDict` in-place.
+
+    Shared by :meth:`Action.__post_init__` and
+    :meth:`ShadowDecision.__post_init__` so both frozen dataclasses
+    enforce the same snapshot-immutability contract through one
+    helper. Idempotent — already-frozen dicts pass through untouched
+    so ``dataclasses.replace`` (which re-runs ``__post_init__``)
+    doesn't double-wrap.
+    """
+    value = getattr(instance, field_name)
+    if not isinstance(value, _FrozenDict):
+        object.__setattr__(instance, field_name, _FrozenDict(value))
+
+
 @dataclass(frozen=True)
 class Action:
     """One declarative thing the MCP executor should do.
@@ -290,6 +483,12 @@ class Action:
     - ``"side_effect"`` — non-state-table operation (currently only
       ``write_cycle_log``). ``payload`` carries the call's structured
       args.
+
+    Construct via the :meth:`transition` / :meth:`event` /
+    :meth:`cycle_log_write` named constructors when building actions
+    from inside this module — they encode the per-kind required-field
+    sets in one place. Direct ``Action(kind=...)`` construction is kept
+    available for tests that want to exercise the raw shape.
 
     The dataclass is frozen so tests can compare actions by value and
     snapshot decisions diff cleanly. ``payload`` is wrapped in
@@ -311,12 +510,73 @@ class Action:
     payload: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        # ``frozen=True`` blocks field reassignment but does not freeze
-        # the underlying dict — wrap in :class:`_FrozenDict` so the
-        # snapshot contract is enforced (mutating ``payload`` raises
-        # ``TypeError`` rather than silently corrupting an Action).
-        if not isinstance(self.payload, _FrozenDict):
-            object.__setattr__(self, "payload", _FrozenDict(self.payload))
+        _freeze_dict_field(self, "payload")
+
+    # ----- named constructors -----
+
+    @classmethod
+    def transition(
+        cls,
+        target_status: str,
+        summary: str,
+        *,
+        clear_error: bool = False,
+    ) -> Action:
+        """Build a status-transition action (the executor sets
+        ``status=target_status`` on apply)."""
+        return cls(
+            kind="transition",
+            target_status=target_status,
+            clear_error=clear_error,
+            summary=summary,
+        )
+
+    @classmethod
+    def event(
+        cls,
+        event_type: str,
+        summary: str,
+        *,
+        source: str = "orchestrator",
+        details: str = "",
+        set_last_error: str = "",
+        payload: Mapping[str, Any] | None = None,
+    ) -> Action:
+        """Build an event-emission action (appended to ``unit_events``).
+
+        ``set_last_error`` populates the unit's ``last_error`` column
+        without a status change — only the ``ci_drift_detected`` event
+        uses it today.
+        """
+        return cls(
+            kind="event",
+            event_type=event_type,
+            event_source=source,
+            summary=summary,
+            details=details,
+            set_last_error=set_last_error,
+            payload=payload or {},
+        )
+
+    @classmethod
+    def cycle_log_write(cls, unit_id: str, merge_commit_sha: str) -> Action:
+        """Build the ``write_cycle_log`` side-effect action.
+
+        Payload matches the call shape ``ops.reconcile_unit_pr`` uses
+        at ``ops.py:246-251`` (``unit_id`` + ``merge_commit_sha`` +
+        backfill commit message) so a downstream executor can splat
+        the payload directly into :func:`cycle_log.write_cycle_log`.
+        """
+        return cls(
+            kind="side_effect",
+            side_effect="write_cycle_log",
+            summary=f"finalize cycle log for {unit_id}",
+            payload={
+                "unit_id": unit_id,
+                "merge_commit_sha": merge_commit_sha,
+                "commit_message": f"cycle-log: backfill merge SHA for {unit_id}",
+            },
+        )
 
 
 @dataclass(frozen=True)
@@ -335,10 +595,7 @@ class ShadowDecision:
     rationale: str
 
     def __post_init__(self) -> None:
-        # Same rationale as :meth:`Action.__post_init__` — ``trigger_inputs``
-        # is part of the snapshot contract and must not mutate post-creation.
-        if not isinstance(self.trigger_inputs, _FrozenDict):
-            object.__setattr__(self, "trigger_inputs", _FrozenDict(self.trigger_inputs))
+        _freeze_dict_field(self, "trigger_inputs")
 
 
 @dataclass(frozen=True)
@@ -348,149 +605,6 @@ class Decision:
 
 
 # --------------------------- probe ---------------------------
-
-
-def _parse_iso(ts: str | None) -> datetime | None:
-    if not ts:
-        return None
-    try:
-        # ``datetime.fromisoformat`` accepts ``Z`` only on Python 3.11+ with
-        # a ``+00:00`` replacement. Normalize so older fixtures (and
-        # GitHub's own ``2026-...Z`` returns) parse.
-        normalized = ts.replace("Z", "+00:00") if ts.endswith("Z") else ts
-        return datetime.fromisoformat(normalized)
-    except ValueError:
-        return None
-
-
-def _age_seconds(ts: str | None, now: datetime) -> int | None:
-    parsed = _parse_iso(ts)
-    if parsed is None:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    return int((now - parsed).total_seconds())
-
-
-def _pr_snapshot(pr: dict | None) -> PRSnapshot | None:
-    if pr is None:
-        return None
-    return PRSnapshot(
-        state=pr.get("state"),
-        merged=bool(pr.get("merged")),
-        mergeable=pr.get("mergeable"),
-        mergeable_state=pr.get("mergeable_state"),
-        # ``conflict_files`` is a GH-side enrichment (not part of the
-        # vanilla PR payload) — the production client populates it when
-        # ``mergeable_state`` indicates a conflict, otherwise we treat
-        # an absent key as "no list available".
-        conflict_files=list(pr.get("conflict_files") or []),
-        head_sha=pr.get("head_sha"),
-        merge_commit_sha=pr.get("merge_commit_sha"),
-        merged_at=pr.get("merged_at"),
-        base=pr.get("base"),
-    )
-
-
-def _ci_snapshot(check_runs: list[dict], required: list[str]) -> CISnapshot:
-    runs = [
-        CheckRunInfo(
-            name=r.get("name", ""),
-            status=r.get("status"),
-            conclusion=r.get("conclusion"),
-            details_url=r.get("details_url"),
-        )
-        for r in check_runs
-    ]
-    # Conclusion taxonomy is shared with ``ci_wait``: ``skipped`` /
-    # ``neutral`` pass; ``cancelled`` / ``timed_out`` / ``action_required`` /
-    # ``stale`` fail alongside ``failure``. Reusing the canonical sets
-    # avoids divergent drift/shadow rules across the two modules.
-    pending = [r.name for r in runs if (r.conclusion is None and r.status != "completed")]
-    failing = [r.name for r in runs if r.conclusion in FAILURE_CONCLUSIONS]
-    actual_names = {r.name for r in runs}
-    missing_required = [name for name in required if name not in actual_names]
-    return CISnapshot(
-        runs=runs,
-        pending=pending,
-        failing=failing,
-        required=list(required),
-        missing_required=missing_required,
-    )
-
-
-def _reviews_snapshot(
-    reviews: list[dict],
-    review_threads: list[dict],
-    requested_reviewers: dict,
-    copilot_review: dict | None,
-) -> ReviewSnapshot:
-    approvals = sum(1 for r in reviews if r.get("state") == "APPROVED" and not r.get("dismissed"))
-    changes_requested = sum(
-        1 for r in reviews if r.get("state") == "CHANGES_REQUESTED" and not r.get("dismissed")
-    )
-    dismissed = sum(1 for r in reviews if r.get("dismissed") or r.get("state") == "DISMISSED")
-    # Outdated threads are GH's signal that the diff moved past the
-    # comment's anchor — not "open work the coder needs to address".
-    unresolved = sum(
-        1 for t in review_threads if not t.get("is_resolved") and not t.get("is_outdated")
-    )
-    users = list(requested_reviewers.get("users") or [])
-    teams = [f"team:{t}" for t in (requested_reviewers.get("teams") or [])]
-    return ReviewSnapshot(
-        approvals=approvals,
-        changes_requested=changes_requested,
-        dismissed=dismissed,
-        unresolved_threads=unresolved,
-        codeowner_requested=users + teams,
-        copilot_present=copilot_review is not None,
-        copilot_state=copilot_review.get("state") if copilot_review else None,
-    )
-
-
-def _worker_sessions(
-    local_state: WorkUnitState, anthropic_client: AnthropicHealthClient
-) -> list[WorkerSessionInfo]:
-    """One :class:`WorkerSessionInfo` per role whose session_id is set.
-
-    Skipping the missing-session rows (rather than emitting
-    ``not_found`` placeholders) keeps the report focused on roles that
-    have actually been spawned for this unit. The MCP tool that
-    surfaces the report can phrase "tester not yet spawned" from the
-    absence rather than from a noisy entry.
-    """
-    role_to_sid: list[tuple[str, str]] = [
-        ("coder", local_state.coder_session_id),
-        ("tester", local_state.tester_session_id),
-        ("reviewer", local_state.reviewer_session_id),
-    ]
-    sessions: list[WorkerSessionInfo] = []
-    for role, sid in role_to_sid:
-        if not sid:
-            continue
-        sessions.append(
-            WorkerSessionInfo(
-                role=role, session_id=sid, session_status=anthropic_client.get_session_status(sid)
-            )
-        )
-    return sessions
-
-
-def _orchestrator_snapshot(
-    local_state: WorkUnitState,
-    downstream_blocked: int,
-    cycle_cap: int,
-    now: datetime,
-) -> OrchestratorSnapshot:
-    age = _age_seconds(local_state.last_activity, now)
-    return OrchestratorSnapshot(
-        cycle=local_state.review_round,
-        cycle_cap=cycle_cap,
-        cycles_remaining=max(0, cycle_cap - local_state.review_round),
-        last_activity=local_state.last_activity,
-        last_activity_age_seconds=age,
-        downstream_blocked=downstream_blocked,
-    )
 
 
 def probe_unit_health(
@@ -530,9 +644,7 @@ def probe_unit_health(
     """
     when = now or datetime.now(UTC)
 
-    pr_data = gh_client.get_pr(unit_id)
-    pr = _pr_snapshot(pr_data)
-
+    pr = PRSnapshot.from_dict(gh_client.get_pr(unit_id))
     head_commit = gh_client.get_head_commit(unit_id)
     compare = gh_client.get_compare_to_base(unit_id)
     git = GitSnapshot(
@@ -542,19 +654,19 @@ def probe_unit_health(
         head_age_seconds=_age_seconds(head_commit.get("committed_at"), when),
         last_force_push_at=gh_client.get_last_force_push_at(unit_id),
     )
-
-    ci = _ci_snapshot(gh_client.get_check_runs(unit_id), gh_client.get_required_checks(unit_id))
-
-    reviews = _reviews_snapshot(
+    ci = CISnapshot.from_lists(
+        gh_client.get_check_runs(unit_id), gh_client.get_required_checks(unit_id)
+    )
+    reviews = ReviewSnapshot.from_lists(
         gh_client.get_reviews(unit_id),
         gh_client.get_review_threads(unit_id),
         gh_client.get_requested_reviewers(unit_id),
         gh_client.get_copilot_review(unit_id),
     )
-
-    workers = _worker_sessions(local_state, anthropic_client)
-
-    orch = _orchestrator_snapshot(local_state, downstream_blocked, cycle_cap, when)
+    workers = WorkerSessionInfo.collect(local_state, anthropic_client)
+    orch = OrchestratorSnapshot.build(
+        local_state, downstream_blocked=downstream_blocked, cycle_cap=cycle_cap, now=when
+    )
 
     # Only ask the client when the PR has actually merged — pre-merge
     # reachability is meaningless (and the production client may not
@@ -610,103 +722,67 @@ def _merged_summary(report: HealthReport) -> str:
 
 
 def _merge_transitions(local_state: WorkUnitState, report: HealthReport) -> list[Action]:
-    """Build actions for the three reconcile cells from ``reconcile_unit_pr``.
+    """Build actions for the reconcile cells from ``reconcile_unit_pr``.
 
     Mirrors that function's status → action table so the new
     health-probe path stays behavior-identical with the existing
-    state-advancing call. The cycle-log writer side effect is appended
-    here too (declarative; the executor runs it on apply).
+    state-advancing call. Cells covered:
+
+    * ``merged + in_ci / approved_awaiting_merge`` → ``done`` + ``merged``
+    * ``merged + escalated`` → ``done`` (clears ``last_error``) +
+      ``merged`` + ``recovered_from_escalated`` (preserves the prior
+      ``last_error`` as audit detail)
+    * ``merged + active-role`` → ``reconcile_refused`` event only
+    * Any of the above with a populated ``merge_commit_sha`` (and
+      ``status`` in :data:`_LOG_WRITABLE_STATUSES`) also gets the
+      ``write_cycle_log`` side effect appended.
     """
     if not _merged_pr(report):
         return []
     assert report.pr is not None  # nosec B101 — guarded by _merged_pr
     status = local_state.status
-    summary = _merged_summary(report)
+    unit_id = local_state.unit_id
+    merged_event_summary = _merged_summary(report)
     actions: list[Action] = []
 
-    if status in ("in_ci", "approved_awaiting_merge"):
-        actions.append(
-            Action(
-                kind="transition",
-                target_status="done",
-                summary=f"{local_state.unit_id} merged from {status}",
-            )
+    if status in _MERGED_TRANSITION_STATUSES:
+        is_escalated = status == "escalated"
+        transition_summary = (
+            f"{unit_id} merged after escalation"
+            if is_escalated
+            else f"{unit_id} merged from {status}"
         )
-        actions.append(
-            Action(
-                kind="event",
-                event_type="merged",
-                event_source="human",
-                summary=summary,
+        actions.append(Action.transition("done", transition_summary, clear_error=is_escalated))
+        actions.append(Action.event("merged", merged_event_summary, source="human"))
+        if is_escalated:
+            actions.append(
+                Action.event(
+                    "recovered_from_escalated",
+                    "merged after escalation; last_error cleared",
+                    source="human",
+                    details=local_state.last_error or "",
+                )
             )
-        )
-    elif status == "escalated":
-        actions.append(
-            Action(
-                kind="transition",
-                target_status="done",
-                clear_error=True,
-                summary=f"{local_state.unit_id} merged after escalation",
-            )
-        )
-        actions.append(
-            Action(
-                kind="event",
-                event_type="merged",
-                event_source="human",
-                summary=summary,
-            )
-        )
-        actions.append(
-            Action(
-                kind="event",
-                event_type="recovered_from_escalated",
-                event_source="human",
-                summary="merged after escalation; last_error cleared",
-                details=local_state.last_error or "",
-            )
-        )
     elif status in _REFUSE_MERGE_FROM_STATUSES:
         # Active-role status observing a merged PR — refuse to advance.
         actions.append(
-            Action(
-                kind="event",
-                event_type="reconcile_refused",
-                event_source="human",
-                summary=f"refusing to advance unit in active status {status!r} to done",
+            Action.event(
+                "reconcile_refused",
+                f"refusing to advance unit in active status {status!r} to done",
+                source="human",
             )
         )
 
-    # Cycle-log writer runs on the same cells ``ops.reconcile_unit_pr``
-    # writes from: the three status-flipping transitions
-    # (``merged-from-{in_ci, approved_awaiting_merge, escalated}``) and
-    # the idempotent re-render after ``status='done'`` for the
-    # null→populated SHA backfill race. ``merged + active-role`` (which
-    # emits ``reconcile_refused``) and ``merged + pending`` are
-    # deliberately excluded — ``ops.py`` doesn't write the log on those
-    # cells either, and finalising a log from an in-flight unit_events
-    # tail would capture a partial cycle. Skipped when SHA isn't there
-    # yet (race after merge — a later poll catches up).
-    log_writable_statuses = {"in_ci", "approved_awaiting_merge", "escalated", "done"}
-    if status in log_writable_statuses and report.pr.merge_commit_sha:
-        backfill_msg = f"cycle-log: backfill merge SHA for {local_state.unit_id}"
-        actions.append(
-            Action(
-                kind="side_effect",
-                side_effect="write_cycle_log",
-                summary=f"finalize cycle log for {local_state.unit_id}",
-                payload={
-                    "unit_id": local_state.unit_id,
-                    "merge_commit_sha": report.pr.merge_commit_sha,
-                    "commit_message": backfill_msg,
-                },
-            )
-        )
+    # Cycle-log writer side effect (same cells ops.reconcile_unit_pr
+    # writes from). Skipped when SHA isn't there yet — a later poll
+    # catches up via the no-op-already-done idempotent re-render.
+    if status in _LOG_WRITABLE_STATUSES and report.pr.merge_commit_sha:
+        actions.append(Action.cycle_log_write(unit_id, report.pr.merge_commit_sha))
 
     return actions
 
 
-def _conflict_event(report: HealthReport) -> Action | None:
+def _conflict_event(local_state: WorkUnitState, report: HealthReport) -> Action | None:  # noqa: ARG001
     pr = report.pr
     if pr is None or pr.merged:
         return None
@@ -716,23 +792,24 @@ def _conflict_event(report: HealthReport) -> Action | None:
     details = (
         f"conflict files: {', '.join(files)}" if files else f"mergeable_state={pr.mergeable_state}"
     )
-    return Action(
-        kind="event",
-        event_type="pr_conflict_detected",
-        summary=f"PR conflict ({pr.mergeable_state})",
+    return Action.event(
+        "pr_conflict_detected",
+        f"PR conflict ({pr.mergeable_state})",
         details=details,
         payload={"conflict_files": list(files), "mergeable_state": pr.mergeable_state},
     )
 
 
-def _required_check_missing_event(report: HealthReport) -> Action | None:
+def _required_check_missing_event(
+    local_state: WorkUnitState,
+    report: HealthReport,  # noqa: ARG001
+) -> Action | None:
     if not report.ci.missing_required:
         return None
     missing = report.ci.missing_required
-    return Action(
-        kind="event",
-        event_type="required_check_missing",
-        summary=f"{len(missing)} required check(s) missing from PR",
+    return Action.event(
+        "required_check_missing",
+        f"{len(missing)} required check(s) missing from PR",
         details=f"missing: {', '.join(missing)}",
         payload={"missing": list(missing), "required": list(report.ci.required)},
     )
@@ -753,12 +830,10 @@ def _ci_drift_event(local_state: WorkUnitState, report: HealthReport) -> Action 
     if local_state.status in TERMINAL_UNIT_STATUSES:
         return None
     failing = report.ci.failing
-    details = f"failing checks: {', '.join(failing)}"
-    return Action(
-        kind="event",
-        event_type="ci_drift_detected",
-        summary=f"CI red while status={local_state.status!r}",
-        details=details,
+    return Action.event(
+        "ci_drift_detected",
+        f"CI red while status={local_state.status!r}",
+        details=f"failing checks: {', '.join(failing)}",
         set_last_error=f"CI drift: {', '.join(failing)} failing",
         payload={"failing": list(failing), "status": local_state.status},
     )
@@ -782,11 +857,11 @@ def _shadow_escalated_to_in_ci_reset(
         return None
     return ShadowDecision(
         rule_name="escalated_to_in_ci_reset",
-        predicted_action=Action(
-            kind="transition",
-            target_status="in_ci",
+        predicted_action=Action.transition(
+            "in_ci",
+            f"reset {local_state.unit_id} from escalated → in_ci "
+            "(CI green, approved, no open threads)",
             clear_error=True,
-            summary=f"reset {local_state.unit_id} from escalated → in_ci (CI green, approved, no open threads)",
         ),
         trigger_inputs={
             "status": local_state.status,
@@ -819,11 +894,10 @@ def _shadow_merge_reverted_flag(
         return None
     return ShadowDecision(
         rule_name="merge_reverted_flag",
-        predicted_action=Action(
-            kind="event",
-            event_type="merge_reverted",
-            event_source="human",
-            summary=f"{local_state.unit_id}'s merge commit no longer reachable from main",
+        predicted_action=Action.event(
+            "merge_reverted",
+            f"{local_state.unit_id}'s merge commit no longer reachable from main",
+            source="human",
             details=f"merge_commit_sha={pr.merge_commit_sha}",
         ),
         trigger_inputs={
@@ -849,20 +923,18 @@ def _shadow_dead_worker_during_active_status(
     terminated = [w for w in report.workers if w.session_status == "terminated"]
     if not terminated:
         return None
+    terminated_roles = [w.role for w in terminated]
     return ShadowDecision(
         rule_name="dead_worker_during_active_status",
-        predicted_action=Action(
-            kind="event",
-            event_type="dead_worker_detected",
-            summary=(
-                f"worker session for {[w.role for w in terminated]} is terminated "
-                f"while unit status={local_state.status!r}"
-            ),
+        predicted_action=Action.event(
+            "dead_worker_detected",
+            f"worker session for {terminated_roles} is terminated "
+            f"while unit status={local_state.status!r}",
             details=", ".join(f"{w.role}={w.session_id}" for w in terminated),
         ),
         trigger_inputs={
             "status": local_state.status,
-            "terminated_roles": [w.role for w in terminated],
+            "terminated_roles": terminated_roles,
         },
         rationale=(
             "An active-role unit (coding/testing/opening_pr/in_ci/reviewing/fixing) "
@@ -873,6 +945,27 @@ def _shadow_dead_worker_during_active_status(
             "false-positive rate (terminated-but-finished sessions) is low enough to act on."
         ),
     )
+
+
+# Event-only signal builders. Each returns an :class:`Action` to append
+# to ``actions_to_apply`` or ``None`` to skip. Adding a new event-only
+# signal is one line here; the dispatch in :func:`decide_transitions`
+# stays untouched. Builders share a uniform ``(local_state, report)``
+# signature even when they don't read ``local_state`` so this list can
+# be a flat tuple of callables.
+_EVENT_BUILDERS: tuple[Callable[[WorkUnitState, HealthReport], Action | None], ...] = (
+    _conflict_event,
+    _required_check_missing_event,
+    _ci_drift_event,
+)
+
+# Shadow-rule builders. Same shape as ``_EVENT_BUILDERS`` but return
+# :class:`ShadowDecision`. New shadow rules append here.
+_SHADOW_BUILDERS: tuple[Callable[[WorkUnitState, HealthReport], ShadowDecision | None], ...] = (
+    _shadow_escalated_to_in_ci_reset,
+    _shadow_merge_reverted_flag,
+    _shadow_dead_worker_during_active_status,
+)
 
 
 # --------------------------- entry point ---------------------------
@@ -896,22 +989,8 @@ def decide_transitions(local_state: WorkUnitState, report: HealthReport) -> Deci
     The function never mutates either argument and never performs I/O.
     """
     actions: list[Action] = list(_merge_transitions(local_state, report))
-
-    if (event := _conflict_event(report)) is not None:
-        actions.append(event)
-    if (event := _required_check_missing_event(report)) is not None:
-        actions.append(event)
-    if (event := _ci_drift_event(local_state, report)) is not None:
-        actions.append(event)
-
-    shadows: list[ShadowDecision] = []
-    if (s := _shadow_escalated_to_in_ci_reset(local_state, report)) is not None:
-        shadows.append(s)
-    if (s := _shadow_merge_reverted_flag(local_state, report)) is not None:
-        shadows.append(s)
-    if (s := _shadow_dead_worker_during_active_status(local_state, report)) is not None:
-        shadows.append(s)
-
+    actions.extend(a for build in _EVENT_BUILDERS if (a := build(local_state, report)) is not None)
+    shadows = [s for build in _SHADOW_BUILDERS if (s := build(local_state, report)) is not None]
     return Decision(actions_to_apply=actions, shadow_decisions=shadows)
 
 
