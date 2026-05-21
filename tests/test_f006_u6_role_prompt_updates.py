@@ -145,10 +145,7 @@ class TestCoderReadsSpecFirst:
         assert re.search(
             r"(?i)spec wins|spec is authoritative|spec takes precedence",
             coder_prompt,
-        ), (
-            "coder.md doesn't tell the agent which source wins on "
-            "spec-vs-unit-description conflict"
-        )
+        ), "coder.md doesn't tell the agent which source wins on spec-vs-unit-description conflict"
 
 
 class TestCoderEmitsSpecSatisfactionSection:
@@ -396,9 +393,7 @@ class TestTesterTestsAgainstSpecAcceptance:
             r"(?i)cross-?check.{0,80}predecessor|predecessor.{0,80}(?:decision|interface)",
             tester_prompt,
             re.DOTALL,
-        ), (
-            "tester.md doesn't tell the tester to cross-check predecessor decisions"
-        )
+        ), "tester.md doesn't tell the tester to cross-check predecessor decisions"
 
 
 class TestTesterScopeViolationsAreBugs:
@@ -504,9 +499,7 @@ class TestReviewerSpecVsPrDescriptionComparison:
             reviewer_prompt,
             re.DOTALL,
         )
-        assert m is not None, (
-            "reviewer.md doesn't classify undocumented spec deviations as 🔴"
-        )
+        assert m is not None, "reviewer.md doesn't classify undocumented spec deviations as 🔴"
 
     def test_missing_spec_satisfaction_when_spec_present_is_red(self, reviewer_prompt):
         """If the spec was injected but the PR description omits the
@@ -534,8 +527,7 @@ class TestReviewerReadsCycleLogFirstOnRetry:
 
     def test_this_units_cycle_log_block_documented(self, reviewer_prompt):
         assert "## THIS UNIT'S CYCLE LOG" in reviewer_prompt, (
-            "reviewer.md doesn't document the `## THIS UNIT'S CYCLE LOG` "
-            "context block"
+            "reviewer.md doesn't document the `## THIS UNIT'S CYCLE LOG` context block"
         )
 
     def test_cycle_log_marked_retry_only(self, reviewer_prompt):
@@ -573,10 +565,7 @@ class TestReviewerPredecessorConsistencyCheck:
         assert re.search(
             r"(?i)predecessor consistency check|Predecessor consistency",
             reviewer_prompt,
-        ), (
-            "reviewer.md doesn't define a 'Predecessor consistency check' as "
-            "required by F-006-U-6"
-        )
+        ), "reviewer.md doesn't define a 'Predecessor consistency check' as required by F-006-U-6"
 
     def test_predecessor_consistency_check_severity_is_orange(self, reviewer_prompt):
         """Per the proposal: silent predecessor divergence is 🟠 (not 🔴 —
@@ -707,15 +696,13 @@ class TestClaudeMdSpecEditDiscipline:
     def test_why_commit_line_required_on_spec_edits(self, claude_md):
         """The `Why:` line is the actual decision log. Pin the rule."""
         assert "Why:" in claude_md, (
-            "CLAUDE.md doesn't reference the `Why:` commit-message line "
-            "required on spec.md edits"
+            "CLAUDE.md doesn't reference the `Why:` commit-message line required on spec.md edits"
         )
         # And it must be in the context of spec.md / commit message.
         why_idx = claude_md.find("Why:")
         window = claude_md[max(why_idx - 400, 0) : why_idx + 400]
         assert re.search(r"(?i)spec\.md|commit", window), (
-            "`Why:` is mentioned in CLAUDE.md but not in the context of "
-            "spec.md commit messages"
+            "`Why:` is mentioned in CLAUDE.md but not in the context of spec.md commit messages"
         )
 
     def test_no_separate_decisions_md_rule(self, claude_md):
@@ -749,9 +736,7 @@ class TestClaudeMdCycleLogsAreReadOnly:
             if re.search(r"(?i)read-only|immutable", window):
                 found = True
                 break
-        assert found, (
-            "CLAUDE.md doesn't mark cycle logs as read-only history"
-        )
+        assert found, "CLAUDE.md doesn't mark cycle logs as read-only history"
 
     def test_revise_spec_not_cycle_log_instruction(self, claude_md):
         """The 'revise spec.md, never the cycle log' instruction is what
@@ -826,10 +811,8 @@ class TestCrossPromptConsistency:
         reads it during step 3. Both prompts must name the section
         identically."""
         assert "## Spec satisfaction" in coder_prompt, (
-            "coder.md doesn't reference the `## Spec satisfaction` section "
-            "(producer side)"
+            "coder.md doesn't reference the `## Spec satisfaction` section (producer side)"
         )
         assert "## Spec satisfaction" in reviewer_prompt, (
-            "reviewer.md doesn't reference the `## Spec satisfaction` section "
-            "(consumer side)"
+            "reviewer.md doesn't reference the `## Spec satisfaction` section (consumer side)"
         )
