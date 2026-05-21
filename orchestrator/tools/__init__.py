@@ -398,6 +398,38 @@ def compose_fix_task(
     source: str,
     feedback: str,
 ) -> str:
+    # F-007-U-4: ultrareview runs *after* our reviewer endorsed via
+    # REVIEW_RECOMMEND_MERGE, so the coder has already taken a victory lap.
+    # The variant prompt anchors them on "final-mile issues, fix without
+    # scope creep" — no broad refactor, no new abstractions, just the
+    # narrow patches the audit named. Findings have no inline anchors (the
+    # ultrareview CLI returns a JSON list, not PR review comments), so the
+    # FEEDBACK above is the full source of truth — symmetric to `ci`.
+    if source == "ultrareview":
+        guidance = (
+            "Our reviewer already endorsed this PR via REVIEW_RECOMMEND_MERGE, "
+            "but the optional `/ultrareview` meta-audit caught these final-mile "
+            "issues. Fix them WITHOUT scope creep — no refactors, no new "
+            "abstractions, no opportunistic cleanups. Address ONLY the findings "
+            "listed above; anything else is out-of-scope for this cycle and "
+            "should go to the PR body's 'Decisions/deviations' section.\n\n"
+            "Ultrareview findings have no inline PR-comment anchors (the audit "
+            "is delivered as a structured JSON list, not a `gh pr review`), so "
+            "the FEEDBACK above is the full source of truth — same shape as "
+            "`ci`. Post one bottom-of-PR comment summarizing what you changed "
+            "per finding (which file / what fix), then push."
+        )
+    else:
+        guidance = (
+            f"Follow the source-specific fix-loop flow in your system prompt "
+            f"(`## When resumed with feedback`). For `reviewer` / `tester` / "
+            f"`human` sources, the source of truth is the inline review "
+            f"comments on PR #{pr_number} — fetch them, address each in code, "
+            f"then **reply inline** to each thread with what you did. For "
+            f"`ci`, the FEEDBACK above is the full context (no inline anchors "
+            f"possible)."
+        )
+
     return f"""You have feedback to address on your existing work for unit {unit.id}.
 
 REPO_URL:  {feature.repo_path}
@@ -408,12 +440,7 @@ SOURCE:    {source}
 FEEDBACK (orchestrator summary — actionable detail lives in PR comments):
 {feedback}
 
-Follow the source-specific fix-loop flow in your system prompt
-(`## When resumed with feedback`). For `reviewer` / `tester` / `human`
-sources, the source of truth is the inline review comments on PR #{pr_number} —
-fetch them, address each in code, then **reply inline** to each thread with
-what you did. For `ci`, the FEEDBACK above is the full context (no inline
-anchors possible).
+{guidance}
 
 End your response with `FIX_PUSHED` on its own line, OR a structured
 `BLOCKED:` line if you couldn't apply the fix.

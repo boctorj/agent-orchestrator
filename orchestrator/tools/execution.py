@@ -657,7 +657,7 @@ def _format_reviewer_marker_response(
 
 @mcp.tool()
 def address_review(unit_id: str, source: str, feedback: str) -> str:
-    """Resume the coder session to address feedback (from tester/reviewer/ci/human).
+    """Resume the coder session to address feedback (from tester/reviewer/ci/human/ultrareview).
 
     **Idempotent on any status with a ``coder_session_id``, EXCEPT ``done``.**
     The session_id is the source of truth — as long as ``coder_session_id``
@@ -678,8 +678,8 @@ def address_review(unit_id: str, source: str, feedback: str) -> str:
 
     Repo must be fresh-verified (call ``verify_repo(<url>)`` if blocked).
     """
-    if source not in ("tester", "reviewer", "ci", "human"):
-        return f"ERROR: source must be tester|reviewer|ci|human, got {source!r}"
+    if source not in ("tester", "reviewer", "ci", "human", "ultrareview"):
+        return f"ERROR: source must be tester|reviewer|ci|human|ultrareview, got {source!r}"
 
     if err := ensure_verified_for_unit(unit_id):
         return err
@@ -2156,30 +2156,47 @@ def _truncate_findings_for_details(findings: list[str], budget: int = 1500) -> s
     return "\n".join(kept)
 
 
-def _ultrareview_phase(ctx: CycleContext) -> tuple[bool, str | None]:
-    """Fire ``/ultrareview`` as the terminal pre-merge gate (F-007).
+def _format_ultrareview_pr_comment(findings: list[str], cycle: int) -> str:
+    """Render the ultrareview meta-audit findings as a PR-comment body (F-007-U-4).
 
-    Called only when ``feature.ultrareview_enabled`` is on AND the reviewer
-    endorsed via ``REVIEW_RECOMMEND_MERGE``. Triggers the subprocess wrapper,
-    blocks on the verdict, and surfaces findings on FAIL.
+    Posted on every FAIL verdict before invoking ``address_review`` so the
+    human reviewing the PR sees the audit alongside the coder's fix push.
+    The spec's "post to the PR as a comment so the human sees the meta-audit"
+    contract: the FAIL fix-loop is internal cycle plumbing, but the audit
+    findings themselves are user-visible (someone deciding whether to merge
+    needs to see what the third reviewer caught).
 
-    Returns ``(passed, escalation_msg)``. On PASS the caller terminates as
-    ``approved_awaiting_merge``. On FAIL this initial impl escalates so the
-    user can decide manually — the full FAIL fix-loop (with cap-3
-    accounting and ``address_review(source='ultrareview', ...)``) ships in
-    F-007-U-4.
+    Bulleted rather than newline-joined so a long findings list renders as
+    discrete items in GitHub's markdown — easier to read than a single blob.
+    """
+    header = (
+        f"🔍 **Ultrareview meta-audit — fix cycle {cycle}, "
+        f"{len(findings)} finding(s)**\n\n"
+        f"Our reviewer endorsed via `REVIEW_RECOMMEND_MERGE`, but the "
+        f"optional `/ultrareview` gate caught the following final-mile "
+        f"issues. The coder is addressing them now — fix without scope creep, "
+        f"no broader refactor.\n\n"
+    )
+    bullets = "\n".join(f"- {f}" for f in findings) if findings else "- (no findings reported)"
+    return header + bullets
 
-    Events recorded for cost attribution + cycle-log entries:
-      * ``ultrareview_started`` — always, just before trigger.
-      * ``ultrareview_passed`` — on PASS verdict.
-      * ``ultrareview_failed`` — on every False-return path (verdict FAIL,
-        wrapper exception, defensive missing-PR-URL), with findings (or the
-        exception message) in ``details``. Every escalation has an event
-        trail explaining why.
 
-    Fail-closed on wrapper exceptions: a missing CLI, parse error, or any
-    other ``ultrareview`` raise is treated as a failed gate, never as a
-    silent endorsement.
+def _run_ultrareview_once(ctx: CycleContext) -> tuple[bool, list[str], str | None]:
+    """Single ``/ultrareview`` verdict — trigger + wait + parse + record events.
+
+    Returns ``(passed, findings, error_msg)``. ``error_msg`` is non-None only
+    on a fail-closed escape (no PR URL, wrapper raise); the caller propagates
+    it directly as the escalation message. On a normal PASS / FAIL verdict
+    ``error_msg`` is None and the caller decides via ``passed``.
+
+    Events recorded:
+      * ``ultrareview_started`` — every entry, just before ``trigger``.
+      * ``ultrareview_passed`` — on PASS.
+      * ``ultrareview_failed`` — on FAIL verdict, wrapper raise, OR defensive
+        no-PR-URL. Every False-return path leaves a telemetry trail.
+
+    Both single-shot and the F-007-U-4 fix-loop call this; the loop wrapping
+    lives in :func:`_ultrareview_phase`.
     """
     unit_state = state.get_unit_state(ctx.unit_id)
     cycle_number = unit_state.review_round if unit_state else 0
@@ -2199,7 +2216,7 @@ def _ultrareview_phase(ctx: CycleContext) -> tuple[bool, str | None]:
             summary="ultrareview gate: no PR URL available",
         )
         ctx.history.append({"step": "ultrareview", "outcome": "error", "error": "no PR URL"})
-        return False, "ultrareview gate: no PR URL available"
+        return False, [], "ultrareview gate: no PR URL available"
 
     state.record_event(
         ctx.unit_id,
@@ -2225,7 +2242,7 @@ def _ultrareview_phase(ctx: CycleContext) -> tuple[bool, str | None]:
             summary=f"ultrareview wrapper error: {e}",
         )
         ctx.history.append({"step": "ultrareview", "outcome": "error", "error": str(e)})
-        return False, f"ultrareview wrapper error: {e}"
+        return False, [], f"ultrareview wrapper error: {e}"
 
     findings = list(result.get("findings", []))
     if result.get("passed"):
@@ -2238,9 +2255,8 @@ def _ultrareview_phase(ctx: CycleContext) -> tuple[bool, str | None]:
             summary="ultrareview passed",
         )
         ctx.history.append({"step": "ultrareview", "outcome": "passed"})
-        return True, None
+        return True, [], None
 
-    findings_text = "\n".join(findings) if findings else "(no findings reported)"
     state.record_event(
         ctx.unit_id,
         ctx.feature_id,
@@ -2251,7 +2267,120 @@ def _ultrareview_phase(ctx: CycleContext) -> tuple[bool, str | None]:
         details=_truncate_findings_for_details(findings),
     )
     ctx.history.append({"step": "ultrareview", "outcome": "failed", "findings": findings})
-    return False, f"ultrareview failed:\n{findings_text}"
+    return False, findings, None
+
+
+def _ultrareview_phase(ctx: CycleContext) -> tuple[bool, str | None]:
+    """Fire ``/ultrareview`` as the terminal pre-merge gate, with FAIL fix-loop.
+
+    Called only when ``feature.ultrareview_enabled`` is on AND the reviewer
+    endorsed via ``REVIEW_RECOMMEND_MERGE``. F-007-U-3 added the PASS-path
+    wiring; F-007-U-4 extends this to a fix-loop on FAIL:
+
+    1. Trigger ultrareview, wait for verdict.
+    2. On PASS → return ``(True, None)`` — cycle terminates as
+       ``approved_awaiting_merge``.
+    3. On FAIL → post the structured findings as a PR comment (so the
+       human reviewing the PR sees the meta-audit), then invoke
+       ``address_review(source='ultrareview', findings_text)`` with the
+       variant prompt anchoring the coder on "fix without scope creep".
+       Wait for CI green, then re-run ``/ultrareview`` (NOT the reviewer
+       agent — endorsement already happened).
+    4. Loop until PASS, the shared CAP_3 cap hits, or a coder fix fails
+       to push.
+
+    Wrapper raises and the defensive no-PR-URL escape exit the loop via
+    ``_run_ultrareview_once``'s error_msg path — fail-closed, never a
+    silent endorsement.
+
+    Events:
+      * ``ultrareview_started`` / ``_passed`` / ``_failed`` — recorded by
+        ``_run_ultrareview_once`` on every iteration.
+      * ``ultrareview_fix_cycle_N`` — recorded once per fix iteration just
+        before the ``address_review`` call, where ``N`` is the upcoming
+        ``review_round`` value the coder fix will land at. Lets the cycle-
+        log / cost-attribution pipeline distinguish ultrareview-driven fix
+        cycles from tester-bug or reviewer-change fixes that share the cap.
+    """
+    passed, findings, err = _run_ultrareview_once(ctx)
+    if err is not None:
+        return False, err
+    if passed:
+        return True, None
+
+    # FAIL fix-loop: address findings → wait CI → re-run ultrareview.
+    while True:
+        unit_state = state.get_unit_state(ctx.unit_id)
+        if unit_state is None or unit_state.review_round >= CAP_3:
+            findings_text = _truncate_findings_for_details(findings)
+            return False, (
+                f"cap of {CAP_3} cycles hit while addressing ultrareview findings:\n{findings_text}"
+            )
+
+        # ``address_review`` will increment review_round; record the upcoming
+        # value on the fix-cycle event so a reader can correlate the event
+        # number with the ``coder_resumed`` cycle_number address_review writes.
+        next_cycle = unit_state.review_round + 1
+        state.record_event(
+            ctx.unit_id,
+            ctx.feature_id,
+            f"ultrareview_fix_cycle_{next_cycle}",
+            source="ultrareview",
+            cycle_number=next_cycle,
+            summary=(f"coder fix cycle {next_cycle} for {len(findings)} ultrareview finding(s)"),
+            details=_truncate_findings_for_details(findings),
+        )
+        ctx.history.append(
+            {
+                "step": f"ultrareview_fix_cycle_{next_cycle}",
+                "findings_count": len(findings),
+            }
+        )
+
+        # Post the meta-audit as a PR comment so the human reviewer sees
+        # what ultrareview caught alongside the coder's fix push. Best-
+        # effort: a posting failure must not abort the fix-loop (cycle_log
+        # records the findings independently via the event detail).
+        feature = state.get_feature(ctx.feature_id)
+        if feature and unit_state.pr_number:
+            safe_comment_pr(
+                feature.repo_path,
+                unit_state.pr_number,
+                _format_ultrareview_pr_comment(findings, next_cycle),
+            )
+
+        # Coder addresses the findings. The variant prompt in compose_fix_task
+        # anchors them on "no scope creep" — ultrareview's catch comes after
+        # the reviewer endorsed, so any broad refactor here would invalidate
+        # the prior verdict for no reason.
+        findings_text = "\n".join(findings) if findings else "(no findings reported)"
+        fix_out = _record_step(
+            ctx,
+            "address_review (ultrareview findings)",
+            address_review(ctx.unit_id, "ultrareview", findings_text),
+        )
+        if fix_out.get("outcome") != "FIX_PUSHED":
+            return False, (
+                f"coder fix for ultrareview findings did not succeed: "
+                f"{fix_out.get('outcome', 'unknown')}"
+            )
+
+        # Wait for CI green on the new commit before re-running the audit.
+        # If CI fails, the helper engages its own CI fix-loop (still shares
+        # the CAP_3 budget).
+        ok, msg = _wait_ci_with_fix_loop(ctx, "ultrareview-fix push")
+        if not ok:
+            return False, msg
+
+        _write_cycle_log_safe(ctx.unit_id)
+
+        # Re-run ultrareview (NOT the reviewer agent — the spec is explicit:
+        # the reviewer already endorsed, we just need the meta-audit to clear).
+        passed, findings, err = _run_ultrareview_once(ctx)
+        if err is not None:
+            return False, err
+        if passed:
+            return True, None
 
 
 @mcp.tool()
@@ -2305,6 +2434,9 @@ def cycle_review(feature_id: str, unit_id: str) -> str:
     # F-007 ultrareview gate: opt-in per feature, fires only after our
     # reviewer endorsed via REVIEW_RECOMMEND_MERGE (REVIEW_COMMENT is a
     # comment-only terminal — not an endorsement, so the gate is skipped).
+    # On FAIL, _ultrareview_phase runs its own coder fix-loop (U-4) sharing
+    # the CAP_3 budget; the reviewer agent is NOT re-engaged (endorsement
+    # already happened — only the audit needs to clear).
     feature = state.get_feature(ctx.feature_id)
     if (
         reviewer_outcome == "REVIEW_RECOMMEND_MERGE"
