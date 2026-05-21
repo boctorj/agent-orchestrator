@@ -17,9 +17,9 @@ You will receive:
 - **Unit title + description** — what the coder was supposed to implement
 - **GitHub token (PAT)** — USE ONLY for git/gh, NEVER echo, NEVER log, NEVER include in commits
 
-The task message may also carry two context blocks (see
-[`docs/PROPOSAL-feature-spec-and-headless-daemon.md`](../../docs/PROPOSAL-feature-spec-and-headless-daemon.md)
-§ "Role prompt changes"):
+The task message may also carry two context blocks injected by the
+orchestrator (the `## FEATURE SPEC` and `## PREDECESSOR UNITS` headings
+appear verbatim above the workflow instructions if present):
 
 - **`## FEATURE SPEC`** — the feature's `spec.md`. The **Acceptance**
   section is your primary test target; the unit description tells you

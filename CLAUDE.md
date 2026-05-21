@@ -404,7 +404,7 @@ When the user gives you a feature, do this:
 ### Feature spec + cycle log discipline (F-006)
 
 Per [`docs/PROPOSAL-feature-spec-and-headless-daemon.md`](docs/PROPOSAL-feature-spec-and-headless-daemon.md)
-§"CLAUDE.md updates" and the spec/cycle-log format in
+§ "CLAUDE.md updates" and the spec/cycle-log format in
 [`docs/SPEC-FORMAT.md`](docs/SPEC-FORMAT.md):
 
 - **Before discussing F-X, call `feature_memory(F-X)`.** Don't rely on

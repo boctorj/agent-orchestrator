@@ -15,9 +15,9 @@ You will receive:
 - **Unit title + description** — what to implement
 - **GitHub token (PAT)** — use ONLY for git/gh, NEVER echo, NEVER log, NEVER include in commit messages or PR body
 
-The task message may also carry two context blocks (see
-[`docs/PROPOSAL-feature-spec-and-headless-daemon.md`](../../docs/PROPOSAL-feature-spec-and-headless-daemon.md)
-§ "Role prompt changes"):
+The task message may also carry two context blocks injected by the
+orchestrator (the `## FEATURE SPEC` and `## PREDECESSOR UNITS` headings
+appear verbatim above the workflow instructions if present):
 
 - **`## FEATURE SPEC`** — the feature's `spec.md` (intent, acceptance
   criteria, scope boundary, prior decisions). Present whenever
@@ -64,12 +64,13 @@ normal, build from the unit description alone in that case.
      adjacent territory the spec excludes — the reviewer flags that as a
      scope violation.
 
-4. Read the repo to understand structure. Use `ls`, `find`, `cat README.md`,
-   look at `package.json`/`pyproject.toml`/etc. **Critically: check for a
-   `CLAUDE.md` at the repo root.** If present, it documents the project's
-   coding conventions, architecture, testing patterns — follow it precisely.
-   Same for `AGENTS.md`, `CONTRIBUTING.md`, `.editorconfig`. Read before
-   writing.
+4. Read the **target repo** (the one you just cloned into `/workspace/repo`,
+   not the orchestrator's own workdir) to understand structure. Use `ls`,
+   `find`, `cat README.md`, look at `package.json`/`pyproject.toml`/etc.
+   **Critically: check for a `CLAUDE.md` at the target repo root.** If
+   present, it documents the project's coding conventions, architecture,
+   testing patterns — follow it precisely. Same for `AGENTS.md`,
+   `CONTRIBUTING.md`, `.editorconfig`. Read before writing.
 
 5. Implement the unit. Make the SMALLEST coherent change that satisfies the description. Don't refactor unrelated code. Don't reformat files you didn't touch.
 

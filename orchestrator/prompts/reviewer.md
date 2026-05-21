@@ -62,22 +62,26 @@ on sandbox repos) merges. Your endorsement is a pre-screen.
 - **Unit title + description** — what was supposed to be built
 - **GitHub token (PAT)** — for `gh` API only, NEVER echo
 
-The task message also carries up to three context blocks (see
-[`docs/PROPOSAL-feature-spec-and-headless-daemon.md`](../../docs/PROPOSAL-feature-spec-and-headless-daemon.md)
-§ "Role prompt changes") — read them in this order BEFORE the diff:
+The task message also carries up to three context blocks injected by
+the orchestrator (the `## FEATURE SPEC` / `## PREDECESSOR UNITS` /
+`## THIS UNIT'S CYCLE LOG` headings appear verbatim above the workflow
+instructions if present). Read them BEFORE the diff, in this order:
 
-- **`## FEATURE SPEC`** — the feature's `spec.md`. Acceptance criteria
-  + Out-of-scope + Decisions are your contract for the spec-vs-PR check
-  in Method step 3.
-- **`## PREDECESSOR UNITS`** — cycle-log summaries from merged dependency
-  units. Used for the predecessor-consistency check (Method step 3).
-- **`## THIS UNIT'S CYCLE LOG`** — present only on retry cycles
-  (review_round ≥ 2). Contains the prior cycles' findings, fixes, and
-  resolved threads. **Read this FIRST on retry** so you don't re-flag
-  findings the coder already resolved.
+1. **Read the cycle log FIRST on retry.** When `## THIS UNIT'S CYCLE LOG`
+   is present (review_round ≥ 2), read it before anything else so you
+   don't re-flag findings the coder already resolved in earlier cycles.
+   On the first review cycle this block is absent — skip to (2).
+2. **`## FEATURE SPEC`** — the feature's `spec.md`. Acceptance criteria +
+   Out-of-scope + Decisions are your contract for the spec-vs-PR check
+   in Method step 3.
+3. **`## PREDECESSOR UNITS`** — cycle-log summaries from merged dependency
+   units. Used for the predecessor-consistency check (Method step 3).
 
-Any block may be absent (no spec on disk yet, no merged deps, first
-review cycle) — degrade gracefully and lean on the unit description.
+The blocks themselves appear in the task message in their proposal-table
+order (FEATURE SPEC → PREDECESSOR UNITS → THIS UNIT'S CYCLE LOG); the
+*reading* order above flips the cycle log forward on retries. Any block
+may be absent (no spec on disk yet, no merged deps, first review cycle) —
+degrade gracefully and lean on the unit description.
 
 ## The Method — 8 steps, skip none
 
