@@ -6,6 +6,7 @@ import json
 from dataclasses import asdict
 
 from orchestrator import blocked_hints, costs, state
+from orchestrator import feature_memory as _feature_memory
 from orchestrator.tools import mcp
 
 
@@ -76,6 +77,29 @@ def feature_cost(feature_id: str) -> str:
     unit_cost (session-hour estimate only).
     """
     return json.dumps(costs.compute_feature_cost(feature_id), indent=2)
+
+
+@mcp.tool()
+def feature_memory(feature_id: str) -> str:
+    """Session-bootstrap blob for a feature — call this at chat start.
+
+    Returns a ~3-7K-token markdown digest of everything the lead needs to
+    re-orient on a fresh session without scrolling chat history:
+
+      - ``features/<feature_id>/spec.md`` contents
+      - ``git log -10 -- features/<feature_id>/spec.md`` (the decision
+        timeline; ``Why:`` commit bodies are the log)
+      - per-unit ``unit_summary`` digest (status, cycles, last error)
+      - cycle-log "Final" sections for each unit with a log on disk
+        (PR section + last cycle subsection)
+      - recent escalation events across the feature
+
+    Read-side null-safe: missing ``features/`` directory, missing
+    ``spec.md``, or a non-git workdir each degrade to a placeholder
+    rather than raising. Returns an ``ERROR: ...`` string when
+    ``feature_id`` doesn't exist in state.
+    """
+    return _feature_memory.build_feature_memory(feature_id)
 
 
 @mcp.tool()

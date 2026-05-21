@@ -23,12 +23,11 @@ Concretely the assertions below cover:
   4. The spec-format reference doc `docs/SPEC-FORMAT.md` exists, names
      every template section, and documents the `Why:` commit-message
      pattern as the decision log.
-  5. "Pure additive" guard for the deferred surfaces: no MCP tool named
-     `feature_memory` is registered yet. (The compose_*_task injections
-     shipped in F-006-U-4 — earlier revisions of this file also asserted
-     the absence of the `## FEATURE SPEC` block, but that guard is
-     retired with U-4 and the equivalent positive coverage lives in
-     `tests/test_f006_u4_spec.py`.)
+  5. "Pure additive" guard: every deferred surface this file once
+     asserted absent has now shipped. The `## FEATURE SPEC` block was
+     retired with F-006-U-4; the `feature_memory` MCP tool was retired
+     with F-006-U-5. The equivalent positive coverage lives in
+     `tests/test_f006_u4_spec.py` and `tests/test_f006_u5_feature_memory.py`.
   6. spec.md is seeded regardless of whether `repo_path` is supplied
      (planning is free; the verification gate is orthogonal).
 """
@@ -38,7 +37,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from orchestrator import feature_spec
-from orchestrator.tools import mcp, planning
+from orchestrator.tools import planning
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SPEC_FORMAT_DOC = REPO_ROOT / "docs" / "SPEC-FORMAT.md"
@@ -222,40 +221,6 @@ def test_spec_format_doc_mentions_features_directory_layout():
 
 
 # --------------------------- pure-additive guard ---------------------------
-
-
-def test_no_feature_memory_mcp_tool_registered_yet():
-    """The proposal defers the `feature_memory` MCP tool to a later unit.
-    F-006-U-1 is "pure additive: planning produces spec.md; no consumers
-    yet." — a feature_memory tool registered here would be premature."""
-    # FastMCP tools register at import time. By the time this test runs,
-    # every tool module has been imported through `orchestrator.tools.*`.
-    # `mcp._tool_manager._tools` is the registry; if FastMCP changes the
-    # private API we fall back to scanning loaded tool modules.
-    try:
-        registered = set(mcp._tool_manager._tools.keys())  # type: ignore[attr-defined]
-    except AttributeError:  # pragma: no cover - defensive
-        from orchestrator.tools import (
-            execution,
-            observability,
-            ops,
-            scheduling,
-        )
-        from orchestrator.tools import planning as p
-
-        registered = set()
-        for mod in (execution, observability, ops, p, scheduling):
-            for name in dir(mod):
-                obj = getattr(mod, name)
-                if callable(obj) and getattr(obj, "__module__", "").startswith(
-                    "orchestrator.tools"
-                ):
-                    registered.add(name)
-
-    assert "feature_memory" not in registered, (
-        "feature_memory MCP tool is registered but the F-006-U-1 unit "
-        "description marks it deferred to a later unit (pure additive)"
-    )
 
 
 def test_planning_module_does_not_read_spec_md_on_import(tmp_state_db):
