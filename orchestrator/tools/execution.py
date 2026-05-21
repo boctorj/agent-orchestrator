@@ -13,7 +13,7 @@ import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from orchestrator import ci_wait, cycle_log, feature_spec, github, ntfy, state, ultrareview
 from orchestrator.agents import ManagedAgentWorker
@@ -269,16 +269,24 @@ def spawn_unit(feature_id: str, unit_id: str) -> str:
 
 @mcp.tool()
 def spawn_tester(feature_id: str, unit_id: str) -> str:
-    """Spawn a tester Managed Agent for a unit whose coder has opened a PR.
+    """Spawn OR resume a tester Managed Agent for a unit whose coder has opened a PR.
 
-    Tester writes tests on the coder's branch, runs them, signals
-    TESTS_PASS / BUG_FOUND / BLOCKED. BLOCKS for minutes.
+    **Idempotent on units with a prior ``tester_session_id``** — instead of
+    refusing (the pre-F-009-U-3 contract), the existing worker session is
+    resumed with a role-aware recovery prompt (see :func:`build_recovery_prompt`).
+    Resuming preserves the worker backend's accumulated context (PR diff,
+    prior test scaffolding, prior findings); spawning fresh would discard
+    all of that and re-pay the clone + inventory cost. This is the common
+    case for Gap-C (post-escalation recovery) and Gap-D (transient-retry)
+    in docs/STATE-MACHINE-AUDIT.md.
 
-    Refuses to spawn if CI is currently failing on the PR — testing a
-    red PR is wasted work. Use `cycle_review` for the automated CI-fix
-    loop, or `send_to_unit` as an escape hatch.
+    Tester signals TESTS_PASS / BUG_FOUND / BLOCKED. BLOCKS for minutes.
 
-    Repo must be fresh-verified (call `verify_repo(<url>)` if blocked).
+    Refuses to act if CI is currently failing on the PR — testing a
+    red PR is wasted work. Use ``cycle_review`` for the automated CI-fix
+    loop, or ``send_to_unit`` as an escape hatch.
+
+    Repo must be fresh-verified (call ``verify_repo(<url>)`` if blocked).
     """
     if err := ensure_verified_for_feature(feature_id):
         return err
@@ -294,8 +302,6 @@ def spawn_tester(feature_id: str, unit_id: str) -> str:
         return f"ERROR: no state for unit {unit_id} — spawn coder first"
     if not unit_state.branch or not unit_state.pr_number:
         return f"ERROR: unit {unit_id} has no branch/PR yet"
-    if unit_state.tester_session_id:
-        return f"ERROR: tester session already exists for {unit_id}. Use address_review to send follow-up."
 
     plan = state.get_plan(feature_id)
     unit = next((u for u in plan.units if u.id == unit_id), None) if plan else None
@@ -304,6 +310,14 @@ def spawn_tester(feature_id: str, unit_id: str) -> str:
 
     if err := need_github_token():
         return err
+
+    # Resume-or-spawn: a prior session_id means the worker holds accumulated
+    # context for this unit — resume it instead of cold-starting. Covers
+    # Gap-C (post-escalation recovery) and Gap-D (transient-retry) without
+    # a schema change. See ``_resume_role_for_recovery`` for the contract.
+    if unit_state.tester_session_id:
+        return _resume_role_for_recovery(role="tester", feature=feature, unit_state=unit_state)
+
     github_token = get_agent_token()
 
     task = compose_tester_task(
@@ -361,20 +375,52 @@ def spawn_tester(feature_id: str, unit_id: str) -> str:
             response=response,
         )
 
+    return _format_tester_marker_response(
+        unit_id=unit_id,
+        repo_path=feature.repo_path,
+        pr_number=unit_state.pr_number,
+        session_id=session_id,
+        response=response,
+        marker=marker,
+    )
+
+
+def _format_tester_marker_response(
+    *,
+    unit_id: str,
+    repo_path: str,
+    pr_number: int,
+    session_id: str,
+    response: str,
+    marker: dict[str, Any],
+) -> str:
+    """Tester marker → MCP return JSON (or BLOCKED string), shared by initial spawn + resume.
+
+    Mirrors :func:`_format_reviewer_marker_response`: both ``spawn_tester``
+    (initial spawn) and ``_resume_role_for_recovery`` (resume on prior
+    ``tester_session_id``) emit the same shape so consumers (cycle_review's
+    ``_record_step``, the MCP tool's JSON return contract) don't need to
+    special-case the resume path.
+
+    Side effects (run from this helper, not the caller):
+      - **TESTS_PASS**: dismiss any prior REQUEST_CHANGES review by this
+        bot identity (so branch protection's "Require resolution of changes
+        requested" doesn't block the eventual merge) and post a same-user
+        COMMENT breadcrumb anchored to the session id.
+      - **BLOCKED**: post the escalation comment on the PR.
+      - **BUG_FOUND**: no PR-side action here — the tester agent posts its
+        own inline REQUEST_CHANGES review per ``prompts/tester.md`` ("Posting
+        the BUG_FOUND review"); a top-level comment would duplicate it.
+    """
     if marker["marker"] == "TESTS_PASS":
-        # Supersede any prior REQUEST_CHANGES review by this bot identity
-        # (from an earlier BUG_FOUND cycle). A same-user COMMENT review
-        # resets the effective review state on most repos; dismissal
-        # handles the strict "Require resolution of changes requested"
-        # branch-protection setting.
         safe_dismiss_own_change_requests(
-            feature.repo_path,
-            unit_state.pr_number,
+            repo_path,
+            pr_number,
             "Tests pass on retry — superseding prior tester review.",
         )
         safe_submit_pr_review(
-            feature.repo_path,
-            unit_state.pr_number,
+            repo_path,
+            pr_number,
             f"🤖 **Tester:** all tests pass. _Session: `{session_id}`_",
             event="COMMENT",
         )
@@ -389,10 +435,6 @@ def spawn_tester(feature_id: str, unit_id: str) -> str:
         )
 
     if marker["marker"] == "BUG_FOUND":
-        # NB: tester posts its own inline REQUEST_CHANGES review with the
-        # per-bug detail (see tester.md "Posting the BUG_FOUND review").
-        # We don't add a top-level comment here — that would duplicate the
-        # inline review. The session-id breadcrumb lives in the event log.
         return json.dumps(
             {
                 "unit_id": unit_id,
@@ -407,8 +449,8 @@ def spawn_tester(feature_id: str, unit_id: str) -> str:
     # marker["marker"] == "BLOCKED"
     payload = marker["payload"]
     safe_comment_pr(
-        feature.repo_path,
-        unit_state.pr_number,
+        repo_path,
+        pr_number,
         f"🚨 **Tester BLOCKED [{payload.reason}]:** {payload.prose}\n_Escalated to human._",
     )
     return f"BLOCKED — tester for {unit_id} [{payload.reason}]: {payload.prose}"
@@ -419,20 +461,28 @@ def spawn_tester(feature_id: str, unit_id: str) -> str:
 
 @mcp.tool()
 def spawn_reviewer(feature_id: str, unit_id: str) -> str:
-    """Spawn a reviewer Managed Agent for a unit's PR.
+    """Spawn OR resume a reviewer Managed Agent for a unit's PR.
+
+    **Idempotent on units with a prior ``reviewer_session_id``** — instead
+    of refusing (the pre-F-009-U-3 contract), the existing worker session
+    is resumed with a role-aware recovery prompt (see
+    :func:`build_recovery_prompt`). Resuming preserves the worker backend's
+    accumulated context (PR inventory, prior findings); spawning fresh
+    would discard it. Covers Gap-C (post-escalation recovery) and Gap-D
+    (transient-retry) in docs/STATE-MACHINE-AUDIT.md.
 
     Reviewer is read-only. Posts review via the Reviews API. Signals
     REVIEW_RECOMMEND_MERGE / REVIEW_REQUEST_CHANGES / REVIEW_COMMENT /
-    BLOCKED. BLOCKS for minutes. (`REVIEW_APPROVED` is deprecated — the
-    orchestrator never uses GitHub's `--approve`; a reviewer that emits
+    BLOCKED. BLOCKS for minutes. (``REVIEW_APPROVED`` is deprecated — the
+    orchestrator never uses GitHub's ``--approve``; a reviewer that emits
     it falls through to the no-marker escalation path so prompt drift
     is visible rather than silently accepted.)
 
-    Refuses to spawn if CI is currently failing — reviewing a red PR
+    Refuses to act if CI is currently failing — reviewing a red PR
     duplicates effort the reviewer would otherwise spend critiquing the
-    same failures. Use `cycle_review` for the automated CI-fix loop.
+    same failures. Use ``cycle_review`` for the automated CI-fix loop.
 
-    Repo must be fresh-verified (call `verify_repo(<url>)` if blocked).
+    Repo must be fresh-verified (call ``verify_repo(<url>)`` if blocked).
     """
     if err := ensure_verified_for_feature(feature_id):
         return err
@@ -446,8 +496,6 @@ def spawn_reviewer(feature_id: str, unit_id: str) -> str:
     unit_state = state.get_unit_state(unit_id)
     if not unit_state or not unit_state.pr_number:
         return f"ERROR: unit {unit_id} has no PR yet"
-    if unit_state.reviewer_session_id:
-        return f"ERROR: reviewer session already exists for {unit_id}"
 
     plan = state.get_plan(feature_id)
     unit = next((u for u in plan.units if u.id == unit_id), None) if plan else None
@@ -456,6 +504,13 @@ def spawn_reviewer(feature_id: str, unit_id: str) -> str:
 
     if err := need_github_token():
         return err
+
+    # Resume-or-spawn: prior session_id means the worker holds accumulated
+    # context (PR inventory, prior verdict) — resume rather than cold-start.
+    # Symmetric to the spawn_tester branch above; see ``_resume_role_for_recovery``.
+    if unit_state.reviewer_session_id:
+        return _resume_role_for_recovery(role="reviewer", feature=feature, unit_state=unit_state)
+
     github_token = get_agent_token()
 
     reviewer_kwargs = _task_context_kwargs(feature, unit)
@@ -604,10 +659,24 @@ def _format_reviewer_marker_response(
 def address_review(unit_id: str, source: str, feedback: str) -> str:
     """Resume the coder session to address feedback (from tester/reviewer/ci/human).
 
+    **Idempotent on any status with a ``coder_session_id``, EXCEPT ``done``.**
+    The session_id is the source of truth — as long as ``coder_session_id``
+    is set and the unit is not merged, the coder thread is resumed and the
+    unit transitions back to ``fixing``. This is the standard recovery path
+    for Gap-C (cleared blocker after escalation): the human surfaces
+    feedback via this call and the coder picks up exactly where it left
+    off. No guard rejects an escalated unit — the prior ``last_error`` is
+    the *reason* the human is calling now.
+
+    Refuses on ``status='done'`` to avoid silently re-opening a merged unit.
+    NB: ``escalated`` is listed in ``TERMINAL_UNIT_STATUSES`` alongside
+    ``done`` but is deliberately *not* refused here — that's the audit
+    Gap-C contract.
+
     Increments review_round. BLOCKS for minutes.
     Returns coder's response — should end with FIX_PUSHED or BLOCKED.
 
-    Repo must be fresh-verified (call `verify_repo(<url>)` if blocked).
+    Repo must be fresh-verified (call ``verify_repo(<url>)`` if blocked).
     """
     if source not in ("tester", "reviewer", "ci", "human"):
         return f"ERROR: source must be tester|reviewer|ci|human, got {source!r}"
@@ -622,6 +691,17 @@ def address_review(unit_id: str, source: str, feedback: str) -> str:
         return f"ERROR: no coder session for {unit_id}"
     if not unit_state.pr_number:
         return f"ERROR: no PR for unit {unit_id} — spawn coder first"
+    # Done units have a merged PR — re-opening via a coder resume would
+    # silently flip status away from terminal. Recovery for merged units
+    # goes through reconcile_unit_pr (which is idempotent and read-only
+    # against the worker session). Symmetric to the `done` guard in
+    # `_resume_role_for_recovery`.
+    if unit_state.status == "done":
+        return (
+            f"ERROR: unit {unit_id} is already done (PR merged). "
+            f"Refusing to resume coder — use reconcile_unit_pr to refresh "
+            f"state if needed."
+        )
 
     feature = state.get_feature(unit_state.feature_id)
     plan = state.get_plan(unit_state.feature_id)
@@ -1170,56 +1250,294 @@ def _wait_ci_with_fix_loop(ctx: CycleContext, label: str) -> tuple[bool, str | N
         unit_state = state.get_unit_state(ctx.unit_id) or unit_state
 
 
-_TESTER_RESUME_RECOVERY_PROMPT = (
-    "Your previous response was lost to a network timeout in the orchestrator. "
-    "The PR is still open and CI is currently green. Please re-evaluate the "
-    "current PR head and re-emit your verdict marker (TESTS_PASS / BUG_FOUND / "
-    "BLOCKED) — do not redo test work you already completed. Output only the "
-    "marker on its own line."
-)
+# --------------------------- resume-or-spawn / recovery prompts ---------------------------
+#
+# F-009-U-3: ``spawn_tester`` / ``spawn_reviewer`` are idempotent on units
+# with a prior ``{role}_session_id``. Instead of refusing (the pre-F-009-U-3
+# contract), the existing worker session is resumed with a role-aware
+# recovery prompt. Closes audit Gaps C (post-escalation recovery) and D
+# (transient-retry) without a schema change — the session id on the unit
+# row is already the source of truth for "this worker holds context".
+
+RecoveryReason = Literal["post-escalation", "transient-retry", "ci-fix"]
+RecoveryRole = Literal["coder", "tester", "reviewer"]
+
+# Stock recovery prompts keyed by (role, reason). Each template may
+# interpolate ``{last_error}`` and ``{details}`` via ``str.format`` —
+# placeholders are optional, templates that don't reference them just
+# pass through unchanged. Keep these short and marker-explicit; the
+# load-bearing content is the marker vocabulary, not prose.
+_RECOVERY_PROMPTS: dict[tuple[str, str], str] = {
+    ("coder", "post-escalation"): (
+        "You were previously escalated (last error: {last_error}). The PR is "
+        "still open and CI is now green — continue addressing the most recent "
+        "feedback and end your reply with FIX_PUSHED (or BLOCKED on a hard "
+        "failure)."
+    ),
+    ("coder", "transient-retry"): (
+        "Picking up your coder session after a transient orchestrator failure. "
+        "Re-emit your last marker (FIX_PUSHED or BLOCKED) on its own line — "
+        "do not redo work you already completed."
+    ),
+    ("coder", "ci-fix"): (
+        "CI has failed: {details}. Inspect the failing checks, push a focused "
+        "fix to the same branch, and end your reply with FIX_PUSHED or BLOCKED."
+    ),
+    ("tester", "post-escalation"): (
+        "You were previously escalated (last error: {last_error}). CI is now "
+        "green and the PR is open — re-evaluate the current PR head and emit "
+        "your verdict marker (TESTS_PASS / BUG_FOUND / BLOCKED). Do not redo "
+        "test work you already completed."
+    ),
+    ("tester", "transient-retry"): (
+        "Your previous response was lost to a network timeout in the orchestrator. "
+        "The PR is still open and CI is currently green. Please re-evaluate the "
+        "current PR head and re-emit your verdict marker (TESTS_PASS / BUG_FOUND / "
+        "BLOCKED) — do not redo test work you already completed. Output only the "
+        "marker on its own line."
+    ),
+    ("tester", "ci-fix"): (
+        "CI has failed: {details}. Wait for the coder's fix push, then re-run "
+        "tests and emit TESTS_PASS / BUG_FOUND / BLOCKED."
+    ),
+    ("reviewer", "post-escalation"): (
+        "You were previously escalated (last error: {last_error}). CI is now "
+        "green — re-evaluate the PR and emit your verdict marker "
+        "(REVIEW_RECOMMEND_MERGE / REVIEW_REQUEST_CHANGES / REVIEW_COMMENT / "
+        "BLOCKED). Do not redo work you already completed."
+    ),
+    ("reviewer", "transient-retry"): (
+        "Your previous response was lost to a network timeout in the orchestrator. "
+        "CI is still green and the PR is open. Re-emit your last verdict marker "
+        "(REVIEW_RECOMMEND_MERGE / REVIEW_REQUEST_CHANGES / REVIEW_COMMENT / "
+        "BLOCKED) on its own line — do not redo work you already completed."
+    ),
+    ("reviewer", "ci-fix"): (
+        "CI has failed: {details}. Wait for the coder's fix push and CI to go "
+        "green, then re-evaluate and emit REVIEW_RECOMMEND_MERGE / "
+        "REVIEW_REQUEST_CHANGES / REVIEW_COMMENT / BLOCKED."
+    ),
+}
+
+
+def build_recovery_prompt(
+    role: RecoveryRole,
+    reason: RecoveryReason,
+    *,
+    last_error: str = "",
+    details: str = "",
+) -> str:
+    """Return the canonical recovery message for ``(role, reason)``.
+
+    Used by ``spawn_tester`` / ``spawn_reviewer`` (and the internal
+    ``_resume_or_spawn_tester`` shim) when resuming a session that already
+    has accumulated worker-side context. The prompt is short and
+    marker-explicit: the agent's job on a resume is to *re-emit* its
+    terminal marker, not to redo the work that produced it.
+
+    Recognised reasons:
+      * ``post-escalation`` — unit hit ``escalated`` previously and the
+        human cleared the blocker; verify/continue. ``last_error`` is
+        interpolated into the template.
+      * ``transient-retry`` — orchestrator-side network blip or restart;
+        the agent's prior reply was lost. Re-emit the marker.
+      * ``ci-fix`` — CI failed; coder pushes a focused fix, tester/reviewer
+        wait then re-evaluate. ``details`` carries the failing-checks summary.
+
+    Unknown ``(role, reason)`` pairs raise ``ValueError`` so prompt drift
+    is loud rather than silent. Tests in
+    ``tests/test_f009_u3_resume_or_spawn.py`` pin each stock message.
+    """
+    key = (role, reason)
+    if key not in _RECOVERY_PROMPTS:
+        raise ValueError(
+            f"unknown (role, reason) for build_recovery_prompt: {key!r}. "
+            f"Valid roles: coder|tester|reviewer; "
+            f"valid reasons: post-escalation|transient-retry|ci-fix."
+        )
+    return _RECOVERY_PROMPTS[key].format(
+        last_error=last_error or "(unspecified)",
+        details=details or "(unspecified)",
+    )
+
+
+def _derive_recovery_reason(unit_state: WorkUnitState) -> RecoveryReason:
+    """Map unit status → which recovery template to use.
+
+    Escalated unit means we're recovering from a prior hard failure (Gap-C);
+    any other status (typically the active role, or ``in_ci`` mid-cycle)
+    means the prior worker reply was lost in transit (Gap-D).
+    """
+    return "post-escalation" if unit_state.status == "escalated" else "transient-retry"
+
+
+def _resume_role_for_recovery(
+    *,
+    role: Literal["tester", "reviewer"],
+    feature: Feature,
+    unit_state: WorkUnitState,
+) -> str:
+    """Resume an existing tester/reviewer session for context-preserving recovery.
+
+    Called from ``spawn_tester`` / ``spawn_reviewer`` when the unit has a
+    prior ``{role}_session_id``. Both spawn surfaces converge on the same
+    response shape (``_format_tester_marker_response`` /
+    ``_format_reviewer_marker_response``) so callers don't need to
+    special-case the resume path.
+
+    **Refuses on ``status='done'``** — the old duplicate-spawn-guard wall
+    incidentally protected merged units from being silently re-opened; the
+    resume contract preserves that. Recovery is for the escalated/active
+    states (Gap-C / Gap-D); a merged unit needs ``reconcile_unit_pr``, not
+    resume. (``escalated`` is recoverable — it's *terminal* per
+    ``TERMINAL_UNIT_STATUSES`` but the audit gap C is exactly the
+    post-escalation recovery path, so we deliberately allow it here.)
+
+    Status handling on the recoverable branches:
+      - flips to ``testing`` / ``reviewing`` while the worker runs;
+      - clears ``last_error`` on entry — we're starting a fresh attempt and
+        the marker chain will repopulate it if the worker BLOCKS again;
+      - records a ``{role}_resume`` audit row (with the derived reason as
+        the summary suffix) before the resume call so operators see the
+        recovery branch was chosen.
+    """
+    # `done` units have a merged PR — re-engaging the worker session would
+    # silently flip status away from terminal, re-trigger ntfy pushes, and
+    # pollute the lead's scheduling view. The pre-F-009-U-3 refusal wall
+    # incidentally caught this; the resume contract has to as well.
+    if unit_state.status == "done":
+        return (
+            f"ERROR: unit {unit_state.unit_id} is already done (PR merged). "
+            f"Refusing to resume {role} — use reconcile_unit_pr to refresh "
+            f"state if needed, or clear the session id manually if you "
+            f"intend to re-open."
+        )
+
+    # Callers (spawn_tester / spawn_reviewer) gate on pr_number before
+    # routing here; assert keeps mypy honest about the narrowing.
+    pr_number = unit_state.pr_number
+    assert pr_number is not None, (
+        f"_resume_role_for_recovery called on {unit_state.unit_id} without a PR — "
+        "spawn_tester / spawn_reviewer must gate on pr_number first"
+    )
+    session_id = (
+        unit_state.tester_session_id if role == "tester" else unit_state.reviewer_session_id
+    )
+    cycle_number = unit_state.review_round
+    reason = _derive_recovery_reason(unit_state)
+    recovery_msg = build_recovery_prompt(role, reason, last_error=unit_state.last_error)
+    active_status: Literal["testing", "reviewing"] = "testing" if role == "tester" else "reviewing"
+
+    # Clear any prior last_error on entry — escalated → active is a fresh
+    # attempt; if the worker re-emits BLOCKED, _record_terminal_marker
+    # populates the new error.
+    state.touch_unit(unit_state.unit_id, status=active_status, clear_error=True)
+    state.record_event(
+        unit_state.unit_id,
+        unit_state.feature_id,
+        f"{role}_resume",
+        source="orchestrator",
+        cycle_number=cycle_number,
+        session_id=session_id,
+        summary=f"Resuming {role} session ({reason})",
+    )
+
+    try:
+        response = _resume_role_session(role, session_id, recovery_msg)
+    except Exception as e:  # noqa: BLE001 — surface as orchestrator error
+        state.touch_unit(unit_state.unit_id, status="escalated", error=str(e))
+        state.record_event(
+            unit_state.unit_id,
+            unit_state.feature_id,
+            f"{role}_resume_error",
+            source="orchestrator",
+            cycle_number=cycle_number,
+            summary=str(e),
+        )
+        return f"ERROR resuming {role}: {e}"
+
+    marker = _record_terminal_marker(
+        unit_id=unit_state.unit_id,
+        feature_id=unit_state.feature_id,
+        role=role,
+        response=response,
+        session_id=session_id,
+        cycle_number=cycle_number,
+    )
+
+    if marker is None:
+        return _escalate_no_marker(
+            unit_id=unit_state.unit_id,
+            feature_id=unit_state.feature_id,
+            role=role,
+            cycle_number=cycle_number,
+            session_id=session_id,
+            response=response,
+        )
+
+    if role == "tester":
+        return _format_tester_marker_response(
+            unit_id=unit_state.unit_id,
+            repo_path=feature.repo_path,
+            pr_number=pr_number,
+            session_id=session_id,
+            response=response,
+            marker=marker,
+        )
+    return _format_reviewer_marker_response(
+        unit_id=unit_state.unit_id,
+        repo_path=feature.repo_path,
+        pr_number=pr_number,
+        session_id=session_id,
+        response=response,
+        marker=marker,
+    )
 
 
 def _resume_or_spawn_tester(feature_id: str, unit_id: str) -> str:
     """Resume an existing tester session, or delegate to ``spawn_tester``.
 
-    ``cycle_review`` re-entering a unit whose previous ``_tester_phase`` died
-    on a network timeout previously caused ``spawn_tester`` to error with
-    "tester session already exists" — surfacing as an "unexpected outcome: RAW"
-    escalation. This helper detects the orphaned session, resumes it for a
-    cheap verdict re-emission, and returns a result ``_record_step`` parses
-    such that ``_tester_phase`` reaches the right branch.
+    Predates F-009-U-3, when ``spawn_tester`` was *refusal-on-duplicate*
+    rather than resume-or-spawn. Kept because ``_tester_phase``'s initial
+    call site routes through this name (and the F-013-U-1 behavioural
+    suite asserts the resume branch runs *without* calling ``spawn_tester``
+    when the session is set — a contract this helper enforces directly).
 
-    Behaviour parity with ``spawn_tester`` on a resume hit:
-      - status flips to ``testing`` while the worker runs (so dashboards
-        don't show the stale ``in_ci`` from cycle_review's GATE 1);
-      - a ``tester_resume`` audit row is written before the resume call so
-        operators can tell the recovery branch was chosen over a fresh spawn;
-      - the TESTS_PASS branch dismisses any prior tester REQUEST_CHANGES
-        review and posts the same-user COMMENT breadcrumb (the orphan is
-        typically the *retry* tester from a cycle N-1 BUG_FOUND → fix-loop,
-        so the prior REQUEST_CHANGES is real and would otherwise block
-        merge under "Require resolution of changes requested" protection);
-      - the BLOCKED branch posts the same PR comment and returns a JSON
-        outcome (``outcome="BLOCKED"``) so ``_record_step`` parses it as
-        a real outcome — returning the bare ``"BLOCKED — ..."`` string
-        like ``spawn_tester`` does falls through ``_record_step``'s JSON
-        fallback as ``outcome="RAW"``, which ``_tester_phase`` then
-        surfaces as the very ``"unexpected outcome: RAW"`` escalation
-        this PR exists to eliminate.
+    Behaviour parity with ``spawn_tester``'s native resume branch
+    (F-009-U-3): the recovery prompt is built via :func:`build_recovery_prompt`
+    rather than a per-call literal, so prompt drift between this helper
+    and ``_resume_role_for_recovery`` is impossible.
 
-    Only the ``_tester_phase`` initial-call site uses this. The interior
-    retry site clears ``tester_session_id`` before calling ``spawn_tester``
-    directly, so the orphan condition cannot arise there.
+    The interior retry site clears ``tester_session_id`` before calling
+    ``spawn_tester`` directly, so the orphan condition cannot arise there.
     """
     unit_state = state.get_unit_state(unit_id)
     if unit_state is None or not unit_state.tester_session_id:
         return spawn_tester(feature_id, unit_id)
 
+    # Symmetric to the `done` guard in ``_resume_role_for_recovery`` — a
+    # merged unit's tester session must not be silently re-engaged, even
+    # from cycle_review's internal retry path.
+    if unit_state.status == "done":
+        return (
+            f"ERROR: unit {unit_id} is already done (PR merged). "
+            f"Refusing to resume tester — use reconcile_unit_pr to refresh "
+            f"state if needed, or clear tester_session_id manually if you "
+            f"intend to re-open."
+        )
+
     session_id = unit_state.tester_session_id
     cycle_number = unit_state.review_round
     feature = state.get_feature(feature_id)
 
-    state.touch_unit(unit_id, status="testing")
+    # Derive the reason from current status so an escalated unit gets the
+    # post-escalation prompt (with interpolated last_error) instead of the
+    # "your previous response was lost" transient-retry script. Mirrors
+    # ``_resume_role_for_recovery``. Clearing last_error on entry matches
+    # the same helper — touch_unit's `error=""` default is a no-op, so the
+    # explicit ``clear_error=True`` is what actually wipes the column.
+    reason = _derive_recovery_reason(unit_state)
+    state.touch_unit(unit_id, status="testing", clear_error=True)
     state.record_event(
         unit_id,
         feature_id,
@@ -1227,11 +1545,15 @@ def _resume_or_spawn_tester(feature_id: str, unit_id: str) -> str:
         source="orchestrator",
         cycle_number=cycle_number,
         session_id=session_id,
-        summary="Resuming orphaned tester session",
+        summary=f"Resuming orphaned tester session ({reason})",
     )
 
     try:
-        response = _resume_role_session("tester", session_id, _TESTER_RESUME_RECOVERY_PROMPT)
+        response = _resume_role_session(
+            "tester",
+            session_id,
+            build_recovery_prompt("tester", reason, last_error=unit_state.last_error),
+        )
     except Exception as e:  # noqa: BLE001 — surface as orchestrator error
         state.touch_unit(unit_id, status="escalated", error=str(e))
         state.record_event(
@@ -1336,9 +1658,13 @@ def _tester_phase(ctx: CycleContext) -> tuple[bool, str | None]:
     On entry, an orphaned ``tester_session_id`` (typical after a previous
     cycle died on a network timeout) is resumed via
     ``_resume_or_spawn_tester`` for a cheap verdict re-emission instead of
-    a fresh ``spawn_tester`` call (which would error "session already exists").
-    The interior retry site clears the session id first and calls
-    ``spawn_tester`` directly.
+    a fresh spawn. Both the helper and ``spawn_tester`` itself are now
+    natively resume-or-spawn (F-009-U-3); the helper is retained here for
+    its JSON-on-BLOCKED contract — bare ``"BLOCKED — ..."`` strings from
+    ``spawn_tester`` fall through ``_record_step``'s RAW fallback, which
+    would re-surface the very ``"unexpected outcome: RAW"`` regression
+    F-013 fixed. The interior retry site clears the session id first and
+    calls ``spawn_tester`` directly.
     """
     tester_out = _record_step(ctx, "tester", _resume_or_spawn_tester(ctx.feature_id, ctx.unit_id))
     outcome = tester_out.get("outcome")

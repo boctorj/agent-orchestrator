@@ -280,7 +280,13 @@ class TestSpawnTester:
         msg = execution.spawn_tester("F-001", "F-001-U-1")
         assert "no branch/PR yet" in msg
 
-    def test_tester_session_already_exists(self, tmp_state_db):
+    def test_tester_session_set_resumes_not_refuses(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """F-009-U-3 contract change: a prior ``tester_session_id`` triggers
+        a resume on the existing worker session (preserves accumulated
+        context), not an "already exists" refusal. Replaces the pre-F-009-U-3
+        behaviour where this case errored out."""
         _seed_coded_unit()
         state.upsert_unit_state(
             WorkUnitState(
@@ -289,11 +295,27 @@ class TestSpawnTester:
                 status="in_ci",
                 branch="b",
                 pr_number=5,
+                coder_session_id="sesn-c",
                 tester_session_id="existing",
             )
         )
-        msg = execution.spawn_tester("F-001", "F-001-U-1")
-        assert "tester session already exists" in msg
+        instances = _install_fake_worker(monkeypatch, resume_response="TESTS_PASS")
+        _stub_github(monkeypatch)
+
+        out = execution.spawn_tester("F-001", "F-001-U-1")
+
+        # No "already exists" refusal — the call returns a real outcome.
+        assert "already exists" not in out
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "TESTS_PASS"
+        assert parsed["session_id"] == "existing"
+
+        # Resumed the existing session, never spawned fresh.
+        tester = instances["tester"]
+        assert len(tester.resume_calls) == 1
+        sid, _ = tester.resume_calls[0]
+        assert sid == "existing"
+        assert tester.spawn_calls == []
 
     def test_missing_token(self, tmp_state_db, no_github_token):
         _seed_coded_unit()
@@ -369,19 +391,43 @@ class TestSpawnReviewer:
         msg = execution.spawn_reviewer("F-001", "F-001-U-1")
         assert "no PR yet" in msg
 
-    def test_reviewer_already_exists(self, tmp_state_db):
+    def test_reviewer_session_set_resumes_not_refuses(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """F-009-U-3 contract change: prior ``reviewer_session_id`` triggers a
+        resume (preserves accumulated PR-inventory context), not an
+        "already exists" refusal. Mirrors the spawn_tester resume path."""
         _seed_coded_unit()
         state.upsert_unit_state(
             WorkUnitState(
                 unit_id="F-001-U-1",
                 feature_id="F-001",
                 status="in_ci",
+                branch="feat/branch",
                 pr_number=5,
-                reviewer_session_id="existing",
+                coder_session_id="sesn-c",
+                reviewer_session_id="existing-r",
             )
         )
-        msg = execution.spawn_reviewer("F-001", "F-001-U-1")
-        assert "already exists" in msg
+        instances = _install_fake_worker(
+            monkeypatch,
+            resume_response="endorsed\nREVIEW_RECOMMEND_MERGE: looks good",
+        )
+        _stub_github(monkeypatch)
+
+        out = execution.spawn_reviewer("F-001", "F-001-U-1")
+
+        assert "already exists" not in out
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "REVIEW_RECOMMEND_MERGE"
+        assert parsed["session_id"] == "existing-r"
+
+        # Resumed the existing session, never spawned fresh.
+        reviewer = instances["reviewer"]
+        assert len(reviewer.resume_calls) == 1
+        sid, _ = reviewer.resume_calls[0]
+        assert sid == "existing-r"
+        assert reviewer.spawn_calls == []
 
     def test_review_approved_escalates_as_prompt_drift(
         self, tmp_state_db, with_github_token, monkeypatch
