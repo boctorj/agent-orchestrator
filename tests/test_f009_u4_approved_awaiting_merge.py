@@ -214,14 +214,17 @@ class TestCycleReviewTerminalWritesStatus:
         pre-F-009-U-4)."""
         _seed_feature()
         _seed_unit(status="in_ci")
+        # cycle_review goes through the F-009-U-3 / F-013-U-2 resume-or-
+        # spawn shims first; stub at that seam (not the bare spawn_*) so
+        # the cycle doesn't try to hit Anthropic on its resume branch.
         monkeypatch.setattr(
             execution,
-            "spawn_tester",
+            "_resume_or_spawn_tester",
             lambda f, u: json.dumps({"unit_id": u, "outcome": "TESTS_PASS"}),
         )
         monkeypatch.setattr(
             execution,
-            "spawn_reviewer",
+            "_resume_or_spawn_reviewer",
             lambda f, u: json.dumps({"unit_id": u, "outcome": "REVIEW_RECOMMEND_MERGE"}),
         )
         # Neutralise GitHub + Copilot touches inside the cycle.

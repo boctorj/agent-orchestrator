@@ -438,7 +438,11 @@ class TestSpawnReviewerResumeOnEscalated:
         assert parsed["session_id"] == "orphan-reviewer"
 
         s = state.get_unit_state("F-001-U-1")
-        assert s.status == "in_ci"
+        # F-009-U-4 retargeted REVIEW_RECOMMEND_MERGE from in_ci to
+        # approved_awaiting_merge — the marker is terminal for the cycle,
+        # so the unit lands in the same status cycle_review's
+        # _emit_terminal would set.
+        assert s.status == "approved_awaiting_merge"
         assert s.reviewer_session_id == "orphan-reviewer"
 
     def test_resume_with_request_changes_keeps_status_active(
