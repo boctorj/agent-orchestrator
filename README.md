@@ -408,9 +408,10 @@ ALLOWED_NETWORK_HOSTS = [
 
 **To add hosts** (e.g. your org's private package registry, internal docs):
 edit `ALLOWED_NETWORK_HOSTS` in `orchestrator/workers/managed_agent.py`.
-The change auto-invalidates the cache (resource signature includes
-env_config), so the next spawn creates a fresh environment with the new
-allowlist.
+This change does **not** auto-invalidate the cache: the resource signature
+does not include env/network config, so existing cached environments keep
+the old allowlist until you reset cached resources (for example,
+`./scripts/reset_cache.sh` or `reset_cached_resources`) and spawn again.
 
 **If an agent reports a network failure** (curl/git/pip hanging or 403),
 check whether the URL is in the allowlist. The agent will silently fail
