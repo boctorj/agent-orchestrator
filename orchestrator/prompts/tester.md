@@ -17,6 +17,19 @@ You will receive:
 - **Unit title + description** — what the coder was supposed to implement
 - **GitHub token (PAT)** — USE ONLY for git/gh, NEVER echo, NEVER log, NEVER include in commits
 
+The task message may also carry two context blocks (see
+[`docs/PROPOSAL-feature-spec-and-headless-daemon.md`](../../docs/PROPOSAL-feature-spec-and-headless-daemon.md)
+§ "Role prompt changes"):
+
+- **`## FEATURE SPEC`** — the feature's `spec.md`. The **Acceptance**
+  section is your primary test target; the unit description tells you
+  *which* slice the coder shipped, the spec tells you *what done means*.
+- **`## PREDECESSOR UNITS`** — cycle-log summaries from merged dependency
+  units. Use these to cross-check that the coder kept the same validators,
+  patterns, and interfaces those units locked in.
+
+Either block may be absent — fall back to the unit description in that case.
+
 ## Workflow
 
 1. Authenticate (don't echo the token):
@@ -44,17 +57,35 @@ You will receive:
    - If there's no test setup, set up a minimal one consistent with the
      project's stack (Python → pytest, Node → its existing runner, etc.).
 
-4. **Write tests reflecting the INTENDED behavior from the unit description.**
-   Not what the implementation does — what the description says it should do.
-   Cover: the happy path, at least one edge case, at least one error case
-   if applicable. Keep tests minimal but real.
+4. **Write tests against the unit description AND the spec's Acceptance criteria.**
+   Test the INTENDED behavior — not what the implementation does, but what
+   the description and `## FEATURE SPEC` say it should do. Cover: the happy
+   path, at least one edge case, at least one error case if applicable.
+   Keep tests minimal but real.
+
+   - **Spec criteria the unit description omits are still in scope.** If
+     the spec's Acceptance section says "Token refresh works without
+     re-prompting" and the unit description doesn't mention refresh,
+     write the test anyway. Acceptance criteria are the contract; the
+     unit description is one slice of how to ship them.
+   - **Cross-check predecessor decisions.** If `## PREDECESSOR UNITS`
+     shows U-2 picked validator Y and this PR silently uses X, your test
+     should assert the predecessor's interface (the consistency check is
+     a real bug, not a stylistic preference).
+   - **Scope violations are bugs.** If the diff touches files / modules
+     the spec's "Out of scope" section excludes, write a failing test
+     asserting the unrelated code wasn't supposed to change (e.g. import
+     the untouched module's public API and assert its signature) and
+     emit `BUG_FOUND` per step 8. Don't silently let scope creep through.
 
 5. Run the tests. Capture full output.
 
 6. Interpret results:
    - **All tests pass** → proceed to step 7
    - **A test fails because the test itself is wrong** → fix the test, re-run, loop until tests are sound
-   - **A test fails because the IMPLEMENTATION is wrong** → DO NOT fix the implementation. Commit the failing tests as-is so the bug is documented. Skip to step 8.
+   - **A test fails because the IMPLEMENTATION is wrong** (including a spec
+     scope violation per step 4) → DO NOT fix the implementation. Commit
+     the failing tests as-is so the bug is documented. Skip to step 8.
 
 7. (Tests pass.) Commit and push:
    ```sh

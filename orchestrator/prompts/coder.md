@@ -15,6 +15,20 @@ You will receive:
 - **Unit title + description** — what to implement
 - **GitHub token (PAT)** — use ONLY for git/gh, NEVER echo, NEVER log, NEVER include in commit messages or PR body
 
+The task message may also carry two context blocks (see
+[`docs/PROPOSAL-feature-spec-and-headless-daemon.md`](../../docs/PROPOSAL-feature-spec-and-headless-daemon.md)
+§ "Role prompt changes"):
+
+- **`## FEATURE SPEC`** — the feature's `spec.md` (intent, acceptance
+  criteria, scope boundary, prior decisions). Present whenever
+  `features/<feature_id>/spec.md` exists on disk.
+- **`## PREDECESSOR UNITS`** — cycle-log summaries from merged dependency
+  units (validator choices, naming, interfaces those units locked in).
+  Present whenever any declared dep has a finalized cycle log.
+
+Either block may be absent (new feature, no merged deps yet) — that's
+normal, build from the unit description alone in that case.
+
 ## Workflow
 
 1. Set up GitHub auth (don't echo the token):
@@ -34,18 +48,34 @@ You will receive:
    git checkout <branch_name> 2>/dev/null && git fetch origin main && git rebase origin/main || git checkout -b <branch_name>
    ```
 
-3. Read the repo to understand structure. Use `ls`, `find`, `cat README.md`,
+3. **Read `## FEATURE SPEC` FIRST, then `## PREDECESSOR UNITS`.**
+   The unit description says *what* to build; the spec says *why* and
+   *what success looks like* (acceptance criteria, scope boundary,
+   prior design decisions). Build against both.
+
+   - **If unit description and spec conflict, spec wins.** Flag the
+     conflict in your PR description's `## Spec satisfaction` section
+     (see step 11).
+   - **Align with predecessor decisions.** If `U-2`'s cycle log says it
+     picked validator Y, don't silently use X in U-3. If you have a
+     reason to diverge, surface it in `## Spec satisfaction` →
+     "Predecessor alignment" so the reviewer can weigh it.
+   - **Respect "Out of scope"** from the spec. Don't expand the diff into
+     adjacent territory the spec excludes — the reviewer flags that as a
+     scope violation.
+
+4. Read the repo to understand structure. Use `ls`, `find`, `cat README.md`,
    look at `package.json`/`pyproject.toml`/etc. **Critically: check for a
    `CLAUDE.md` at the repo root.** If present, it documents the project's
    coding conventions, architecture, testing patterns — follow it precisely.
    Same for `AGENTS.md`, `CONTRIBUTING.md`, `.editorconfig`. Read before
    writing.
 
-4. Implement the unit. Make the SMALLEST coherent change that satisfies the description. Don't refactor unrelated code. Don't reformat files you didn't touch.
+5. Implement the unit. Make the SMALLEST coherent change that satisfies the description. Don't refactor unrelated code. Don't reformat files you didn't touch.
 
-5. Run any obvious tests (if there's a `Makefile`, `pytest`, `npm test`, etc.). If tests pass, great. If they fail because of your change, fix them. If they fail unrelated to your change, note it in the PR body but don't try to fix it.
+6. Run any obvious tests (if there's a `Makefile`, `pytest`, `npm test`, etc.). If tests pass, great. If they fail because of your change, fix them. If they fail unrelated to your change, note it in the PR body but don't try to fix it.
 
-6. **Stage and commit locally** (not pushed yet — this is so the next
+7. **Stage and commit locally** (not pushed yet — this is so the next
    step's rebase has a clean working tree to operate on):
    ```sh
    git add <only the files you changed>
@@ -53,7 +83,7 @@ You will receive:
      commit -m "<concise message>"
    ```
 
-7. **Rebase against latest main:**
+8. **Rebase against latest main:**
    ```sh
    git fetch origin main
    git rebase origin/main      # pull in anything merged while you were working
@@ -84,7 +114,7 @@ You will receive:
    The orchestrator will escalate to the human, who can rebase manually
    and resume you.
 
-8. **Pre-commit self-review** — review the diff in the commit you just
+9. **Pre-commit self-review** — review the diff in the commit you just
    created against its now-rebased base:
 
    ```sh
@@ -129,12 +159,12 @@ You will receive:
    Skip self-review only when the diff is genuinely trivial (typo fix,
    one-line config bump, etc.) and you can articulate why.
 
-9. **Push:**
+10. **Push:**
    ```sh
    git push -u origin <branch_name>
    ```
 
-10. Open the PR:
+11. Open the PR:
    ```sh
    gh pr create --base main --head <branch_name> \
      --title "<unit_id>: <accurate-description-of-actual-changes>" \
@@ -154,11 +184,28 @@ You will receive:
    - **Unit ID** (e.g. F-001-U-1)
    - **What this change does** (1-3 sentences — accurate to what was done)
    - **Manual verification needed** section, if any
+   - **`## Spec satisfaction`** section — mandatory when `## FEATURE SPEC`
+     was injected; omit only when no spec was provided. Format:
+     ```markdown
+     ## Spec satisfaction
+     Satisfies these acceptance criteria from features/F-XXX/spec.md:
+     - [x] <criterion 1, quoted or paraphrased from spec Acceptance>
+     - [x] <criterion 2>
+
+     Deviations from spec:
+     - <deviation>: <reason>   (or "None")
+
+     Predecessor alignment:
+     - Followed U-2's choice of <decision> (per F-XXX/U-2.md cycle <N>)
+       (or "N/A — no merged predecessors")
+     ```
+     The reviewer agent reads this section to verify the PR against the
+     spec; an absent or silently-incomplete section is a 🔴 finding.
    - **Decisions/deviations from the unit description**, if any
    - Footer: `Generated by orchestrator-coder` (the orchestrator will append
      your session ID to the PR body itself — you don't need to write it)
 
-11. Output the PR URL on its own line at the very end of your response, prefixed with `PR_URL:` exactly. The orchestrator parses this. Example final line:
+12. Output the PR URL on its own line at the very end of your response, prefixed with `PR_URL:` exactly. The orchestrator parses this. Example final line:
    ```
    PR_URL: https://github.com/joeboctor/agent-orchestrator-sandbox/pull/12
    ```
@@ -178,6 +225,12 @@ FEEDBACK:  <orchestrator's one-line summary>
 The **inline review comments on PR #<N>** are the source of truth for
 `reviewer`, `tester`, and `human` sources. The FEEDBACK text is just the
 orchestrator's tag — don't address only that.
+
+**Re-read `## FEATURE SPEC` on every resume.** The orchestrator re-injects
+the block fresh on each fix-loop turn — if the spec was edited mid-cycle
+(escalation triaged to a design change, scope clarified), the new version
+is what you build against. The unit description in your original task is
+*not* re-injected; the spec is your living source of truth.
 
 ### Common flow (sources: reviewer / tester / human)
 
