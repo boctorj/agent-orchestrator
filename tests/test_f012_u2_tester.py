@@ -489,6 +489,75 @@ class TestComposeReviewerDeltaTask:
         assert match is not None, "fix-summary section missing"
         assert match.group(1).strip(), "fix_summary fallback must be non-empty"
 
+    def test_renders_feature_spec_block_when_provided(self, feat_and_unit):
+        """F-006-U-6 review feedback (M1): the reviewer.md "Read this
+        FIRST on retry" rule for ``## FEATURE SPEC`` / ``## THIS UNIT'S
+        CYCLE LOG`` must be backed by composer support on the delta-resume
+        path — features/F-006/spec.md § Constraints requires fresh
+        re-injection on every resume, including the steady-state delta
+        retry."""
+        f, u = feat_and_unit
+        out = compose_reviewer_delta_task(
+            feature=f,
+            unit=u,
+            pr_number=42,
+            prior_sha="aaaa",
+            current_sha="bbbb",
+            prior_findings="x",
+            fix_summary="y",
+            feature_spec_text="# F-001\n\n## Acceptance\n- supports refresh",
+        )
+        assert "## FEATURE SPEC" in out
+        assert "supports refresh" in out
+
+    def test_renders_predecessor_units_block_when_provided(self, feat_and_unit):
+        f, u = feat_and_unit
+        out = compose_reviewer_delta_task(
+            feature=f,
+            unit=u,
+            pr_number=42,
+            prior_sha="aaaa",
+            current_sha="bbbb",
+            prior_findings="x",
+            fix_summary="y",
+            predecessor_logs=[("F-001-U-0", "Picked validator Y.")],
+        )
+        assert "## PREDECESSOR UNITS" in out
+        assert "F-001-U-0" in out
+        assert "validator Y" in out
+
+    def test_renders_own_cycle_log_block_when_provided(self, feat_and_unit):
+        f, u = feat_and_unit
+        out = compose_reviewer_delta_task(
+            feature=f,
+            unit=u,
+            pr_number=42,
+            prior_sha="aaaa",
+            current_sha="bbbb",
+            prior_findings="x",
+            fix_summary="y",
+            own_cycle_log="# F-001-U-1\n\n### Cycle 1 — reviewer: REVIEW_REQUEST_CHANGES",
+        )
+        assert "## THIS UNIT'S CYCLE LOG" in out
+        assert "Cycle 1" in out
+
+    def test_omits_context_blocks_when_kwargs_empty(self, feat_and_unit):
+        """Pre-F-006 call sites pass no context kwargs and must see the
+        original message unchanged — no stray block headers."""
+        f, u = feat_and_unit
+        out = compose_reviewer_delta_task(
+            feature=f,
+            unit=u,
+            pr_number=42,
+            prior_sha="a",
+            current_sha="b",
+            prior_findings="x",
+            fix_summary="y",
+        )
+        assert "## FEATURE SPEC" not in out
+        assert "## PREDECESSOR UNITS" not in out
+        assert "## THIS UNIT'S CYCLE LOG" not in out
+
 
 # =============================================================================
 # _resume_reviewer_for_delta — behaviours not covered by the coder's suite

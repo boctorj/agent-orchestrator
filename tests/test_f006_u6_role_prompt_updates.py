@@ -321,13 +321,13 @@ class TestCoderWorkflowStillIntegral:
     def test_workflow_step_count_grew_to_accommodate_spec_step(self, coder_prompt):
         """The unit description says coder reads spec FIRST — implementing
         that necessarily adds at least one step to the workflow (the
-        old prompt was 10 steps; adding the spec-read step makes it
-        ≥ 11). Allow ≥ 11 to leave headroom for future additions."""
+        old prompt was 11 steps; adding the spec-read step makes it
+        ≥ 12). Allow ≥ 12 to leave headroom for future additions."""
         workflow, _, _ = coder_prompt.partition("## When resumed with feedback")
         count = len(re.findall(r"^\d+\. ", workflow, re.MULTILINE))
-        assert count >= 11, (
+        assert count >= 12, (
             f"F-006-U-6 should have added a 'read spec FIRST' step but "
-            f"workflow has only {count} steps (was 10 before this unit)"
+            f"workflow has only {count} steps (was 11 before this unit)"
         )
 
 
