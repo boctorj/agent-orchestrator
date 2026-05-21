@@ -26,12 +26,15 @@ chats with you from mobile (via Claude Code Remote Control) or laptop.
 > [`README.md` § "Choosing a worker backend"](README.md#choosing-a-worker-backend)
 > and [`docs/PROPOSAL-docker-workers.md`](docs/PROPOSAL-docker-workers.md).
 
-## Current stage: 6 — polish (parallel exec, cost telemetry, restart resilience)
+## Current capabilities (Stages 1-8 complete)
 
 You can plan features, approve them, spawn coders to open PRs, spawn
 testers to write+run tests, spawn reviewers to review, and let the
 orchestrator drive the full fix loop with a cap of **3 cycles** before
-escalating to the user.
+escalating to the user. Stage 6 added parallel execution, cost
+telemetry, and restart resilience; Stage 7 added cross-feature
+scheduling and the in-chat dashboard; Stage 8 added the `verify_repo`
+gate that refuses to spawn against repos without branch protection.
 
 ### Available MCP tools
 
@@ -57,10 +60,14 @@ escalating to the user.
   BLOCKS minutes. Use `source='ci'` when forwarding a CI failure manually.
 - `cycle_review(feature_id, unit_id)` — **one-call automation:** wait CI →
   tester → fix-loop → wait CI → **request GitHub Copilot review + wait** →
-  reviewer → fix-loop → wait CI → terminal. Cap = 3 shared cycles
-  (counts tester-bug fixes, reviewer-change fixes, AND CI-fail fixes).
-  BLOCKS for **5-20+ minutes** plus up to 5 min waiting for Copilot.
-  Use this for the normal post-spawn path.
+  reviewer → fix-loop → wait CI → (if the feature row's
+  `ultrareview_enabled=1`) **ultrareview gate** → terminal. Cap = 3
+  shared cycles (counts tester-bug fixes, reviewer-change fixes, AND
+  CI-fail fixes). BLOCKS for **5-20+ minutes** plus up to 5 min waiting
+  for Copilot, plus a few minutes for ultrareview when enabled. Use
+  this for the normal post-spawn path. The ultrareview gate (F-007)
+  invokes the `/ultrareview` skill on the PASS path; a failed audit
+  escalates the unit.
 
   **CI-green gate at every hand-off:** the orchestrator waits for CI
   to settle (success-only conclusion on every check_run) before each
@@ -114,6 +121,14 @@ escalating to the user.
 - `unit_cost(unit_id)` — approximate $ cost for one unit (session-hour
   estimate from event timestamps; tokens not included).
 - `feature_cost(feature_id)` — aggregated across all units of a feature.
+
+**Feature memory (F-006):**
+- `feature_memory(feature_id)` — returns a digest of the feature's
+  `features/F-XXX/spec.md` plus per-unit cycle-log highlights. Call
+  when you need to recall what a feature is about, what units have
+  shipped, and what's still in flight — especially after a fresh
+  conversation start when your in-context memory is thin. Strictly
+  read-only.
 
   Include `feature_cost` output when the user asks "what did this cost?"
   or in a final summary after a feature ships. Don't proactively spam

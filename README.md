@@ -13,13 +13,16 @@ non-trivial changes.
 workflow, repo layout, quality gates, and commit conventions for changes
 to this repo.
 
-## Status: v1 complete (Stages 1-5)
+## Status: v1 complete (Stages 1-8)
 
 The orchestrator can take a feature description, break it into a work-unit
 DAG with the user's approval, spawn coder/tester/reviewer Managed Agents
 per unit, run an automated fix loop (cap = 3 cycles), open PRs, post bug
 findings as PR comments, escalate to your phone via ntfy.sh when needed,
-and schedule next-ready units as merges complete.
+and schedule next-ready units as merges complete. Stage 6 added parallel
+execution, cost telemetry, and restart resilience; Stage 7 added
+cross-feature scheduling; Stage 8 added the `verify_repo` gate that
+refuses to spawn against repos without branch protection.
 
 You merge PRs. Everything else is automated.
 
@@ -66,6 +69,7 @@ The `orchestrator init` wizard prompts for:
 | `orchestrator doctor` | Health check — 10 checks across env, tokens, claude CLI, package |
 | `orchestrator run` | Launches Claude Code with `--remote-control` and clean env |
 | `orchestrator dashboard` | Live TUI dashboard (~2s refresh, Ctrl+C to quit) |
+| `orchestrator verify-repo <url>` | Run + cache the branch-protection / approvals / no-bypass policy check for a target repo (24h TTL); required before any spawn |
 | `orchestrator version` | Print installed version |
 
 
@@ -380,8 +384,9 @@ If Docker isn't reachable, the autouse fixture skips cleanly even with
 
 Coder/tester/reviewer containers run with **`limited` outbound networking**
 — they can only reach the hosts in `ALLOWED_NETWORK_HOSTS`
-(`orchestrator/agents.py`), plus public package registries (PyPI, npm, etc.)
-via the `allow_package_managers: True` flag.
+(defined in `orchestrator/workers/managed_agent.py`; re-exported via the
+`orchestrator/agents.py` back-compat shim), plus public package
+registries (PyPI, npm, etc.) via the `allow_package_managers: True` flag.
 
 This is defense against:
 - Token exfiltration if the agent goes rogue or runs poisoned dep code
@@ -402,9 +407,11 @@ ALLOWED_NETWORK_HOSTS = [
 ```
 
 **To add hosts** (e.g. your org's private package registry, internal docs):
-edit `ALLOWED_NETWORK_HOSTS` in `orchestrator/agents.py`. The change auto-
-invalidates the cache (resource signature includes env_config), so the
-next spawn creates a fresh environment with the new allowlist.
+edit `ALLOWED_NETWORK_HOSTS` in `orchestrator/workers/managed_agent.py`.
+This change does **not** auto-invalidate the cache: the resource signature
+does not include env/network config, so existing cached environments keep
+the old allowlist until you reset cached resources (for example,
+`./scripts/reset_cache.sh` or `reset_cached_resources`) and spawn again.
 
 **If an agent reports a network failure** (curl/git/pip hanging or 403),
 check whether the URL is in the allowlist. The agent will silently fail
@@ -419,8 +426,9 @@ re-creating them on every spawn. Cache key = sha256 of `role + prompt + model`.
 
 1. **Prompt edit** — editing `coder.md` / `tester.md` / `reviewer.md` changes
    the signature → next spawn creates a fresh agent with the new prompt.
-2. **Model change** — bumping `DEFAULT_MODEL` in `agents.py` changes the
-   signature → next spawn uses the new model.
+2. **Model change** — bumping `DEFAULT_MODEL` in
+   `orchestrator/workers/managed_agent.py` changes the signature → next
+   spawn uses the new model.
 3. **TTL (time-based)** — cached entries older than `MAX_CACHE_AGE_DAYS`
    (default 30) are treated as cache misses on lookup. This lets Anthropic's
    underlying improvements roll in over time without manual refreshes.
@@ -513,6 +521,12 @@ Coder / Tester / Reviewer sessions (gVisor sandboxes on Anthropic infra)
 GitHub (your repo)
 ```
 
-The `Worker` protocol in `orchestrator/agents.py` is a portability seam —
-v1 is `ManagedAgentWorker`, future impls (local executor, Modal, E2B,
-non-Claude models) plug in without touching the lead or state machine.
+The `Worker` protocol in `orchestrator/workers/base.py` is a portability
+seam — today's impls are `ManagedAgentWorker`
+(`orchestrator/workers/managed_agent.py`) and `DockerClaudeCodeWorker`
+(`orchestrator/workers/docker_claude_code.py`), selected at spawn time
+by `make_worker(role)` (`orchestrator/workers/__init__.py`) keyed by
+`ORCH_WORKER_BACKEND`. Future impls (Modal, E2B, non-Claude models) plug
+in without touching the lead or state machine. The historical
+`orchestrator/agents.py` module is a back-compat shim that re-exports
+these symbols.

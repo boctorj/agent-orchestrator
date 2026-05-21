@@ -151,7 +151,7 @@ This separation means:
   cent on Anthropic compute. 289 tests pass in 5 seconds against fake workers.
 - A compromised worker can't escalate to the orchestrator process; the only
   channel back is the agent's text response, which is parsed for known markers.
-- The lead's tool surface is finite (23 MCP tools, all human-readable JSON
+- The lead's tool surface is finite (33 MCP tools, all human-readable JSON
   contracts). It can't "improvise" a new operation.
 
 ---
@@ -234,7 +234,25 @@ orchestrator/
 │                                (5 panels: features / in flight /
 │                                awaiting merge / escalated / events)
 ├── cli.py                       Click CLI: init, doctor, run, dashboard,
-│                                version
+│                                version, verify-repo
+├── ci_wait.py                   CI check_runs polling helper — the
+│                                green-gate between cycle_review phases
+├── repo_verify.py               Branch-protection / approvals / no-bypass
+│                                policy; populates verified_repos cache
+├── feature_spec.py              features/F-XXX/spec.md template +
+│                                idempotent write_spec_if_missing
+├── feature_memory.py            feature_memory(feature_id) MCP tool —
+│                                spec + cycle-log digest (F-006-U-5)
+├── cycle_log.py                 features/F-XXX/U-N.md atomic writer
+│                                (F-006-U-2)
+├── cycle_log_gh.py              Cycle-log GitHub helpers (PR body
+│                                backfill, post-merge SHA capture)
+├── cycle_log_render.py          Cycle-log markdown renderer (pure)
+├── blocked_hints.py             BLOCKED-marker → operator hint mapping
+├── blocked_reasons.py           BLOCKED-reason classification
+├── ultrareview.py               /ultrareview gate invocation primitive
+│                                (F-007); cycle_review calls when the
+│                                feature's ultrareview_enabled=1
 ├── tools/                       MCP tool subpackage — see below
 │   ├── __init__.py              FastMCP instance, marker regexes
 │   │                            (PR_URL_RE, BLOCKED_RE, etc.),
@@ -250,13 +268,15 @@ orchestrator/
 │   ├── scheduling.py            4 tools: next_ready_units,
 │   │                            next_ready_units_all, parallel_units,
 │   │                            parallel_units_global (thread-pool based)
-│   ├── observability.py         7 tools: get_unit_status, list_units,
+│   ├── observability.py         8 tools: get_unit_status, list_units,
 │   │                            unit_history, unit_summary, unit_cost,
-│   │                            feature_cost, show_dashboard
-│   └── ops.py                   9 tools: hello_world_test, check_unit_pr,
+│   │                            feature_cost, feature_memory,
+│   │                            show_dashboard
+│   └── ops.py                   10 tools: hello_world_test, check_unit_pr,
 │                                reconcile_unit_pr, list_in_flight,
-│                                resume_unit, reset_cached_resources,
-│                                verify_repo, list_verified_repos, forget_repo
+│                                resume_unit, tail_worker,
+│                                reset_cached_resources, verify_repo,
+│                                list_verified_repos, forget_repo
 └── prompts/
     ├── coder.md                 system prompt for coder Managed Agent
     ├── tester.md                system prompt for tester Managed Agent
@@ -275,7 +295,9 @@ pyproject.toml                   Package metadata + ruff + mypy + bandit +
                                  pytest + coverage configs
 ```
 
-**Total: 31 MCP tools across 5 modules; 17 Python modules; ~3000 LOC.**
+**Total: dozens of MCP tools across multiple modules, with additional
+structure under `orchestrator/` including subpackages such as `tools/`,
+`workers/`, and `network/`; ~3500 LOC.**
 
 ---
 
@@ -301,7 +323,7 @@ pyproject.toml                   Package metadata + ruff + mypy + bandit +
                     │───────────────────│         │───────────────────│
                     │ feature_id  FK PK │ ◄──┐    │ unit_id     PK    │
                     │ units_json        │    │    │ feature_id  FK    │
-                    │   (WorkUnit list) │    │    │ status            │ ◄── 9 states
+                    │   (WorkUnit list) │    │    │ status            │ ◄── 10 states
                     │ status            │    │    │ branch            │
                     │   'draft'|        │    │    │ pr_number         │
                     │   'approved'      │    │    │ coder_session_id  │
@@ -415,11 +437,25 @@ Schema reference for both: [`docs/SPEC-FORMAT.md`](SPEC-FORMAT.md).
        │           │  REVIEW_COMMENT or REVIEW_REQUEST_CHANGES
        └───────────┤  (changes: increment review_round, fix, retry)
                    │
-                   │  human merges on github.com + reconcile_unit_pr called
+                   │  (optional) _ultrareview_phase — only if the
+                   │  feature row's ultrareview_enabled=1 (F-007)
                    ▼
-              ┌─────────┐
-              │  done   │   (terminal success)
-              └─────────┘
+              ┌────────────────────────────┐
+              │ approved_awaiting_merge    │  (reviewer endorsed;
+              │                            │   ntfy push fires;
+              │                            │   awaits human merge)
+              └─────────────┬──────────────┘
+                            │  human merges on github.com +
+                            │  reconcile_unit_pr called
+                            ▼
+                       ┌─────────┐
+                       │  done   │   (terminal success)
+                       └─────────┘
+
+Two transient states — `opening_pr` (briefly while the coder is creating
+the PR) and `fixing` (during a coder resume in the address_review loop)
+— are not drawn but are valid `UnitStatus` values listed in
+`ACTIVE_UNIT_STATUSES` in `orchestrator/models.py`.
 
 ANY active state can transition to:
               ┌──────────┐
@@ -428,7 +464,12 @@ ANY active state can transition to:
 ```
 
 Where `cycle_review` runs `_tester_phase()` then `_copilot_phase()` then
-`_reviewer_phase()` as nested loops with `CAP_3 = 3` total fix cycles.
+`_reviewer_phase()` then (when the feature row's
+`ultrareview_enabled=1`) `_ultrareview_phase()` as nested loops with
+`CAP_3 = 3` total fix cycles. The ultrareview phase is the F-007 gate:
+it invokes the `/ultrareview` skill against the PR on the PASS path
+and escalates on a failed audit; it is a no-op on features that haven't
+opted in.
 
 ---
 
