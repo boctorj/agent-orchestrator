@@ -42,10 +42,12 @@ rules.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol, runtime_checkable
 
+from orchestrator.ci_wait import FAILURE_CONCLUSIONS, PASSING_CONCLUSIONS
 from orchestrator.models import (
     ACTIVE_UNIT_STATUSES,
     TERMINAL_UNIT_STATUSES,
@@ -246,6 +248,33 @@ class HealthReport:
 # --------------------------- decisions ---------------------------
 
 
+class _FrozenDict(dict):
+    """Read-only ``dict`` subclass — preserves ``isinstance(x, dict)`` for
+    callers while blocking the mutation paths that would defeat
+    :class:`Action` / :class:`ShadowDecision`'s snapshot contract.
+
+    ``frozen=True`` on the surrounding dataclass only blocks field
+    reassignment; without this wrapper the underlying dict is still
+    mutable in place (``a.payload["x"] = "y"`` would silently corrupt
+    the snapshot). Subclassing ``dict`` rather than wrapping in
+    ``MappingProxyType`` keeps the test contract that
+    ``trigger_inputs`` / ``payload`` is-a ``dict``.
+    """
+
+    __slots__ = ()
+
+    def _readonly(self, *args: Any, **kwargs: Any) -> Any:  # noqa: ARG002
+        raise TypeError("Action.payload / ShadowDecision.trigger_inputs are read-only")
+
+    __setitem__ = _readonly
+    __delitem__ = _readonly
+    pop = _readonly
+    popitem = _readonly
+    clear = _readonly
+    update = _readonly
+    setdefault = _readonly
+
+
 @dataclass(frozen=True)
 class Action:
     """One declarative thing the MCP executor should do.
@@ -263,7 +292,11 @@ class Action:
       args.
 
     The dataclass is frozen so tests can compare actions by value and
-    snapshot decisions diff cleanly.
+    snapshot decisions diff cleanly. ``payload`` is wrapped in
+    :class:`_FrozenDict` post-init to make the immutability the
+    docstring promises actually enforced — mutating
+    ``action.payload["x"]`` raises rather than silently corrupting a
+    snapshot.
     """
 
     kind: str
@@ -275,7 +308,15 @@ class Action:
     details: str = ""
     set_last_error: str = ""
     side_effect: str = ""
-    payload: dict[str, Any] = field(default_factory=dict)
+    payload: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # ``frozen=True`` blocks field reassignment but does not freeze
+        # the underlying dict — wrap in :class:`_FrozenDict` so the
+        # snapshot contract is enforced (mutating ``payload`` raises
+        # ``TypeError`` rather than silently corrupting an Action).
+        if not isinstance(self.payload, _FrozenDict):
+            object.__setattr__(self, "payload", _FrozenDict(self.payload))
 
 
 @dataclass(frozen=True)
@@ -290,8 +331,14 @@ class ShadowDecision:
 
     rule_name: str
     predicted_action: Action
-    trigger_inputs: dict[str, Any]
+    trigger_inputs: Mapping[str, Any]
     rationale: str
+
+    def __post_init__(self) -> None:
+        # Same rationale as :meth:`Action.__post_init__` — ``trigger_inputs``
+        # is part of the snapshot contract and must not mutate post-creation.
+        if not isinstance(self.trigger_inputs, _FrozenDict):
+            object.__setattr__(self, "trigger_inputs", _FrozenDict(self.trigger_inputs))
 
 
 @dataclass(frozen=True)
@@ -355,8 +402,12 @@ def _ci_snapshot(check_runs: list[dict], required: list[str]) -> CISnapshot:
         )
         for r in check_runs
     ]
+    # Conclusion taxonomy is shared with ``ci_wait``: ``skipped`` /
+    # ``neutral`` pass; ``cancelled`` / ``timed_out`` / ``action_required`` /
+    # ``stale`` fail alongside ``failure``. Reusing the canonical sets
+    # avoids divergent drift/shadow rules across the two modules.
     pending = [r.name for r in runs if (r.conclusion is None and r.status != "completed")]
-    failing = [r.name for r in runs if r.conclusion == "failure"]
+    failing = [r.name for r in runs if r.conclusion in FAILURE_CONCLUSIONS]
     actual_names = {r.name for r in runs}
     missing_required = [name for name in required if name not in actual_names]
     return CISnapshot(
@@ -533,15 +584,18 @@ def _merged_pr(report: HealthReport) -> bool:
 
 
 def _ci_is_green(ci: CISnapshot) -> bool:
-    """All known runs report ``success`` and no run is pending.
+    """All known runs report a passing conclusion and no run is pending.
 
     A repo with zero check_runs is treated as green — matches
     ``ci_wait``'s "no-CI repos pass through" gate. Pending runs hold
-    the gate closed (CI hasn't settled yet).
+    the gate closed (CI hasn't settled yet). Passing conclusions are
+    the canonical ``PASSING_CONCLUSIONS`` set (``success`` /
+    ``skipped`` / ``neutral``) so this module's drift / shadow rules
+    stay aligned with ``ci_wait``'s wait-loop semantics.
     """
     if ci.pending:
         return False
-    return all(r.conclusion == "success" for r in ci.runs)
+    return all(r.conclusion in PASSING_CONCLUSIONS for r in ci.runs)
 
 
 def _ci_has_failure(ci: CISnapshot) -> bool:
@@ -623,17 +677,29 @@ def _merge_transitions(local_state: WorkUnitState, report: HealthReport) -> list
             )
         )
 
-    # Cycle-log writer runs on every merged observation that carries a
-    # populated ``merge_commit_sha`` — covers both the status-flipping
-    # transition and the idempotent re-render on a subsequent poll
-    # after ``status='done'``. Skipped when SHA isn't there yet.
-    if report.pr.merge_commit_sha:
+    # Cycle-log writer runs on the same cells ``ops.reconcile_unit_pr``
+    # writes from: the three status-flipping transitions
+    # (``merged-from-{in_ci, approved_awaiting_merge, escalated}``) and
+    # the idempotent re-render after ``status='done'`` for the
+    # null→populated SHA backfill race. ``merged + active-role`` (which
+    # emits ``reconcile_refused``) and ``merged + pending`` are
+    # deliberately excluded — ``ops.py`` doesn't write the log on those
+    # cells either, and finalising a log from an in-flight unit_events
+    # tail would capture a partial cycle. Skipped when SHA isn't there
+    # yet (race after merge — a later poll catches up).
+    log_writable_statuses = {"in_ci", "approved_awaiting_merge", "escalated", "done"}
+    if status in log_writable_statuses and report.pr.merge_commit_sha:
+        backfill_msg = f"cycle-log: backfill merge SHA for {local_state.unit_id}"
         actions.append(
             Action(
                 kind="side_effect",
                 side_effect="write_cycle_log",
                 summary=f"finalize cycle log for {local_state.unit_id}",
-                payload={"merge_commit_sha": report.pr.merge_commit_sha},
+                payload={
+                    "unit_id": local_state.unit_id,
+                    "merge_commit_sha": report.pr.merge_commit_sha,
+                    "commit_message": backfill_msg,
+                },
             )
         )
 
@@ -799,12 +865,12 @@ def _shadow_dead_worker_during_active_status(
             "terminated_roles": [w.role for w in terminated],
         },
         rationale=(
-            "An active-role unit (coding/testing/reviewing/fixing/in_ci) is paired with "
-            "a terminated worker session — the agent died on Anthropic's side but the "
-            "orchestrator hasn't observed it yet. Restart-recovery flow (resume_unit + "
-            "tail_worker) already triages this manually; the shadow rule would automate "
-            "the escalation. Held in shadow until we've confirmed the false-positive "
-            "rate (terminated-but-finished sessions) is low enough to act on."
+            "An active-role unit (coding/testing/opening_pr/in_ci/reviewing/fixing) "
+            "is paired with a terminated worker session — the agent died on Anthropic's "
+            "side but the orchestrator hasn't observed it yet. Restart-recovery flow "
+            "(resume_unit + tail_worker) already triages this manually; the shadow rule "
+            "would automate the escalation. Held in shadow until we've confirmed the "
+            "false-positive rate (terminated-but-finished sessions) is low enough to act on."
         ),
     )
 

@@ -296,6 +296,44 @@ class TestProbeUnitHealthCI:
         assert report.ci.required == []
         assert report.ci.missing_required == []
 
+    def test_skipped_and_neutral_conclusions_count_as_passing(self):
+        # Matches ``ci_wait.PASSING_CONCLUSIONS`` — ``skipped`` covers
+        # path-filtered checks GitHub never ran; ``neutral`` covers
+        # decided-not-to-fail outcomes.
+        gh = FakeGH(
+            pr=_pr(),
+            check_runs=[
+                _run("lint", "success"),
+                _run("typecheck", "skipped"),
+                _run("docs", "neutral"),
+            ],
+        )
+        report = health.probe_unit_health(
+            "U-1", gh, FakeAnthropic(), local_state=_state(), now=_now()
+        )
+        assert report.ci.failing == []
+        assert report.ci.pending == []
+
+    def test_cancelled_timed_out_action_required_stale_count_as_failing(self):
+        # Matches ``ci_wait.FAILURE_CONCLUSIONS`` — ``cancelled`` /
+        # ``timed_out`` / ``action_required`` / ``stale`` are all
+        # treated as failures alongside the canonical ``failure``.
+        gh = FakeGH(
+            pr=_pr(),
+            check_runs=[
+                _run("a", "cancelled"),
+                _run("b", "timed_out"),
+                _run("c", "action_required"),
+                _run("d", "stale"),
+                _run("e", "failure"),
+            ],
+        )
+        report = health.probe_unit_health(
+            "U-1", gh, FakeAnthropic(), local_state=_state(), now=_now()
+        )
+        assert set(report.ci.failing) == {"a", "b", "c", "d", "e"}
+        assert report.ci.pending == []
+
 
 class TestProbeUnitHealthReviews:
     def test_approval_and_changes_counts(self):
@@ -532,6 +570,41 @@ class TestDecideTransitionsMergedTransitions:
         assert len(side_effects) == 1
         assert side_effects[0].side_effect == "write_cycle_log"
         assert side_effects[0].payload.get("merge_commit_sha") == "abc123"
+        # Payload carries the full call shape so a downstream executor
+        # can splat into ``cycle_log.write_cycle_log`` without an
+        # implicit local_state lookup (matches the ops.py call site at
+        # ``ops.py:246-251``).
+        assert side_effects[0].payload.get("unit_id") == st.unit_id
+        assert (
+            side_effects[0].payload.get("commit_message")
+            == f"cycle-log: backfill merge SHA for {st.unit_id}"
+        )
+
+    def test_cycle_log_side_effect_skipped_on_active_role_refusal(self):
+        # ``merged + active-role`` emits ``reconcile_refused`` and ops.py
+        # does NOT call the cycle-log writer on that cell. Health must
+        # match ops.py — finalising a log from an in-flight unit_events
+        # tail would capture a partial cycle.
+        for status in ("coding", "testing", "opening_pr", "reviewing", "fixing"):
+            st, rep = _report(
+                status=status,
+                pr=_pr(state_="closed", merged=True, merge_commit_sha="abc123"),
+            )
+            decision = health.decide_transitions(st, rep)
+            side_effects = [a for a in decision.actions_to_apply if a.kind == "side_effect"]
+            assert side_effects == [], f"unexpected cycle-log side_effect for status {status!r}"
+
+    def test_cycle_log_side_effect_skipped_on_pending(self):
+        # ``merged + pending`` falls through ops.reconcile_unit_pr's
+        # action table (no merged-from-*, no no-op-already-done) so the
+        # writer doesn't fire there either.
+        st, rep = _report(
+            status="pending",
+            pr=_pr(state_="closed", merged=True, merge_commit_sha="abc123"),
+        )
+        decision = health.decide_transitions(st, rep)
+        side_effects = [a for a in decision.actions_to_apply if a.kind == "side_effect"]
+        assert side_effects == []
 
     def test_merged_with_missing_merge_commit_sha_no_cycle_log_side_effect(self):
         # GitHub races merge_commit_sha population — first poll right after
@@ -1087,6 +1160,30 @@ class TestDecisionShape:
         assert shadow.predicted_action is action
         assert shadow.trigger_inputs == {"foo": 1}
         assert shadow.rationale == "example"
+
+    def test_action_payload_is_read_only(self):
+        # ``frozen=True`` blocks field reassignment but the underlying
+        # dict was previously mutable — defeating the snapshot contract
+        # the module docstring promises. ``_FrozenDict`` enforces it.
+        action = health.Action(kind="event", event_type="x", payload={"a": 1})
+        with pytest.raises(TypeError):
+            action.payload["b"] = 2  # type: ignore[index]
+        with pytest.raises(TypeError):
+            del action.payload["a"]  # type: ignore[attr-defined]
+        # ``isinstance(payload, dict)`` is preserved — the tester-set
+        # contract continues to hold.
+        assert isinstance(action.payload, dict)
+
+    def test_shadow_decision_trigger_inputs_is_read_only(self):
+        shadow = health.ShadowDecision(
+            rule_name="r",
+            predicted_action=health.Action(kind="event"),
+            trigger_inputs={"k": "v"},
+            rationale="why",
+        )
+        with pytest.raises(TypeError):
+            shadow.trigger_inputs["k"] = "other"  # type: ignore[index]
+        assert isinstance(shadow.trigger_inputs, dict)
 
     def test_empty_report_yields_empty_decision(self):
         # Defensive: a unit with no PR and no signals should produce no
