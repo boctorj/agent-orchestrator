@@ -25,7 +25,7 @@ import json
 
 import pytest
 
-from orchestrator import state
+from orchestrator import cycle_log, state
 from orchestrator.ci_wait import CIWaitResult
 from orchestrator.models import Feature, WorkUnit, WorkUnitState
 from orchestrator.tools import CAP_3, compose_fix_task, execution
@@ -527,3 +527,44 @@ class TestUltrareviewFixCycleEvents:
         # Two FAILs → two fix iterations → cycle numbers 1, 2.
         ns = sorted(int(e["event_type"].rsplit("_", 1)[-1]) for e in fix_cycles)
         assert ns == [1, 2], f"expected cycles [1, 2]; got {ns}"
+
+    def test_fix_cycle_event_renders_in_cycle_log_markdown(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """The docstring on ``_ultrareview_phase`` names two consumers for
+        ``ultrareview_fix_cycle_N``: cost-attribution + cycle-log. The
+        earlier test pins the cost-attribution half (event in
+        ``state.list_events``); this one pins the cycle-log half by
+        rendering the markdown and checking the heading + summary land.
+
+        Without this, the renderer can silently drop the event (U-3's H1
+        pattern recurring for the new event type) and the
+        ``state.list_events`` assertion in the sibling test still passes —
+        cleanly slipping the regression through coverage. The recurrence
+        on PR #51 cycle 0 (H1 finding from boctorj) is the reason this
+        test exists.
+        """
+        _seed_endorsing_unit()
+        _endorse_phases(monkeypatch)
+        _stub_github(monkeypatch)
+        _stub_address_review_fix_pushed(monkeypatch)
+        _stub_ultrareview_sequence(monkeypatch, [(False, ["leak"]), (True, [])])
+
+        # Patch parse_repo_url on the cycle_log renderer's import path too —
+        # render_cycle_log goes through it for the PR URL line.
+        monkeypatch.setattr(
+            "orchestrator.cycle_log_render.parse_repo_url",
+            lambda url: ("owner", "repo"),
+        )
+
+        execution.cycle_review("F-001", "F-001-U-1")
+
+        md = cycle_log.render_cycle_log("F-001-U-1", pr_info={}, review_threads=[])
+        assert "ultrareview: fix cycle 1" in md, (
+            "ultrareview_fix_cycle_1 must render as a cycle-history heading — "
+            "without it, the committed log silently drops the audit trail "
+            "(the U-3 H1 pattern, recurring for the new event type)"
+        )
+        # Summary text must reach the rendered markdown too (not just the
+        # heading) so a reader sees how many findings the cycle addressed.
+        assert "coder fix cycle 1 for 1 ultrareview finding(s)" in md

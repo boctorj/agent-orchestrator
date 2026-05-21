@@ -70,6 +70,31 @@ _EVENT_HEADINGS: dict[str, str] = {
     "ultrareview_failed": "ultrareview: FAILED",
 }
 
+# F-007-U-4 fix-loop events carry the cycle number in the type suffix
+# (``ultrareview_fix_cycle_1``, ``_2``, ...) so they can't live in the static
+# ``_EVENT_HEADINGS`` table. The renderer routes through ``_heading_for``
+# instead of a direct ``_EVENT_HEADINGS.get`` so the dynamic prefix is
+# resolved alongside the static keys — without this, the U-3 H1 pattern
+# (events recorded but dropped by the renderer) silently recurs for every
+# ultrareview-driven fix cycle.
+_ULTRAREVIEW_FIX_CYCLE_PREFIX = "ultrareview_fix_cycle_"
+
+
+def _heading_for(event_type: str) -> str | None:
+    """Resolve the cycle-history heading for ``event_type``, or ``None`` to skip.
+
+    Handles both the static ``_EVENT_HEADINGS`` map and the dynamic
+    ``ultrareview_fix_cycle_N`` family introduced in F-007-U-4 (where ``N``
+    is the shared CAP_3 cycle number address_review writes for the coder
+    resume). Routing both lookups through one function keeps the renderer's
+    loop a single line — and ensures any future dynamic-suffix event type
+    only needs to extend this helper, not every call site.
+    """
+    if event_type.startswith(_ULTRAREVIEW_FIX_CYCLE_PREFIX):
+        n = event_type[len(_ULTRAREVIEW_FIX_CYCLE_PREFIX) :]
+        return f"ultrareview: fix cycle {n}"
+    return _EVENT_HEADINGS.get(event_type)
+
 
 _REVIEW_TIER_PREFIX = ("🔴", "🟠", "🟡", "🔵")
 
@@ -133,7 +158,7 @@ def _render_cycle_history(
 ) -> list[str]:
     rendered: list[dict[str, Any]] = []
     for ev in events:
-        heading = _EVENT_HEADINGS.get(ev["event_type"])
+        heading = _heading_for(ev["event_type"])
         if heading is None:
             continue
         rendered.append(

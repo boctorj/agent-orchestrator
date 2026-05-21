@@ -2166,16 +2166,26 @@ def _format_ultrareview_pr_comment(findings: list[str], cycle: int) -> str:
     findings themselves are user-visible (someone deciding whether to merge
     needs to see what the third reviewer caught).
 
+    The ``cycle`` number is the *shared* CAP_3 counter (tester-bug +
+    reviewer-change + CI-fail + ultrareview cycles all share it). The
+    header renders it as ``overall fix cycle N/CAP_3`` so a human reading
+    the PR conversation doesn't have to know about the shared-cap
+    semantics to interpret the number — a comment that just said
+    ``fix cycle 3`` after two unrelated tester-bug fixes would read as
+    "the third ultrareview attempt" when it's actually the first.
+
     Bulleted rather than newline-joined so a long findings list renders as
     discrete items in GitHub's markdown — easier to read than a single blob.
     """
     header = (
-        f"🔍 **Ultrareview meta-audit — fix cycle {cycle}, "
+        f"🔍 **Ultrareview meta-audit — overall fix cycle {cycle}/{CAP_3}, "
         f"{len(findings)} finding(s)**\n\n"
         f"Our reviewer endorsed via `REVIEW_RECOMMEND_MERGE`, but the "
         f"optional `/ultrareview` gate caught the following final-mile "
         f"issues. The coder is addressing them now — fix without scope creep, "
         f"no broader refactor.\n\n"
+        f"_Cycle number above is the shared CAP_{CAP_3} budget across "
+        f"tester-bug, reviewer-change, CI-fix, and ultrareview cycles._\n\n"
     )
     bullets = "\n".join(f"- {f}" for f in findings) if findings else "- (no findings reported)"
     return header + bullets

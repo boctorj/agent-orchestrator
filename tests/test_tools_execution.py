@@ -1407,16 +1407,24 @@ class TestCycleReviewUltrareviewGate:
         out = execution.cycle_review("F-001", "F-001-U-1")
         parsed = json.loads(out)
         assert parsed["outcome"] == "escalated"
+        # Source attribution must survive the escalation message — preserved
+        # from the U-3 baseline. A refactor that swaps the wording (e.g. to
+        # "meta-audit cap-3 hit") would silently strip ultrareview from the
+        # ntfy push body and the dashboard escalation digest.
+        assert "ultrareview" in parsed["message"].lower()
         # Cap-3 escalation message must surface the unresolved findings so
         # the human reading the ntfy push sees what ultrareview still flagged.
         for f in findings:
             assert f in parsed["message"], "cap-3 escalation must surface findings"
 
-        # ultrareview fired CAP_3+1 times: the initial verdict + one re-run
-        # per fix cycle. The last re-run's FAIL pushes review_round past CAP_3
-        # and exits the loop on the cap check at the top of the next iter.
-        assert len(calls["trigger"]) >= 2, (
-            "fix loop must re-run ultrareview after each coder fix push"
+        # ultrareview fired exactly CAP_3+1 times: the initial verdict + one
+        # re-run per fix cycle (CAP_3 fixes). A weaker `>= 2` assertion would
+        # silently let a regression that runs the loop just once through.
+        from orchestrator.tools import CAP_3
+
+        assert len(calls["trigger"]) == CAP_3 + 1, (
+            f"fix loop must re-run ultrareview once per fix cycle (expected "
+            f"{CAP_3 + 1} trigger calls, got {len(calls['trigger'])})"
         )
 
         events = state.list_events("F-001-U-1")
