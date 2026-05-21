@@ -295,9 +295,9 @@ pyproject.toml                   Package metadata + ruff + mypy + bandit +
                                  pytest + coverage configs
 ```
 
-**Total: 33 MCP tools across 5 modules; 22 top-level modules under
-`orchestrator/` (33 incl. `tools/`, `workers/`, `network/` subpackages);
-~3500 LOC.**
+**Total: dozens of MCP tools across multiple modules, with additional
+structure under `orchestrator/` including subpackages such as `tools/`,
+`workers/`, and `network/`; ~3500 LOC.**
 
 ---
 
