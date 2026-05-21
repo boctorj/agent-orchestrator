@@ -1218,6 +1218,261 @@ class TestCycleReview:
         assert len(calls) == 2, f"expected 2 CI waits on clean run, got {len(calls)}"
 
 
+# --------------------------- ultrareview gate (F-007-U-3) ---------------------------
+
+
+def _enable_ultrareview(feature_id="F-001"):
+    """Flip `ultrareview_enabled` on an already-seeded feature."""
+    feat = state.get_feature(feature_id)
+    feat.ultrareview_enabled = True
+    state.save_feature(feat)
+
+
+def _stub_ultrareview(monkeypatch, *, passed: bool, findings=None):
+    """Patch ultrareview.trigger/wait_for_result to return a canned verdict.
+
+    Tests stub at the orchestrator/tools/execution module's bound name so the
+    real `claude ultrareview` subprocess is never spawned. Records every call
+    so tests can assert on argv shape.
+    """
+    findings = list(findings or [])
+    calls: dict[str, list] = {"trigger": [], "wait": []}
+
+    def fake_trigger(pr_url, **kw):
+        calls["trigger"].append((pr_url, kw))
+
+    def fake_wait(pr_url, **kw):
+        calls["wait"].append((pr_url, kw))
+        return {"passed": passed, "findings": findings}
+
+    monkeypatch.setattr("orchestrator.tools.execution.ultrareview.trigger", fake_trigger)
+    monkeypatch.setattr("orchestrator.tools.execution.ultrareview.wait_for_result", fake_wait)
+    return calls
+
+
+class TestCycleReviewUltrareviewGate:
+    """F-007-U-3 wires `/ultrareview` into `cycle_review` as the terminal pass.
+
+    The gate runs only when ``feature.ultrareview_enabled`` is True and the
+    reviewer endorsed via ``REVIEW_RECOMMEND_MERGE``. On PASS the cycle
+    terminates as ``approved_awaiting_merge`` (today's behaviour); on FAIL
+    this initial impl escalates (the full FAIL fix-loop ships in U-4).
+    """
+
+    def _seed_for_reviewer_recommend(self, monkeypatch):
+        """Common scaffold: reviewer endorses; tester passes; gh helpers no-op."""
+        _seed_coded_unit()
+        monkeypatch.setattr(
+            execution,
+            "spawn_tester",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "TESTS_PASS"}),
+        )
+        monkeypatch.setattr(
+            execution,
+            "spawn_reviewer",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "REVIEW_RECOMMEND_MERGE"}),
+        )
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_ready_to_merge",
+            lambda *a, **k: True,
+        )
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_escalation",
+            lambda *a, **k: True,
+        )
+
+    def test_flag_off_skips_ultrareview_entirely(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """When the flag is False (default), ultrareview is not triggered at all
+        — today's `approved_awaiting_merge` behaviour is preserved.
+        """
+        self._seed_for_reviewer_recommend(monkeypatch)
+        calls = _stub_ultrareview(monkeypatch, passed=True)
+
+        out = execution.cycle_review("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "approved_awaiting_merge"
+        assert calls["trigger"] == [], "ultrareview must not fire when flag is off"
+        assert calls["wait"] == []
+        types = [e["event_type"] for e in state.list_events("F-001-U-1")]
+        assert "ultrareview_started" not in types
+
+    def test_flag_on_passes_terminates_approved(self, tmp_state_db, with_github_token, monkeypatch):
+        """Flag on + ultrareview PASS → `approved_awaiting_merge`, plus
+        ``ultrareview_started`` and ``ultrareview_passed`` events for cost +
+        cycle-log attribution.
+        """
+        self._seed_for_reviewer_recommend(monkeypatch)
+        _enable_ultrareview()
+        calls = _stub_ultrareview(monkeypatch, passed=True)
+
+        out = execution.cycle_review("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "approved_awaiting_merge"
+
+        # Subprocess was actually invoked, keyed by the PR URL.
+        assert len(calls["trigger"]) == 1
+        assert calls["trigger"][0][0] == "https://github.com/owner/repo/pull/5"
+        assert len(calls["wait"]) == 1
+
+        types = [e["event_type"] for e in state.list_events("F-001-U-1")]
+        assert "ultrareview_started" in types
+        assert "ultrareview_passed" in types
+        assert "ultrareview_failed" not in types
+
+    def test_flag_on_fails_escalates_with_findings(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """Flag on + ultrareview FAIL → escalation (initial impl; U-4 adds the
+        fix-loop). ``ultrareview_failed`` event carries the findings list.
+        """
+        self._seed_for_reviewer_recommend(monkeypatch)
+        _enable_ultrareview()
+        findings = ["src/x.py:42 — leaks fd on retry", "src/y.py:7 — off-by-one"]
+        calls = _stub_ultrareview(monkeypatch, passed=False, findings=findings)
+
+        out = execution.cycle_review("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "escalated"
+        assert "ultrareview" in parsed["message"].lower()
+        for f in findings:
+            assert f in parsed["message"], "escalation message must surface findings"
+
+        assert len(calls["trigger"]) == 1
+
+        events = state.list_events("F-001-U-1")
+        types = [e["event_type"] for e in events]
+        assert "ultrareview_started" in types
+        assert "ultrareview_failed" in types
+        assert "ultrareview_passed" not in types
+        failed_evt = next(e for e in events if e["event_type"] == "ultrareview_failed")
+        for f in findings:
+            assert f in failed_evt["details"], "findings must land in event.details"
+
+    def test_review_comment_does_not_trigger_ultrareview(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """Spec says "after reviewer emits REVIEW_RECOMMEND_MERGE". A
+        ``REVIEW_COMMENT`` terminal (comment-only, not an endorsement) must NOT
+        fire the gate — even when the flag is on.
+        """
+        _seed_coded_unit()
+        _enable_ultrareview()
+        monkeypatch.setattr(
+            execution,
+            "spawn_tester",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "TESTS_PASS"}),
+        )
+        monkeypatch.setattr(
+            execution,
+            "spawn_reviewer",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "REVIEW_COMMENT"}),
+        )
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_ready_to_merge",
+            lambda *a, **k: True,
+        )
+        calls = _stub_ultrareview(monkeypatch, passed=True)
+
+        out = execution.cycle_review("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "approved_awaiting_merge"
+        assert calls["trigger"] == [], "ultrareview only runs after REVIEW_RECOMMEND_MERGE"
+
+    def test_ultrareview_wrapper_exception_escalates(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """If the subprocess wrapper raises (CLI missing, parse error, ...),
+        cycle_review escalates rather than crashing or silently endorsing —
+        same fail-closed direction as `_parse_bugs`.
+        """
+        self._seed_for_reviewer_recommend(monkeypatch)
+        _enable_ultrareview()
+
+        def boom(pr_url, **kw):
+            raise RuntimeError("claude CLI not on PATH")
+
+        monkeypatch.setattr("orchestrator.tools.execution.ultrareview.trigger", boom)
+
+        out = execution.cycle_review("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "escalated"
+        types = [e["event_type"] for e in state.list_events("F-001-U-1")]
+        assert "ultrareview_failed" in types
+
+    def test_missing_pr_url_records_failed_event(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """Reviewer M1 regression: the defensive ``pr_url is None`` escape
+        must record an ``ultrareview_failed`` event before returning. Without
+        it the escalation ntfy push lands with no event trail explaining why
+        — every False-return path in ``_ultrareview_phase`` is supposed to
+        be fail-closed *with evidence*.
+        """
+        _seed_coded_unit()
+        _enable_ultrareview()
+        # Wipe the PR number to force ``_pr_url_for`` to return None.
+        s = state.get_unit_state("F-001-U-1")
+        s.pr_number = None
+        state.upsert_unit_state(s)
+
+        ctx = execution.CycleContext(feature_id="F-001", unit_id="F-001-U-1", history=[])
+        passed, msg = execution._ultrareview_phase(ctx)
+
+        assert passed is False
+        assert "no PR URL" in msg
+
+        events = state.list_events("F-001-U-1")
+        types = [e["event_type"] for e in events]
+        assert "ultrareview_failed" in types, (
+            "every False-return path must leave an ultrareview_failed event "
+            "trail (fail-closed with evidence)"
+        )
+        assert "ultrareview_started" not in types, (
+            "the started event fires after the PR-URL check; a missing PR "
+            "means we never reached the trigger"
+        )
+
+    def test_failed_event_details_truncates_per_finding_not_mid_string(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """Reviewer M2 regression: the FAIL-path event ``details`` must keep
+        whole findings up to the budget and append a `(N more findings
+        truncated)` marker, not char-slice the joined blob mid-finding.
+        """
+        self._seed_for_reviewer_recommend(monkeypatch)
+        _enable_ultrareview()
+        # Each finding is 100 chars; 30 of them = 3000+ chars when joined —
+        # well over the 1500-char budget, so truncation must kick in.
+        findings = [f"src/file_{i:03d}.py:42 — " + "x" * 70 for i in range(30)]
+        _stub_ultrareview(monkeypatch, passed=False, findings=findings)
+
+        execution.cycle_review("F-001", "F-001-U-1")
+
+        events = state.list_events("F-001-U-1")
+        failed_evt = next(e for e in events if e["event_type"] == "ultrareview_failed")
+        details = failed_evt["details"]
+
+        # Every line in details must be either a complete finding from the
+        # input or the truncation marker — no partial findings (which would
+        # be the char-slice failure mode).
+        complete_findings = set(findings)
+        for line in details.splitlines():
+            if line.startswith("..."):
+                continue
+            assert line in complete_findings, (
+                f"truncated mid-finding: {line!r} is not a complete finding "
+                "from the input list (char-slice bug regressed)"
+            )
+
+        # And the marker must appear, naming how many were dropped.
+        assert "more findings truncated" in details
+        assert "(no findings reported)" not in details
+
+
 # --------------------------- _resume_reviewer_for_delta (F-012-U-2) ---------------------------
 
 

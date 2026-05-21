@@ -692,7 +692,7 @@ class TestReviewerPhaseWireUp:
         _stub_github(monkeypatch)
 
         ctx = execution.CycleContext(feature_id="F-013", unit_id="F-013-U-2", history=[])
-        approved, msg = execution._reviewer_phase(ctx)
+        approved, msg, _outcome = execution._reviewer_phase(ctx)
         assert approved, (
             f"reviewer phase should pass after REQUEST_CHANGES→FIX_PUSHED→RECOMMEND_MERGE "
             f"retry; got approved={approved}, msg={msg!r}, history={ctx.history}"

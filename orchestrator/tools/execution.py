@@ -1,8 +1,9 @@
 """Execution MCP tools: spawn coder/tester/reviewer, address feedback, run full cycle.
 
-The `cycle_review` orchestration is broken into three private helper functions
-— `_tester_phase`, `_copilot_phase`, `_reviewer_phase` — to keep the main flow
-linear and each phase independently testable.
+The `cycle_review` orchestration is broken into private helper functions —
+`_tester_phase`, `_copilot_phase`, `_reviewer_phase`, and the F-007 opt-in
+`_ultrareview_phase` — to keep the main flow linear and each phase
+independently testable.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from orchestrator import ci_wait, cycle_log, feature_spec, github, ntfy, state
+from orchestrator import ci_wait, cycle_log, feature_spec, github, ntfy, state, ultrareview
 from orchestrator.agents import ManagedAgentWorker
 from orchestrator.blocked_reasons import parse_blocked_marker
 from orchestrator.models import ACTIVE_UNIT_STATUSES, Feature, WorkUnit, WorkUnitState
@@ -1693,19 +1694,24 @@ def _resume_or_spawn_reviewer(feature_id: str, unit_id: str) -> str:
     )
 
 
-def _reviewer_phase(ctx: CycleContext) -> tuple[bool, str | None]:
+def _reviewer_phase(ctx: CycleContext) -> tuple[bool, str | None, str | None]:
     """Run reviewer until approved/recommend-merge/comment or escalation.
 
-    Returns (approved, escalation_msg). Iterates the fix-loop on
-    REVIEW_REQUEST_CHANGES, respecting CAP_3. The *first* reviewer turn is a
-    spawn-or-resume via ``_resume_or_spawn_reviewer`` — a cold-start
-    ``spawn_reviewer`` when no ``reviewer_session_id`` is on the unit, or a
-    cheap verdict re-emission when an orphaned session is present (typical
-    after a previous cycle died on a network timeout; symmetric to the
-    ``_tester_phase`` recovery added in F-013-U-1). Every subsequent retry
-    inside the REVIEW_REQUEST_CHANGES fix-loop is a session resume via
-    ``_resume_reviewer_for_delta`` (F-012-U-2 — avoids re-paying the ~900s
-    clone+inventory on every cycle).
+    Returns ``(approved, escalation_msg, final_outcome)``. ``final_outcome``
+    is the last reviewer marker string (``REVIEW_RECOMMEND_MERGE`` /
+    ``REVIEW_COMMENT`` / ``REVIEW_REQUEST_CHANGES`` / ``BLOCKED…``) so the
+    caller can branch (e.g. ``cycle_review`` fires the ultrareview gate only
+    on ``REVIEW_RECOMMEND_MERGE``).
+
+    Iterates the fix-loop on REVIEW_REQUEST_CHANGES, respecting CAP_3. The
+    *first* reviewer turn is a spawn-or-resume via
+    ``_resume_or_spawn_reviewer`` — a cold-start ``spawn_reviewer`` when no
+    ``reviewer_session_id`` is on the unit, or a cheap verdict re-emission
+    when an orphaned session is present (typical after a previous cycle died
+    on a network timeout; symmetric to the ``_tester_phase`` recovery added
+    in F-013-U-1). Every subsequent retry inside the REVIEW_REQUEST_CHANGES
+    fix-loop is a session resume via ``_resume_reviewer_for_delta``
+    (F-012-U-2 — avoids re-paying the ~900s clone+inventory on every cycle).
 
     Each coder fix push waits for CI green before re-running the reviewer.
     """
@@ -1715,7 +1721,7 @@ def _reviewer_phase(ctx: CycleContext) -> tuple[bool, str | None]:
     outcome = reviewer_out.get("outcome")
 
     if isinstance(outcome, str) and outcome.startswith("BLOCKED"):
-        return False, "reviewer blocked"
+        return False, "reviewer blocked", outcome
 
     while outcome == "REVIEW_REQUEST_CHANGES":
         # Anchor the next delta range on what the reviewer just saw. Done
@@ -1725,7 +1731,7 @@ def _reviewer_phase(ctx: CycleContext) -> tuple[bool, str | None]:
 
         unit_state = state.get_unit_state(ctx.unit_id)
         if unit_state is None or unit_state.review_round >= CAP_3:
-            return False, f"cap of {CAP_3} cycles hit while addressing reviewer"
+            return False, f"cap of {CAP_3} cycles hit while addressing reviewer", outcome
 
         prior_findings = reviewer_out.get("issue", "")
         fix_out = _record_step(
@@ -1734,11 +1740,11 @@ def _reviewer_phase(ctx: CycleContext) -> tuple[bool, str | None]:
             address_review(ctx.unit_id, "reviewer", prior_findings),
         )
         if fix_out.get("outcome") != "FIX_PUSHED":
-            return False, "coder fix (for review) did not succeed"
+            return False, "coder fix (for review) did not succeed", outcome
 
         ok, msg = _wait_ci_with_fix_loop(ctx, "reviewer-changes fix push")
         if not ok:
-            return False, msg
+            return False, msg, outcome
 
         # Per-cycle append (see matching call in _tester_phase).
         _write_cycle_log_safe(ctx.unit_id)
@@ -1752,7 +1758,7 @@ def _reviewer_phase(ctx: CycleContext) -> tuple[bool, str | None]:
         plan = state.get_plan(ctx.feature_id)
         unit = next((u for u in plan.units if u.id == ctx.unit_id), None) if plan else None
         if unit_state is None or feature is None or unit is None:
-            return False, "unit state vanished mid-cycle"
+            return False, "unit state vanished mid-cycle", outcome
 
         reviewer_out = _record_step(
             ctx,
@@ -1768,19 +1774,146 @@ def _reviewer_phase(ctx: CycleContext) -> tuple[bool, str | None]:
         )
         outcome = reviewer_out.get("outcome")
         if isinstance(outcome, str) and outcome.startswith("BLOCKED"):
-            return False, "reviewer blocked on retry"
+            return False, "reviewer blocked on retry", outcome
 
     if outcome in ("REVIEW_COMMENT", "REVIEW_RECOMMEND_MERGE"):
+        return True, None, outcome
+
+    return False, f"reviewer ended with unexpected outcome: {outcome}", outcome
+
+
+def _truncate_findings_for_details(findings: list[str], budget: int = 1500) -> str:
+    """Join ``findings`` newline-separated, keeping whole entries up to ``budget`` chars.
+
+    Char-slicing the joined blob (``"\\n".join(findings)[:budget]``) cuts mid-
+    finding for long lists, leaving event-log readers with a corrupted final
+    entry. Slicing per-finding instead preserves complete entries and appends
+    an explicit ``... (N more findings truncated)`` marker so the cost-
+    attribution / postmortem queries that read ``unit_events.details`` see
+    that the list was capped rather than mistaking the missing items for
+    "ultrareview only found this many".
+    """
+    if not findings:
+        return "(no findings reported)"
+    kept: list[str] = []
+    used = 0
+    for f in findings:
+        # +1 for the newline between this entry and the previous one (only
+        # charged when there's already at least one entry — matches the
+        # char count of "\n".join).
+        sep = 1 if kept else 0
+        if used + sep + len(f) > budget and kept:
+            kept.append(f"... ({len(findings) - len(kept)} more findings truncated)")
+            break
+        kept.append(f)
+        used += sep + len(f)
+    return "\n".join(kept)
+
+
+def _ultrareview_phase(ctx: CycleContext) -> tuple[bool, str | None]:
+    """Fire ``/ultrareview`` as the terminal pre-merge gate (F-007).
+
+    Called only when ``feature.ultrareview_enabled`` is on AND the reviewer
+    endorsed via ``REVIEW_RECOMMEND_MERGE``. Triggers the subprocess wrapper,
+    blocks on the verdict, and surfaces findings on FAIL.
+
+    Returns ``(passed, escalation_msg)``. On PASS the caller terminates as
+    ``approved_awaiting_merge``. On FAIL this initial impl escalates so the
+    user can decide manually — the full FAIL fix-loop (with cap-3
+    accounting and ``address_review(source='ultrareview', ...)``) ships in
+    F-007-U-4.
+
+    Events recorded for cost attribution + cycle-log entries:
+      * ``ultrareview_started`` — always, just before trigger.
+      * ``ultrareview_passed`` — on PASS verdict.
+      * ``ultrareview_failed`` — on every False-return path (verdict FAIL,
+        wrapper exception, defensive missing-PR-URL), with findings (or the
+        exception message) in ``details``. Every escalation has an event
+        trail explaining why.
+
+    Fail-closed on wrapper exceptions: a missing CLI, parse error, or any
+    other ``ultrareview`` raise is treated as a failed gate, never as a
+    silent endorsement.
+    """
+    unit_state = state.get_unit_state(ctx.unit_id)
+    cycle_number = unit_state.review_round if unit_state else 0
+    pr_url = _pr_url_for(ctx.feature_id, unit_state)
+    if pr_url is None:
+        # Defensive: a reviewer that endorsed has a PR, so this branch is
+        # nearly unreachable. Still record an ultrareview_failed event so
+        # every False-return path leaves a telemetry trail — the resulting
+        # escalation should never land in the user's notification with no
+        # event log explaining why.
+        state.record_event(
+            ctx.unit_id,
+            ctx.feature_id,
+            "ultrareview_failed",
+            source="ultrareview",
+            cycle_number=cycle_number,
+            summary="ultrareview gate: no PR URL available",
+        )
+        ctx.history.append({"step": "ultrareview", "outcome": "error", "error": "no PR URL"})
+        return False, "ultrareview gate: no PR URL available"
+
+    state.record_event(
+        ctx.unit_id,
+        ctx.feature_id,
+        "ultrareview_started",
+        source="ultrareview",
+        cycle_number=cycle_number,
+        summary="firing /ultrareview",
+        details=pr_url,
+    )
+    ctx.history.append({"step": "ultrareview_started", "pr_url": pr_url})
+
+    try:
+        ultrareview.trigger(pr_url)
+        result = ultrareview.wait_for_result(pr_url)
+    except Exception as e:  # noqa: BLE001 — fail-closed: any wrapper raise = gate fails
+        state.record_event(
+            ctx.unit_id,
+            ctx.feature_id,
+            "ultrareview_failed",
+            source="ultrareview",
+            cycle_number=cycle_number,
+            summary=f"ultrareview wrapper error: {e}",
+        )
+        ctx.history.append({"step": "ultrareview", "outcome": "error", "error": str(e)})
+        return False, f"ultrareview wrapper error: {e}"
+
+    findings = list(result.get("findings", []))
+    if result.get("passed"):
+        state.record_event(
+            ctx.unit_id,
+            ctx.feature_id,
+            "ultrareview_passed",
+            source="ultrareview",
+            cycle_number=cycle_number,
+            summary="ultrareview passed",
+        )
+        ctx.history.append({"step": "ultrareview", "outcome": "passed"})
         return True, None
 
-    return False, f"reviewer ended with unexpected outcome: {outcome}"
+    findings_text = "\n".join(findings) if findings else "(no findings reported)"
+    state.record_event(
+        ctx.unit_id,
+        ctx.feature_id,
+        "ultrareview_failed",
+        source="ultrareview",
+        cycle_number=cycle_number,
+        summary=f"ultrareview failed with {len(findings)} findings",
+        details=_truncate_findings_for_details(findings),
+    )
+    ctx.history.append({"step": "ultrareview", "outcome": "failed", "findings": findings})
+    return False, f"ultrareview failed:\n{findings_text}"
 
 
 @mcp.tool()
 def cycle_review(feature_id: str, unit_id: str) -> str:
     """Full automated post-spawn loop:
       tester → (if BUG: address_review → tester) → Copilot review →
-      our reviewer → (if CHANGES: address_review → reviewer) → terminal.
+      our reviewer → (if CHANGES: address_review → reviewer) → optional
+      ultrareview gate (if feature.ultrareview_enabled) → terminal.
 
     Cap = CAP_3 shared cycles across tester-bugs and reviewer-changes.
     On cap hit or any BLOCKED: marks escalated, returns summary.
@@ -1819,9 +1952,22 @@ def cycle_review(feature_id: str, unit_id: str) -> str:
 
     _copilot_phase(ctx)
 
-    approved, msg = _reviewer_phase(ctx)
+    approved, msg, reviewer_outcome = _reviewer_phase(ctx)
     if not approved:
         return _emit_terminal(ctx, "escalated", msg or "reviewer phase failed")
+
+    # F-007 ultrareview gate: opt-in per feature, fires only after our
+    # reviewer endorsed via REVIEW_RECOMMEND_MERGE (REVIEW_COMMENT is a
+    # comment-only terminal — not an endorsement, so the gate is skipped).
+    feature = state.get_feature(ctx.feature_id)
+    if (
+        reviewer_outcome == "REVIEW_RECOMMEND_MERGE"
+        and feature is not None
+        and feature.ultrareview_enabled
+    ):
+        ur_passed, ur_msg = _ultrareview_phase(ctx)
+        if not ur_passed:
+            return _emit_terminal(ctx, "escalated", ur_msg or "ultrareview phase failed")
 
     return _emit_terminal(
         ctx,

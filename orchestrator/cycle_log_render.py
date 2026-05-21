@@ -61,6 +61,13 @@ _EVENT_HEADINGS: dict[str, str] = {
     "reviewer_error": "reviewer: ERROR",
     "fix_pushed": "coder fix: FIX_PUSHED",
     "coder_blocked_on_fix": "coder fix: BLOCKED",
+    # F-007 ultrareview gate (opt-in terminal pass after reviewer endorses).
+    # Without these, a unit that escalated *because* ultrareview failed shows
+    # the reviewer endorsement and nothing else — the persistent on-disk
+    # cycle log silently drops the entire reason for escalation.
+    "ultrareview_started": "ultrareview: STARTED",
+    "ultrareview_passed": "ultrareview: PASSED",
+    "ultrareview_failed": "ultrareview: FAILED",
 }
 
 
