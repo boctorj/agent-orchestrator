@@ -2182,8 +2182,10 @@ def _format_ultrareview_pr_comment(findings: list[str], cycle: int) -> str:
         f"{len(findings)} finding(s)**\n\n"
         f"Our reviewer endorsed via `REVIEW_RECOMMEND_MERGE`, but the "
         f"optional `/ultrareview` gate caught the following final-mile "
-        f"issues. The coder is addressing them now — fix without scope creep, "
-        f"no broader refactor.\n\n"
+        f"issues. The orchestrator will now route these to the coder for a "
+        f"fix-without-scope-creep pass (no broader refactor); if the coder "
+        f"BLOCKS or the shared CAP_{CAP_3} budget is exhausted, the unit "
+        f"escalates with this finding list as the escalation reason.\n\n"
         f"_Cycle number above is the shared CAP_{CAP_3} budget across "
         f"tester-bug, reviewer-change, CI-fix, and ultrareview cycles._\n\n"
     )
