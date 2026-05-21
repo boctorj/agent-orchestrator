@@ -291,7 +291,8 @@ def list_in_flight(reason: str = "") -> str:
     the lead ask "show me everything blocked on auth" in one call. Each
     matching row gets an extra ``reason`` field so the lead can see
     which slug matched. Empty string (the default) preserves the
-    original active-only behaviour.
+    agent-active + awaiting-merge set described above (no escalation
+    rows, no reason filter).
     """
     statuses: tuple[str, ...] = tuple(_LIST_IN_FLIGHT_STATUSES)
     if reason:

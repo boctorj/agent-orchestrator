@@ -75,6 +75,30 @@ class TestDataFetchers:
         unit_ids = {r["unit_id"] for r in rows}
         assert unit_ids == {"U1"}
 
+    def test_in_flight_keeps_in_ci_with_stale_terminal_review_event(self, tmp_state_db):
+        """Regression guard for the F-009-U-4 cut-over (audit Gap H, C2).
+
+        A unit endorsed via ``send_to_unit(reviewer, ...)`` BEFORE this
+        unit shipped has the shape ``status='in_ci'`` plus a stale
+        ``reviewer_recommend_merge`` event. The old post-filter using
+        ``_is_awaiting_merge`` hid such rows from in-flight; the new
+        awaiting-merge bucket queries by status, so they were also
+        absent from awaiting-merge — invisible on the dashboard.
+
+        After dropping the event-driven post-filter (F-009-U-4), these
+        transitional rows surface under in_flight where the lead can
+        see them and reconcile manually.
+        """
+        state.save_feature(Feature(id="F", title="t", description=""))
+        state.upsert_unit_state(
+            WorkUnitState(unit_id="U1", feature_id="F", status="in_ci", pr_number=5)
+        )
+        state.record_event("U1", "F", "reviewer_recommend_merge", source="reviewer")
+
+        rows = dashboard._in_flight_data()
+        unit_ids = {r["unit_id"] for r in rows}
+        assert unit_ids == {"U1"}
+
     def test_awaiting_merge_picks_up_endorsed_units(self, tmp_state_db):
         """F-009-U-4: the bucket is now driven by
         ``status='approved_awaiting_merge'`` — the canonical source of truth

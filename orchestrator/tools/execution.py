@@ -1067,11 +1067,14 @@ def _record_terminal_marker(
         — or the ``blocked_event`` override, used by ``address_review`` to
         keep the historical ``coder_blocked_on_fix`` distinction).
       - Updates ``work_units.status`` *only when the unit is currently in an
-        active state* (see :func:`_flip_status_if_active`): success markers →
-        ``in_ci``; ``BLOCKED`` → ``escalated`` (and populates ``last_error``);
-        ``BUG_FOUND`` / ``REVIEW_REQUEST_CHANGES`` leave status unchanged
-        (the caller's loop holds the unit in ``testing`` / ``reviewing``
-        until the next ``address_review`` cycle).
+        active state* (see :func:`_flip_status_if_active`) to the
+        per-marker ``target_status`` from ``_MARKER_SPECS``: most success
+        markers target ``in_ci``; ``REVIEW_RECOMMEND_MERGE`` targets
+        ``approved_awaiting_merge`` (F-009-U-4 — matches cycle_review's
+        terminal); ``BLOCKED`` flips to ``escalated`` and populates
+        ``last_error``; ``BUG_FOUND`` / ``REVIEW_REQUEST_CHANGES`` leave
+        status unchanged (the caller's loop holds the unit in ``testing``
+        / ``reviewing`` until the next ``address_review`` cycle).
 
     PR comments, ntfy pushes, and JSON return-value composition stay in the
     calling tool — those vary too much per surface to belong here.

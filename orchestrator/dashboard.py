@@ -132,6 +132,13 @@ def _in_flight_data() -> list[dict]:
             f"SELECT * FROM work_units WHERE status IN ({placeholders}) ORDER BY last_activity DESC",  # noqa: S608  # nosec B608
             tuple(ACTIVE_STATUSES),
         ).fetchall()
+    # ``approved_awaiting_merge`` is the dedicated bucket for endorsed-but-
+    # not-merged units (F-009-U-4) and is NOT in ``ACTIVE_STATUSES``, so the
+    # SQL filter already excludes it. The old post-filter against
+    # ``_is_awaiting_merge`` (event-driven) was redundant for the new design
+    # and additionally hid transitional rows (``in_ci`` + stale
+    # ``reviewer_recommend_merge`` event from the pre-F-009-U-4 send_to_unit
+    # path) from both panels — drop it.
     return [
         {
             "unit_id": r["unit_id"],
@@ -142,7 +149,6 @@ def _in_flight_data() -> list[dict]:
             "cycle": r["review_round"],
         }
         for r in rows
-        if not _is_awaiting_merge(r["unit_id"])
     ]
 
 
@@ -151,9 +157,10 @@ def _awaiting_merge_data() -> list[dict]:
 
     Authoritative source: ``work_units.status == 'approved_awaiting_merge'``
     (written by ``cycle_review._emit_terminal`` and by ``send_to_unit`` via
-    ``_record_terminal_marker``). The legacy event-driven heuristic
-    (:func:`_is_awaiting_merge`) is preserved for direct callers but the
-    bucket query uses status now — Gap H, F-009-U-4.
+    ``_record_terminal_marker``). Closes audit Gap H (F-009-U-4) — the
+    pre-existing event-driven heuristic (:func:`_is_awaiting_merge`) is
+    no longer consulted by either bucket query and remains only as a
+    diagnostic helper.
     """
     with contextlib.closing(_open_db_ro()) as conn:
         rows = conn.execute(

@@ -27,7 +27,6 @@ Tests pinned here (per the unit description):
 from __future__ import annotations
 
 import json
-import re
 
 import pytest
 
@@ -254,6 +253,9 @@ class TestCycleReviewTerminalWritesStatus:
             "orchestrator.tools.execution._write_cycle_log_safe", lambda *a, **k: None
         )
 
+        # Cycle_review's terminal in cycle_review uses _emit_terminal +
+        # the new status flip; this test's whole point is that the unit
+        # status reflects the awaiting-merge bucket after the call.
         out = execution.cycle_review("F-001", "F-001-U-1")
         parsed = json.loads(out)
         assert parsed["outcome"] == "approved_awaiting_merge"
@@ -381,7 +383,10 @@ class TestDashboardAwaitingMergeBucket:
 class TestNextReadyUnitsRespectsAwaitingMerge:
     """A unit in ``approved_awaiting_merge`` does NOT count as a satisfied
     dep — downstream work waits for the actual merge. The unit itself
-    surfaces as ``in_flight`` (it's pending human action, not idle)."""
+    surfaces in its own ``awaiting_merge`` bucket: distinct from
+    ``in_flight`` (no agent running) and from ``escalated`` (cycle
+    finished cleanly), and explicitly NOT under ``in_flight`` (matching
+    the assertions below)."""
 
     def test_downstream_dep_stays_blocked_when_dep_is_awaiting_merge(self, tmp_state_db):
         u1, _u2 = _seed_two_unit_plan("F-100")
@@ -644,7 +649,10 @@ def test_show_dashboard_surfaces_approved_awaiting_merge_in_chat_section(tmp_sta
     md = dashboard.render_markdown()
     section = md.split("## 🟢 Awaiting your merge", 1)[1].split("## ", 1)[0]
     # Both the unit id and the PR are present; the empty-state placeholder
-    # ('none awaiting merge') must NOT be — proves the table got populated.
+    # must NOT be — proves the table got populated. The placeholder is
+    # rendered as ``_none awaiting merge_`` (markdown italics), so we
+    # match the literal string the renderer emits — a ``\bword\b`` regex
+    # wouldn't fire because ``_`` is a word character.
     assert "F-001-U-1" in section
     assert "#42" in section
-    assert not re.search(r"\bnone awaiting merge\b", section)
+    assert "_none awaiting merge_" not in section
