@@ -517,9 +517,8 @@ orchestrator daemon status   # alive? lag? in-flight count?
 orchestrator daemon logs     # tail recent decisions
 ```
 
-The daemon is a plain Python event loop (new file
-`orchestrator/daemon.py` — to be added in Phase 3).
-One process, one host, owns the entire state machine.
+The daemon is a plain Python event loop ([`orchestrator/daemon.py`](../orchestrator/daemon.py),
+new). One process, one host, owns the entire state machine.
 
 **Main loop (level-triggered reconciliation, pseudocode):**
 
@@ -754,8 +753,9 @@ redundant.
 - Remove the `wait` half of the old `spawn`-as-monolith from
   `execution.py`. The blocking helpers (`_wait_ci_with_fix_loop`,
   `_tester_phase`, `_reviewer_phase`, `_ultrareview_phase`) move to
-  a new `orchestrator/cycle/phases.py` module where both the daemon
-  and the explicit `cycle_review_blocking` call them.
+  [`orchestrator/cycle/phases.py`](../orchestrator/cycle/phases.py) (new)
+  where both the daemon and the explicit `cycle_review_blocking`
+  call them.
 - Delete `parallel_units` / `parallel_units_global` thread-pool
   internals once daemon-driven concurrency proves itself in
   production.
@@ -844,7 +844,7 @@ intermediate state is fully usable.
 
 ## Acceptance for F-016 overall
 
-When all seven units are merged:
+When all six units are merged:
 
 1. `spawn_unit`, `cycle_review`, `parallel_units_global` all return
    in ≤3 seconds.
