@@ -722,7 +722,13 @@ def address_review(unit_id: str, source: str, feedback: str) -> str:
     )
 
     fix_msg = compose_fix_task(
-        feature, unit, unit_state.branch, unit_state.pr_number, source, feedback
+        feature,
+        unit,
+        unit_state.branch,
+        unit_state.pr_number,
+        source,
+        feedback,
+        **_task_context_kwargs(feature, unit),
     )
     try:
         worker = ManagedAgentWorker(role="coder")
@@ -1836,6 +1842,9 @@ def _resume_reviewer_for_delta(
     except Exception:  # noqa: BLE001 — best-effort; prompt has a fallback
         current_sha = ""
 
+    delta_kwargs = _task_context_kwargs(feature, unit)
+    if unit_state.review_round >= REVIEWER_OWN_LOG_MIN_ROUND:
+        delta_kwargs["own_cycle_log"] = cycle_log.read_cycle_log(ctx.unit_id)
     delta_msg = compose_reviewer_delta_task(
         feature=feature,
         unit=unit,
@@ -1844,6 +1853,7 @@ def _resume_reviewer_for_delta(
         current_sha=current_sha,
         prior_findings=prior_findings,
         fix_summary=fix_summary,
+        **delta_kwargs,
     )
 
     state.touch_unit(ctx.unit_id, status="reviewing")

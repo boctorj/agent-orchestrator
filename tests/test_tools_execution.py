@@ -623,6 +623,39 @@ class TestAddressReview:
         msg = execution.address_review("F-001-U-1", "tester", "fix")
         assert "ERROR resuming coder" in msg
 
+    def test_fix_message_carries_feature_spec_block(self, tmp_state_db, monkeypatch):
+        """F-006-U-6 review feedback (H1): address_review must pass the
+        feature spec text to ``compose_fix_task`` so the coder's
+        ``Re-read FEATURE SPEC on every resume`` rule has runtime backing.
+
+        Seeds a feature with an on-disk ``spec.md``, runs ``address_review``,
+        and inspects the resume message the FakeWorker received.
+        """
+        _seed_coded_unit()
+        instances = _install_fake_worker(monkeypatch, resume_response="FIX_PUSHED")
+        _stub_github(monkeypatch)
+
+        # Write a spec.md for F-001 alongside the tmp_state_db
+        from orchestrator import feature_spec
+
+        feature_spec.write_spec_if_missing("F-001", title="t", description="d")
+        spec_path = feature_spec.spec_path("F-001")
+        spec_path.write_text(
+            "# F-001: t\n\n## Acceptance\n- add(2, 3) returns 5\n",
+            encoding="utf-8",
+        )
+
+        execution.address_review("F-001-U-1", "tester", "test failed")
+
+        coder = instances["coder"]
+        assert coder.resume_calls, "FakeWorker.resume was not called"
+        _, msg = coder.resume_calls[0]
+        assert "## FEATURE SPEC" in msg, (
+            "address_review didn't inject ## FEATURE SPEC into the fix-loop "
+            "message; coder.md's 're-read on every resume' contract is unwired"
+        )
+        assert "add(2, 3) returns 5" in msg
+
 
 # --------------------------- send_to_unit ---------------------------
 

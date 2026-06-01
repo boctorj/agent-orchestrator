@@ -340,6 +340,10 @@ def compose_reviewer_delta_task(
     current_sha: str,
     prior_findings: str,
     fix_summary: str,
+    *,
+    feature_spec_text: str = "",
+    predecessor_logs: list[tuple[str, str]] | None = None,
+    own_cycle_log: str = "",
 ) -> str:
     """Delta-review resume message for an existing reviewer session.
 
@@ -356,7 +360,18 @@ def compose_reviewer_delta_task(
     The companion "On delta re-review" section in ``prompts/reviewer.md``
     expands the contract (anti-anchoring guidance, reconciliation table format,
     when N/A is appropriate).
+
+    The optional ``feature_spec_text`` / ``predecessor_logs`` / ``own_cycle_log``
+    kwargs honour ``features/F-006/spec.md`` § Constraints — *"Worker-prompt
+    context blocks are one-shot per spawn/resume ... re-injected fresh on
+    every resume to pick up mid-cycle spec edits."* Empty values drop their
+    block; the message still works on the F-006-pre wire-up call sites.
     """
+    context = _render_context_blocks(
+        feature_spec_text=feature_spec_text,
+        predecessor_logs=predecessor_logs,
+        own_cycle_log=own_cycle_log,
+    )
     return f"""DELTA RE-REVIEW — PR #{pr_number} ({feature.title}), unit {unit.id}.
 
 The coder pushed a fix in response to your prior REVIEW_REQUEST_CHANGES.
@@ -371,7 +386,7 @@ PRIOR_FINDINGS (one-line summary from your last verdict):
 CODER'S FIX SUMMARY (their reply to the fix loop):
 {fix_summary or "(no summary — read PR comments for what they changed)"}
 
-Follow the "On delta re-review" section of your system prompt:
+{context}Follow the "On delta re-review" section of your system prompt:
   - SKIP the full clone/inventory step (1 in The Method) — your session
     already has the PR loaded; just `git fetch` and diff the new range.
   - DIFF ONLY `{prior_sha or "PRIOR_SHA"}..{current_sha or "CURRENT_SHA"}`
@@ -397,7 +412,22 @@ def compose_fix_task(
     pr_number: int,
     source: str,
     feedback: str,
+    *,
+    feature_spec_text: str = "",
+    predecessor_logs: list[tuple[str, str]] | None = None,
 ) -> str:
+    """Resume message for the coder fix-loop (tester / reviewer / ci / human source).
+
+    Re-injecting the spec + predecessor blocks on every resume is the contract
+    documented in ``features/F-006/spec.md`` § Constraints (*"Worker-prompt
+    context blocks are one-shot per spawn/resume ... re-injected fresh on
+    every resume to pick up mid-cycle spec edits"*) and reflected by
+    ``prompts/coder.md``'s "Re-read FEATURE SPEC on every resume" rule.
+    Empty kwargs drop their block, keeping pre-F-006 call sites valid.
+    """
+    context = _render_context_blocks(
+        feature_spec_text=feature_spec_text, predecessor_logs=predecessor_logs
+    )
     return f"""You have feedback to address on your existing work for unit {unit.id}.
 
 REPO_URL:  {feature.repo_path}
@@ -408,7 +438,7 @@ SOURCE:    {source}
 FEEDBACK (orchestrator summary — actionable detail lives in PR comments):
 {feedback}
 
-Follow the source-specific fix-loop flow in your system prompt
+{context}Follow the source-specific fix-loop flow in your system prompt
 (`## When resumed with feedback`). For `reviewer` / `tester` / `human`
 sources, the source of truth is the inline review comments on PR #{pr_number} —
 fetch them, address each in code, then **reply inline** to each thread with

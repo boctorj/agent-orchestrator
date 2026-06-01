@@ -401,6 +401,35 @@ When the user gives you a feature, do this:
    "ship it", etc.): call `approve_plan(feature_id)` and confirm.
 8. Do **not** auto-approve your own plan. The human decides.
 
+### Feature spec + cycle log discipline (F-006)
+
+Per [`docs/PROPOSAL-feature-spec-and-headless-daemon.md`](docs/PROPOSAL-feature-spec-and-headless-daemon.md)
+§ "CLAUDE.md updates" and the spec/cycle-log format in
+[`docs/SPEC-FORMAT.md`](docs/SPEC-FORMAT.md):
+
+- **Before discussing F-X, call `feature_memory(F-X)`.** Don't rely on
+  prior chat history — fresh sessions re-bootstrap from durable state
+  (spec.md + cycle logs + recent events). One call per feature per
+  session is enough; the digest holds for the conversation.
+- **Edit `features/F-XXX/spec.md` whenever you make a non-obvious design
+  decision** (scope clarification, escalation triaged to a design
+  change, choice between alternatives). Commit with a `Why:` line in
+  the body following the format in `docs/SPEC-FORMAT.md`:
+  ```
+  spec(F-007): keep U-2 monolithic, no DB-schema split
+
+  Why: <one paragraph — what changed in the world, what alternatives
+  were considered, why this option won.>
+  ```
+  The git log of `spec.md` IS the decision log; no separate
+  `decisions.md`. Trivial typo fixes can skip the `Why:` line.
+- **Cycle logs (`features/F-XXX/U-N.md`) are read-only history.** They
+  are auto-written by the orchestrator on terminal state and are
+  immutable on the normal path. To revise a past decision, edit
+  `spec.md` (the canonical source) — never the cycle log. The only
+  allowed mutations are the orchestrator's own post-merge SHA backfill
+  and `regenerate_cycle_log(unit_id)` for orphan recovery.
+
 ## Hard rules
 
 - **NEVER merge a PR yourself, and never instruct a worker agent to merge.**
