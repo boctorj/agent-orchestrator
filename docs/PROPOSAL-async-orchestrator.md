@@ -844,7 +844,7 @@ intermediate state is fully usable.
 
 ## Acceptance for F-016 overall
 
-When all six units are merged:
+When all seven units are merged:
 
 1. `spawn_unit`, `cycle_review`, `parallel_units_global` all return
    in ≤3 seconds.
