@@ -244,9 +244,7 @@ class TestApprovedAwaitingMergeCell:
         _install_clients(monkeypatch, gh)
 
         health_tool.inspect_unit_health("U1")
-        merged_evt = next(
-            e for e in state.list_events("U1") if e["event_type"] == "merged"
-        )
+        merged_evt = next(e for e in state.list_events("U1") if e["event_type"] == "merged")
         # ``reconcile_unit_pr`` records ``source='human'`` because the
         # merge click is a human action; the canonical tool must agree
         # so dashboards filtering on source=human keep working.
@@ -318,9 +316,7 @@ class TestCycleLogWriterSideEffect:
         )
         _install_clients(monkeypatch, gh)
 
-        with patch.object(
-            health_tool.cycle_log, "write_cycle_log", autospec=True
-        ) as mock_write:
+        with patch.object(health_tool.cycle_log, "write_cycle_log", autospec=True) as mock_write:
             health_tool.inspect_unit_health("U1")
 
         assert mock_write.called, "write_cycle_log should fire on merged poll with SHA"
@@ -348,9 +344,7 @@ class TestCycleLogWriterSideEffect:
         )
         _install_clients(monkeypatch, gh)
 
-        with patch.object(
-            health_tool.cycle_log, "write_cycle_log", autospec=True
-        ) as mock_write:
+        with patch.object(health_tool.cycle_log, "write_cycle_log", autospec=True) as mock_write:
             health_tool.inspect_unit_health("U1")
 
         assert not mock_write.called
@@ -362,9 +356,7 @@ class TestCycleLogWriterSideEffect:
         gh = FakeGH(pr=_pr(state_="open", merged=False))
         _install_clients(monkeypatch, gh)
 
-        with patch.object(
-            health_tool.cycle_log, "write_cycle_log", autospec=True
-        ) as mock_write:
+        with patch.object(health_tool.cycle_log, "write_cycle_log", autospec=True) as mock_write:
             health_tool.inspect_unit_health("U1")
 
         assert not mock_write.called
@@ -466,9 +458,7 @@ class TestPRConflictDetected:
 class TestRequiredCheckMissing:
     """New event signal in U-2 for branch-protection drift."""
 
-    def test_required_check_absent_emits_event(
-        self, tmp_state_db, with_github_token, monkeypatch
-    ):
+    def test_required_check_absent_emits_event(self, tmp_state_db, with_github_token, monkeypatch):
         _seed_unit(status="in_ci")
         gh = FakeGH(
             pr=_pr(),
@@ -493,9 +483,7 @@ class TestRequiredCheckMissing:
         missing_evt = next(e for e in events if e["event_type"] == "required_check_missing")
         assert "tests-required" in (missing_evt["details"] or "")
 
-    def test_all_required_present_no_event(
-        self, tmp_state_db, with_github_token, monkeypatch
-    ):
+    def test_all_required_present_no_event(self, tmp_state_db, with_github_token, monkeypatch):
         _seed_unit(status="in_ci")
         gh = FakeGH(
             pr=_pr(),
@@ -532,12 +520,8 @@ class TestAliasDeprecationWarnings:
     ):
         _seed_unit(status="in_ci")
         # Stub the real GitHub helpers so check_unit_pr returns without I/O.
-        monkeypatch.setattr(
-            ops.github, "get_pr_state", lambda *a, **k: _pr(state_="open")
-        )
-        monkeypatch.setattr(
-            ops.github, "get_pr_check_runs", lambda *a, **k: {"runs": []}
-        )
+        monkeypatch.setattr(ops.github, "get_pr_state", lambda *a, **k: _pr(state_="open"))
+        monkeypatch.setattr(ops.github, "get_pr_check_runs", lambda *a, **k: {"runs": []})
 
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -553,12 +537,8 @@ class TestAliasDeprecationWarnings:
         self, tmp_state_db, with_github_token, monkeypatch
     ):
         _seed_unit(status="in_ci")
-        monkeypatch.setattr(
-            ops.github, "get_pr_state", lambda *a, **k: _pr(state_="open")
-        )
-        monkeypatch.setattr(
-            ops.github, "get_pr_check_runs", lambda *a, **k: {"runs": []}
-        )
+        monkeypatch.setattr(ops.github, "get_pr_state", lambda *a, **k: _pr(state_="open"))
+        monkeypatch.setattr(ops.github, "get_pr_check_runs", lambda *a, **k: {"runs": []})
 
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -637,9 +617,7 @@ def test_inspect_unit_health_mcp_dry_run_default_is_false():
 
 
 def _claude_md_text() -> str:
-    return (Path(__file__).resolve().parent.parent / "CLAUDE.md").read_text(
-        encoding="utf-8"
-    )
+    return (Path(__file__).resolve().parent.parent / "CLAUDE.md").read_text(encoding="utf-8")
 
 
 def test_claude_md_scheduling_rule_mentions_inspect_unit_health():
@@ -651,13 +629,11 @@ def test_claude_md_scheduling_rule_mentions_inspect_unit_health():
     sched_marker = "### Scheduling rule"
     assert sched_marker in text
     # Both names must appear after that heading (preserved + recommended).
-    after_sched = text[text.index(sched_marker):]
+    after_sched = text[text.index(sched_marker) :]
     # Cut at the next H3 so we look only at the scheduling section.
     next_h3 = after_sched.find("\n### ", 1)
     section = after_sched if next_h3 == -1 else after_sched[:next_h3]
-    assert "inspect_unit_health" in section, (
-        "scheduling rule must recommend inspect_unit_health"
-    )
+    assert "inspect_unit_health" in section, "scheduling rule must recommend inspect_unit_health"
     assert "reconcile_unit_pr" in section, (
         "scheduling rule must preserve the existing reconcile_unit_pr reference"
     )
@@ -667,7 +643,7 @@ def test_claude_md_restart_recovery_mentions_inspect_unit_health():
     text = _claude_md_text()
     restart_marker = "### Restart recovery flow"
     assert restart_marker in text
-    after = text[text.index(restart_marker):]
+    after = text[text.index(restart_marker) :]
     next_h3 = after.find("\n### ", 1)
     section = after if next_h3 == -1 else after[:next_h3]
     assert "inspect_unit_health" in section, (
@@ -710,9 +686,7 @@ class TestAliasBehavioralParity:
             merge_commit_sha="merged-sha-xyz",
         )
 
-    def test_inspect_unit_health_path(
-        self, tmp_state_db, with_github_token, monkeypatch
-    ):
+    def test_inspect_unit_health_path(self, tmp_state_db, with_github_token, monkeypatch):
         _seed_unit(status="in_ci")
         _install_clients(monkeypatch, FakeGH(pr=self._merged_pr()))
 
@@ -722,26 +696,20 @@ class TestAliasBehavioralParity:
         assert len(merged) == 1
         assert merged[0]["source"] == "human"
 
-    def test_reconcile_unit_pr_path(
-        self, tmp_state_db, with_github_token, monkeypatch
-    ):
+    def test_reconcile_unit_pr_path(self, tmp_state_db, with_github_token, monkeypatch):
         """Same fixture, alias path. Must end in the same observable
         state — ``done`` + one ``merged`` event with ``source='human'``."""
         _seed_unit(status="in_ci")
 
         merged = self._merged_pr()
         monkeypatch.setattr(ops.github, "get_pr_state", lambda *a, **k: merged)
-        monkeypatch.setattr(
-            ops.github, "get_pr_check_runs", lambda *a, **k: {"runs": []}
-        )
+        monkeypatch.setattr(ops.github, "get_pr_check_runs", lambda *a, **k: {"runs": []})
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
             ops.reconcile_unit_pr("U1")
 
         assert state.get_unit_state("U1").status == "done"
-        merged_events = [
-            e for e in state.list_events("U1") if e["event_type"] == "merged"
-        ]
+        merged_events = [e for e in state.list_events("U1") if e["event_type"] == "merged"]
         assert len(merged_events) == 1
         assert merged_events[0]["source"] == "human"
