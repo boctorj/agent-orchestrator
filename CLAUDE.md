@@ -81,15 +81,32 @@ gate that refuses to spawn against repos without branch protection.
   know — spec compliance, scope, intent — without duplicating Copilot's
   line-level work. If Copilot's review doesn't arrive within 5 min
   (timeout / not enabled on repo), our reviewer runs solo.
-- `check_unit_pr(unit_id)` — **read-only** poll of GitHub for PR state +
-  CI checks. Does NOT mutate orchestrator state — safe for dashboards
-  and diagnostics. To advance state on a merged PR, use
-  `reconcile_unit_pr`.
-- `reconcile_unit_pr(unit_id)` — read via `check_unit_pr`, then apply
-  state transitions: merged + in_ci → `done` (+ `merged` event); merged
-  + escalated → `done` (+ `merged` AND `recovered_from_escalated` events,
-  clears `last_error`); open / closed-unmerged → no-op. This is the
-  state-advancing call.
+- `inspect_unit_health(unit_id, dry_run=False)` — **canonical** full-spectrum
+  health probe (F-014). Reads PR state, CI check_runs, GitHub-side review
+  approvals + changes-requested, merge conflicts, required-check delta,
+  and worker session liveness; runs the pure decision table from
+  `orchestrator.health`; then applies the same `merged → done`
+  transitions `reconcile_unit_pr` does, plus event-only signals
+  (`pr_conflict_detected`, `required_check_missing`, `ci_drift_detected`)
+  and the cycle-log writer side effect. Records a
+  `shadow_transition_proposed` event per `ShadowDecision` returned by
+  the decision table (so F-015 can promote them with a backtest) and
+  one `health_report_snapshot` event per unit per UTC day (forensics
+  retention, toggle via `ORCH_HEALTH_SNAPSHOT_DAILY`). Returns a
+  markdown digest. `dry_run=True` skips every write — use after restart
+  or any time you want a peek without action.
+- `check_unit_pr(unit_id)` — **deprecated** (F-014-U-2). Read-only PR +
+  CI snapshot in the legacy JSON shape. Thin alias retained for
+  backward compatibility; new flows should prefer
+  `inspect_unit_health(unit_id, dry_run=True)`.
+- `reconcile_unit_pr(unit_id)` — **deprecated** (F-014-U-2). Reads via
+  `check_unit_pr`, then applies state transitions: merged + in_ci →
+  `done` (+ `merged` event); merged + escalated → `done` (+ `merged`
+  AND `recovered_from_escalated` events, clears `last_error`); open /
+  closed-unmerged → no-op. Thin alias for
+  `inspect_unit_health(unit_id, dry_run=False)`; preserved for
+  backward compatibility and the legacy `reconciled` / `action` JSON
+  shape.
 - `unit_history(unit_id)` — full event timeline for debugging.
 - `unit_summary(unit_id)` — human-readable digest.
 
@@ -238,9 +255,12 @@ gate that refuses to spawn against repos without branch protection.
 3. After `cycle_review` returns `approved_awaiting_merge`: tell the user
    the PR URL and that you're awaiting their merge
 4. Later (when user says "did F-001-U-1 merge?" or you want to advance
-   downstream units): `reconcile_unit_pr(unit_id)` — flips to `done` if
-   merged. (Use `check_unit_pr` if you only want to peek without
-   advancing.)
+   downstream units): `inspect_unit_health(unit_id)` — applies the same
+   `merged → done` transitions `reconcile_unit_pr` does plus surfaces
+   any conflict / CI / review drift. (`inspect_unit_health(unit_id,
+   dry_run=True)` peeks without writing. The legacy
+   `reconcile_unit_pr` / `check_unit_pr` aliases still work for backward
+   compatibility but are deprecated.)
 
 ### Scheduling rule (when user has approved a plan)
 
@@ -266,9 +286,11 @@ unless the user is explicitly focused on one feature.
 7. After all currently-ready units are processed, tell the user which ones
    are awaiting their merge and stop.
 8. When the user says "I merged X" or "what's next?", call
-   `reconcile_unit_pr(X)` to flip it to done (or `recovered_from_escalated`
-   + done if X was escalated), then `next_ready_units_all()` to find
-   newly-unblocked units across the whole project, and repeat from step 2.
+   `inspect_unit_health(X)` to flip it to done (or
+   `recovered_from_escalated` + done if X was escalated; the deprecated
+   `reconcile_unit_pr(X)` alias also works), then
+   `next_ready_units_all()` to find newly-unblocked units across the
+   whole project, and repeat from step 2.
 9. On any escalation, the failure summary already includes the cycle
    history. Don't paraphrase — surface the orchestrator's response. The
    ntfy push has already gone out (if NTFY_TOPIC is set).
@@ -285,7 +307,11 @@ that the orchestrator was restarted, do this FIRST before anything else:
 3. Report what you find:
    - `session_status: idle` → agent finished while away. Read the unit's
      history with `unit_history` to figure out what happened, then decide:
-     spawn the next role manually, or run `reconcile_unit_pr` if merged.
+     spawn the next role manually, or run `inspect_unit_health` (or the
+     deprecated `reconcile_unit_pr`) if merged. After restart in
+     particular, prefer `inspect_unit_health` — it also flags any
+     conflict / CI / review drift that accumulated while the
+     orchestrator was down.
    - `session_status: running` → still working. Note it, move on.
    - `session_status: terminated` → call `tail_worker(unit_id, role)` for
      the last messages before death so the user has actionable context,

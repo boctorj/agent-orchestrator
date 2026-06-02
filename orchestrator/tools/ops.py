@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import sqlite3
+import warnings
 
 from orchestrator import blocked_hints, cycle_log, github, github_app, repo_verify, state
 from orchestrator.agents import ManagedAgentWorker
@@ -46,14 +47,26 @@ def hello_world_test() -> str:
 def check_unit_pr(unit_id: str) -> str:
     """Poll GitHub for the PR's state + check_runs. **Read-only.**
 
+    **Deprecated** (F-014-U-2). The canonical surface is
+    ``inspect_unit_health(unit_id, dry_run=True)`` — same read, plus
+    full conflict / review / CI-drift coverage and a shadow-decision
+    audit log. ``check_unit_pr`` remains as a thin alias that returns
+    the legacy JSON shape (no ``applied_actions`` field) so existing
+    dashboards keep working.
+
     Returns the observed PR state and CI checks alongside the orchestrator's
     current ``status`` for the unit. Does NOT mutate state — safe to call
     from dashboards, diagnostics, or monitors as often as you like.
 
     To advance a unit's state when its PR has been merged, call
-    ``reconcile_unit_pr(unit_id)`` instead. That tool reads via this one
-    and then applies the (PR-state, unit-status) transitions.
+    ``reconcile_unit_pr(unit_id)`` (also deprecated) or the canonical
+    ``inspect_unit_health(unit_id)``.
     """
+    warnings.warn(
+        "check_unit_pr is deprecated; use inspect_unit_health(unit_id, dry_run=True) instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     unit_state = state.get_unit_state(unit_id)
     if not unit_state or not unit_state.pr_number:
         return f"ERROR: unit {unit_id} has no PR"
@@ -86,6 +99,14 @@ def check_unit_pr(unit_id: str) -> str:
 @mcp.tool()
 def reconcile_unit_pr(unit_id: str) -> str:
     """Reconcile orchestrator state with the PR's actual status on GitHub.
+
+    **Deprecated** (F-014-U-2). The canonical surface is
+    ``inspect_unit_health(unit_id, dry_run=False)`` — same merge
+    transitions, plus event-only ``pr_conflict_detected`` /
+    ``required_check_missing`` / ``ci_drift_detected`` signals and a
+    shadow-decision audit log. ``reconcile_unit_pr`` remains as a thin
+    alias preserving the legacy JSON shape (``reconciled`` + ``action``
+    slug) and the cycle-log writer side effect on merged polls.
 
     Reads via ``check_unit_pr`` (which never mutates), then applies state
     transitions based on the (PR state, orchestrator status) pair:
@@ -122,6 +143,11 @@ def reconcile_unit_pr(unit_id: str) -> str:
     race that GitHub's REST API can hit catches up on a subsequent
     call. See ``orchestrator.cycle_log.write_cycle_log``.
     """
+    warnings.warn(
+        "reconcile_unit_pr is deprecated; use inspect_unit_health(unit_id) instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     poll_result = check_unit_pr(unit_id)
     # Surface upstream errors verbatim (no PR, no feature, no token, GH error).
     if poll_result.startswith("ERROR"):
