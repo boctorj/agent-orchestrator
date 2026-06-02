@@ -31,6 +31,7 @@ load_dotenv()
 # in general but doesn't apply here; the noqa keeps the lint green.
 from orchestrator.tools import (  # noqa: E402
     execution,  # noqa: F401
+    health,  # noqa: F401
     observability,  # noqa: F401
     ops,  # noqa: F401
     planning,  # noqa: F401
