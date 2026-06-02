@@ -221,9 +221,7 @@ def test_inspect_unit_health_conflict_emits_event_only(
     assert state.get_unit_state("U1").status == "in_ci"
 
 
-def test_inspect_unit_health_ci_drift_sets_last_error(
-    tmp_state_db, with_github_token, monkeypatch
-):
+def test_inspect_unit_health_ci_drift_sets_last_error(tmp_state_db, with_github_token, monkeypatch):
     """``ci_drift_detected`` carries ``set_last_error`` on its Action; the
     apply layer must write it to ``last_error`` without changing the
     status — pinning the "events can populate last_error" contract.
