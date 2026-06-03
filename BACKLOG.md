@@ -449,6 +449,47 @@ Plan a refactor DAG considering risk; behavior tests before structural changes.
 
 ---
 
+## Superseded / renumbered specs
+
+Three speculative feature specs were committed together in `f8f9015`
+("Add future features (#39)") under numbers F-014/F-015/F-016. Those
+numbers were later repurposed in state.db for a different trilogy
+(unit-health-probe / promote-shadow-decisions / non-blocking-daemon),
+so the original specs were displaced. The ideas are kept here; full
+text is recoverable at git ref `f8f9015`.
+
+### Role / prompt decomposition (was F-014) 🆕
+Split monolithic `coder.md` (~347 lines) into focused role prompts —
+`coder-open.md`, `coder-fix.md`, `coder-fix-ci.md`,
+`coder-selfreview.md` — and `reviewer.md` into `reviewer-stance.md` +
+`reviewer-method.md`, composed via `{{include}}`. Goal: resumed agents
+stop carrying opener context (token + attention savings); each prompt
+has exactly one path. Depended on the F-013 composer.
+**Recover:** `git show f8f9015:features/F-014/spec.md`.
+
+### Structured tool-call markers (was F-015) 🆕
+Replace terminal marker *strings* (`PR_URL:`, `TESTS_PASS`,
+`REVIEW_RECOMMEND_MERGE`, …) with structured tool calls
+(`emit_pr_url`, `emit_tests_pass`, …) so marker counts are exact rather
+than regex-matched anywhere in a long response. Prerequisite for precise
+marker-protocol validation.
+**Recover:** `git show f8f9015:features/F-015/spec.md`.
+
+### Defense-in-depth: server-side enforcement (was F-016) 🆕
+Mechanical backstops for the prose hard rules:
+- **Marker-protocol validation** — exactly-one terminal marker, correct
+  for the role; structured `marker_protocol_violation` BLOCKED slug.
+- **Worker-side pre-push hook** — abort pushes touching
+  `.github/workflows/*` unless `ORCH_ALLOW_WORKFLOW_CHANGES=1`, and abort
+  tester pushes outside `tests/`. Converts prose rules into a git-hook
+  gate. **Still worth doing independently of the daemon work.**
+- **Prompt version headers + CI drift gate** — `version: N` frontmatter
+  per role prompt; CI fails if a prompt's composed output changes without
+  a version bump.
+**Recover:** `git show f8f9015:features/F-016/spec.md`.
+
+---
+
 ## Long shots / research
 
 - Multi-lead session (two leads, one project, lock-coordinated)

@@ -65,6 +65,22 @@ def _markdown_files() -> list[Path]:
         # Also skip vendored fixtures whose link semantics aren't ours.
         if "site-packages" in parts:
             continue
+        # Skip per-unit cycle logs (`features/F-XXX/U-N.md`). These mirror
+        # the original PR body verbatim and are auto-rewritten by the
+        # orchestrator on merge to backfill the merge commit SHA. Any
+        # link fix we apply post-hoc gets reverted on the next rewrite,
+        # so the contract is: cycle logs are immutable historical
+        # records, not first-party docs. The `features/F-XXX/spec.md`
+        # files (the actual feature specs) are NOT exempt and remain in
+        # scope. See docs/PROPOSAL-feature-spec-and-headless-daemon.md
+        # § "Per-unit cycle log".
+        if (
+            len(parts) == 3
+            and parts[0] == "features"
+            and parts[1].startswith("F-")
+            and parts[2].startswith("U-")
+        ):
+            continue
         out.append(p)
     out.sort()
     return out
