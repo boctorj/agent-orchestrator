@@ -1,6 +1,6 @@
 # F-016: Non-blocking orchestrator — dispatcher/watcher split + reconciliation daemon
 
-> **Authoritative design:** [`docs/PROPOSAL-async-orchestrator.md`](../../docs/PROPOSAL-async-orchestrator.md).
+> **Design proposal (draft):** [`docs/PROPOSAL-async-orchestrator.md`](../../docs/PROPOSAL-async-orchestrator.md).
 > This spec is the feature-level summary; the proposal carries the full
 > phase-by-phase API surface, migration sequence, risks, and acceptance.
 
