@@ -210,9 +210,8 @@ wait_unit(unit_id, role, timeout_s=600) -> {marker?, status, reason?}
 # On timeout: returns {status: "still_running", reason: "timeout"}
 # — caller decides whether to retry, escalate, or hand off to daemon.
 
-scan_unit_session(unit_id, role) -> {marker, written_event_id, status}
-# Phase 0 read tool; optionally writes the event if a fresh terminal
-# marker is found.
+scan_unit_session(unit_id, role) -> {marker, status}
+# Phase 0 read tool; does NOT write any events (caller decides).
 ```
 
 **Implementation:**
