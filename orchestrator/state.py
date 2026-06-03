@@ -84,6 +84,40 @@ def _migrate_features_ultrareview(conn: sqlite3.Connection) -> None:
             raise
 
 
+def _migrate_unit_events_dedupe_key(conn: sqlite3.Connection) -> None:
+    """Add `dedupe_key` + its UNIQUE index to `unit_events` for pre-F-016 DBs.
+
+    Phase 0 of F-016 makes terminal-marker recording idempotent: callers
+    pass a deterministic ``dedupe_key`` (sha256 over
+    ``session_id|cycle_number|event_type|marker_payload``) and the INSERT
+    becomes ``INSERT OR IGNORE`` so a duplicate scan of the same session
+    response is a no-op. The dedupe column is nullable so legacy event
+    types (``spawn_coder``, ``coder_resumed``, ``merged``, …) keep
+    inserting a fresh row every call — only structured marker events opt
+    in.
+
+    SQLite's UNIQUE constraint treats NULL as distinct from every other
+    NULL, so the partial-uniqueness contract ("at most one row per
+    non-null key") falls out of the index definition without needing a
+    ``WHERE dedupe_key IS NOT NULL`` clause. We add one anyway for
+    clarity and to keep the index small on long-running DBs.
+
+    Race-safe in the same shape as `_migrate_features_ultrareview` —
+    PRAGMA-probe first; treat ``duplicate column name`` as success.
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(unit_events)").fetchall()}
+    if "dedupe_key" not in cols:
+        try:
+            conn.execute("ALTER TABLE unit_events ADD COLUMN dedupe_key TEXT")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_unit_events_dedupe_key "
+        "ON unit_events(dedupe_key) WHERE dedupe_key IS NOT NULL"
+    )
+
+
 def init_db() -> None:
     """Create tables if they don't exist, then apply column migrations.
 
@@ -140,10 +174,15 @@ def init_db() -> None:
                 summary       TEXT NOT NULL DEFAULT '',
                 details       TEXT NOT NULL DEFAULT '',
                 session_id    TEXT NOT NULL DEFAULT '',
+                dedupe_key    TEXT,
                 FOREIGN KEY (unit_id) REFERENCES work_units(unit_id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_unit_events_unit_ts
                 ON unit_events(unit_id, ts);
+            -- The unique index on ``dedupe_key`` lives in
+            -- ``_migrate_unit_events_dedupe_key`` so legacy DBs that
+            -- pre-date the column can ALTER first, then index. Same
+            -- step runs on fresh DBs (IF NOT EXISTS keeps it a no-op).
 
             CREATE TABLE IF NOT EXISTS cached_resources (
                 role            TEXT NOT NULL,
@@ -172,6 +211,7 @@ def init_db() -> None:
             """
         )
         _migrate_features_ultrareview(conn)
+        _migrate_unit_events_dedupe_key(conn)
 
 
 # --------------------------- features ---------------------------
@@ -458,14 +498,33 @@ def record_event(
     summary: str = "",
     details: str = "",
     session_id: str = "",
-) -> None:
-    """Append a row to unit_events. Never overwrites."""
+    dedupe_key: str | None = None,
+) -> bool:
+    """Append a row to unit_events.
+
+    Returns ``True`` if a row was inserted, ``False`` if ``dedupe_key`` was
+    supplied and an event with the same key already exists.
+
+    ``dedupe_key`` is the F-016 Phase 0 idempotency hook: terminal-marker
+    callers pass a deterministic hash of
+    ``session_id|cycle_number|event_type|marker_payload`` so a re-scan of
+    the same worker response (e.g. the daemon re-polling an idle session)
+    is a no-op rather than a duplicate audit row. When omitted, the
+    INSERT writes unconditionally — preserving the original
+    "never overwrites" contract for non-marker events (``spawn_coder``,
+    ``coder_resumed``, ``merged``, …) that legitimately repeat.
+
+    The UNIQUE index on ``dedupe_key`` ignores NULL rows, so the
+    dedupe-vs-append branches share one table without a partial-key
+    workaround.
+    """
     with _connect() as conn:
-        conn.execute(
+        cur = conn.execute(
             """
-            INSERT INTO unit_events
-                (unit_id, feature_id, ts, event_type, source, cycle_number, summary, details, session_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR IGNORE INTO unit_events
+                (unit_id, feature_id, ts, event_type, source, cycle_number,
+                 summary, details, session_id, dedupe_key)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 unit_id,
@@ -477,8 +536,10 @@ def record_event(
                 summary,
                 details,
                 session_id,
+                dedupe_key,
             ),
         )
+    return cur.rowcount > 0
 
 
 def list_events(unit_id: str, limit: int = 200) -> list[dict]:

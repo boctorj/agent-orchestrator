@@ -349,7 +349,8 @@ structure under `orchestrator/` including subpackages such as `tools/`,
                                                   │ summary           │
                                                   │ details           │
                                                   │ session_id        │
-                                                  └───────────────────┘
+                                                  │ dedupe_key UNIQ?  │ ◄── F-016 Phase 0
+                                                  └───────────────────┘     (INSERT OR IGNORE)
 
                     ┌───────────────────┐
                     │ cached_resources  │ ◄── (role, prompt_hash) PK

@@ -27,18 +27,29 @@ CAP_3 = 3
 """Max shared cycles (tester-bug + reviewer-change combined) per unit."""
 
 # --- marker regexes (agents emit these as final-line sentinels) ---
-PR_URL_RE = re.compile(r"PR_URL:\s*(https://github\.com/[\w.-]+/[\w.-]+/pull/(\d+))", re.IGNORECASE)
+#
+# Single source of truth: ``orchestrator.markers``. Re-exported here so
+# legacy import sites (and tests) that predate F-016 keep working
+# without a sweeping rename.
+from orchestrator.markers import (  # noqa: E402, F401
+    BUG_FOUND_RE,
+    FIX_PUSHED_RE,
+    PR_URL_RE,
+    REVIEW_CHANGES_RE,
+    REVIEW_COMMENT_RE,
+    REVIEW_RECOMMEND_MERGE_RE,
+    TESTS_PASS_RE,
+)
+
 BLOCKED_RE = re.compile(r"^BLOCKED:\s*(.+)$", re.MULTILINE)
 """Legacy line-only matcher; structured parsing lives in
-:func:`orchestrator.blocked_reasons.parse_blocked_marker`. Kept here so existing
-import sites (and tests) continue to work."""
-TESTS_PASS_RE = re.compile(r"^TESTS_PASS\s*$", re.MULTILINE)
-BUG_FOUND_RE = re.compile(r"^BUG_FOUND:\s*(.+)$", re.MULTILINE)
+:func:`orchestrator.blocked_reasons.parse_blocked_marker`. Kept here so
+existing import sites (and tests) continue to work; the markers module
+uses ``parse_blocked_marker`` directly and so doesn't need this alias."""
 REVIEW_APPROVED_RE = re.compile(r"^REVIEW_APPROVED\s*$", re.MULTILINE)
-REVIEW_CHANGES_RE = re.compile(r"^REVIEW_REQUEST_CHANGES:\s*(.+)$", re.MULTILINE)
-REVIEW_COMMENT_RE = re.compile(r"^REVIEW_COMMENT\s*$", re.MULTILINE)
-REVIEW_RECOMMEND_MERGE_RE = re.compile(r"^REVIEW_RECOMMEND_MERGE:\s*(.+)$", re.MULTILINE)
-FIX_PUSHED_RE = re.compile(r"\bFIX_PUSHED\b")
+"""Pre-F-009 verdict marker, replaced by ``REVIEW_RECOMMEND_MERGE``.
+Kept compiled so the legacy import surface stays intact, but the
+marker is not part of the F-016 :mod:`orchestrator.markers` grammar."""
 
 
 # --- pure helpers ---

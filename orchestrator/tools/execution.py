@@ -10,24 +10,17 @@ from __future__ import annotations
 
 import contextlib
 import json
-import re
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
 from orchestrator import ci_wait, cycle_log, feature_spec, github, ntfy, state, ultrareview
+from orchestrator import markers as markers_module
 from orchestrator.agents import ManagedAgentWorker
 from orchestrator.blocked_reasons import parse_blocked_marker
 from orchestrator.models import ACTIVE_UNIT_STATUSES, Feature, WorkUnit, WorkUnitState
 from orchestrator.tools import (
-    BUG_FOUND_RE,
     CAP_3,
-    FIX_PUSHED_RE,
     PR_URL_RE,
-    REVIEW_CHANGES_RE,
-    REVIEW_COMMENT_RE,
-    REVIEW_RECOMMEND_MERGE_RE,
-    TESTS_PASS_RE,
     blocked_event_details,
     branch_for,
     compose_coder_task,
@@ -918,120 +911,6 @@ def _flip_status_if_active(unit_id: str, *, target: str, error: str = "") -> Non
         state.touch_unit(unit_id, status=target, error=error)
 
 
-@dataclass(frozen=True)
-class _MarkerSpec:
-    """One (role, marker) pair: regex + the event-recording shape it produces.
-
-    Drives `_record_terminal_marker`'s dispatch loop. Each spec captures
-    everything that varies per marker so the loop body stays a four-liner:
-    regex match → build event payload → optional status flip → return.
-
-    ``build`` receives the regex match plus the worker response and produces
-    ``(extras, event_kwargs)``:
-      - ``extras`` is merged into the helper's return dict alongside
-        ``{"marker": <name>}``.
-      - ``event_kwargs`` is the keyword payload for ``state.record_event``
-        (``summary`` / ``details`` — the rest is filled by the loop).
-
-    ``target_status`` is the status the unit transitions to when this marker
-    matches (and the unit is currently in an active state — see
-    :func:`_flip_status_if_active`). ``None`` means "leave status alone"
-    (BUG_FOUND / REVIEW_REQUEST_CHANGES — the caller's loop owns the next
-    transition). Most success-side markers target ``"in_ci"``;
-    ``REVIEW_RECOMMEND_MERGE`` targets ``"approved_awaiting_merge"`` so the
-    reviewer's endorsement lands the unit in the same status cycle_review's
-    ``_emit_terminal`` would set — closes audit Gap H (F-009-U-4).
-    """
-
-    role: str
-    marker: str
-    pattern: re.Pattern[str]
-    event_type: str
-    target_status: str | None
-    build: Callable[[re.Match[str], str], tuple[dict[str, Any], dict[str, str]]]
-
-
-def _build_pr_url(m: re.Match[str], _response: str) -> tuple[dict[str, Any], dict[str, str]]:
-    pr_url, pr_number = m.group(1), int(m.group(2))
-    return (
-        {"pr_url": pr_url, "pr_number": pr_number},
-        {"summary": f"PR #{pr_number} opened", "details": pr_url},
-    )
-
-
-def _build_fix_pushed(_m: re.Match[str], response: str) -> tuple[dict[str, Any], dict[str, str]]:
-    return ({}, {"summary": "Fix committed and pushed", "details": tail(response)})
-
-
-def _build_tests_pass(_m: re.Match[str], _response: str) -> tuple[dict[str, Any], dict[str, str]]:
-    return ({}, {"summary": "All tests pass", "details": ""})
-
-
-def _build_bug_found(m: re.Match[str], response: str) -> tuple[dict[str, Any], dict[str, str]]:
-    reason = m.group(1).strip()
-    return ({"bug": reason}, {"summary": reason, "details": tail(response)})
-
-
-def _build_recommend_merge(
-    m: re.Match[str], _response: str
-) -> tuple[dict[str, Any], dict[str, str]]:
-    reason = m.group(1).strip()
-    return (
-        {"reason": reason},
-        {"summary": f"Endorsed (self-approval blocked): {reason}", "details": ""},
-    )
-
-
-def _build_request_changes(
-    m: re.Match[str], response: str
-) -> tuple[dict[str, Any], dict[str, str]]:
-    reason = m.group(1).strip()
-    return ({"issue": reason}, {"summary": reason, "details": tail(response)})
-
-
-def _build_review_comment(
-    _m: re.Match[str], _response: str
-) -> tuple[dict[str, Any], dict[str, str]]:
-    return ({}, {"summary": "Comment-only review", "details": ""})
-
-
-# Ordered per role: PR_URL before FIX_PUSHED for the coder branch matches the
-# pre-refactor precedence (the spawn_unit path checks PR_URL first too).
-_MARKER_SPECS: tuple[_MarkerSpec, ...] = (
-    _MarkerSpec("coder", "PR_URL", PR_URL_RE, "pr_opened", "in_ci", _build_pr_url),
-    _MarkerSpec("coder", "FIX_PUSHED", FIX_PUSHED_RE, "fix_pushed", "in_ci", _build_fix_pushed),
-    _MarkerSpec("tester", "TESTS_PASS", TESTS_PASS_RE, "tests_pass", "in_ci", _build_tests_pass),
-    _MarkerSpec("tester", "BUG_FOUND", BUG_FOUND_RE, "tester_bug_found", None, _build_bug_found),
-    _MarkerSpec(
-        "reviewer",
-        "REVIEW_RECOMMEND_MERGE",
-        REVIEW_RECOMMEND_MERGE_RE,
-        "reviewer_recommend_merge",
-        # Reviewer endorsement is terminal for the cycle — land directly in
-        # the awaiting-merge bucket so send_to_unit(reviewer) endorsements
-        # match cycle_review's terminal state (audit Gap H, F-009-U-4).
-        "approved_awaiting_merge",
-        _build_recommend_merge,
-    ),
-    _MarkerSpec(
-        "reviewer",
-        "REVIEW_REQUEST_CHANGES",
-        REVIEW_CHANGES_RE,
-        "reviewer_request_changes",
-        None,
-        _build_request_changes,
-    ),
-    _MarkerSpec(
-        "reviewer",
-        "REVIEW_COMMENT",
-        REVIEW_COMMENT_RE,
-        "reviewer_comment",
-        "in_ci",
-        _build_review_comment,
-    ),
-)
-
-
 def _record_terminal_marker(
     *,
     unit_id: str,
@@ -1047,35 +926,43 @@ def _record_terminal_marker(
 
     Single source of truth for the marker → (event, status) mapping shared by
     ``spawn_tester``, ``spawn_reviewer``, ``address_review``, and
-    ``send_to_unit``. Cross-role markers are ignored — a tester response
-    containing ``REVIEW_RECOMMEND_MERGE`` is NOT a recognised marker.
+    ``send_to_unit``. The grammar lives in
+    :mod:`orchestrator.markers`; this helper is the recorder half — it
+    takes the pure :class:`markers.MarkerSpec` and applies the audit-row
+    write + status flip side-effects.
 
-    Per-role marker scope::
+    Cross-role markers are ignored — a tester response containing
+    ``REVIEW_RECOMMEND_MERGE`` is NOT a recognised marker. Per-role
+    marker scope::
 
         coder    -> PR_URL | FIX_PUSHED | BLOCKED
         tester   -> TESTS_PASS | BUG_FOUND | BLOCKED
         reviewer -> REVIEW_RECOMMEND_MERGE | REVIEW_REQUEST_CHANGES |
                     REVIEW_COMMENT | BLOCKED
 
-    Each (role, marker) pair is encoded once in ``_MARKER_SPECS``; the body
-    is a single dispatch loop. Callers that know certain role-appropriate
-    markers are invalid in their context can narrow the search via
-    ``markers`` (e.g. ``address_review`` and ``send_to_unit(role='coder')``
-    pass ``{"FIX_PUSHED", "BLOCKED"}`` — a coder resume returning ``PR_URL``
-    is anomalous since the unit already has a PR from ``spawn_unit``, and
-    matching it here would write a spurious ``pr_opened`` event without
-    persisting ``pr_number`` to the unit row).
+    Callers that know certain role-appropriate markers are invalid in
+    their context can narrow the search via ``markers`` (e.g.
+    ``address_review`` and ``send_to_unit(role='coder')`` pass
+    ``{"FIX_PUSHED", "BLOCKED"}`` — a coder resume returning ``PR_URL``
+    is anomalous since the unit already has a PR from ``spawn_unit``,
+    and matching it here would write a spurious ``pr_opened`` event
+    without persisting ``pr_number`` to the unit row).
 
     Side effects on match:
-      - Appends one ``unit_event`` row (``pr_opened`` / ``fix_pushed`` /
-        ``tests_pass`` / ``tester_bug_found`` / ``reviewer_recommend_merge`` /
-        ``reviewer_request_changes`` / ``reviewer_comment`` / ``{role}_blocked``
-        — or the ``blocked_event`` override, used by ``address_review`` to
-        keep the historical ``coder_blocked_on_fix`` distinction).
+      - Appends one ``unit_event`` row keyed by
+        :func:`orchestrator.markers.dedupe_key` — a second call on the
+        same response (e.g. the F-016 watcher daemon re-scanning an idle
+        session) is a no-op via ``INSERT OR IGNORE``. Event types:
+        ``pr_opened`` / ``fix_pushed`` / ``tests_pass`` /
+        ``tester_bug_found`` / ``reviewer_recommend_merge`` /
+        ``reviewer_request_changes`` / ``reviewer_comment`` /
+        ``{role}_blocked`` — or the ``blocked_event`` override, used by
+        ``address_review`` to keep the historical
+        ``coder_blocked_on_fix`` distinction.
       - Updates ``work_units.status`` *only when the unit is currently in an
         active state* (see :func:`_flip_status_if_active`) to the
-        per-marker ``target_status`` from ``_MARKER_SPECS``: most success
-        markers target ``in_ci``; ``REVIEW_RECOMMEND_MERGE`` targets
+        per-marker ``target_status``: most success markers target
+        ``in_ci``; ``REVIEW_RECOMMEND_MERGE`` targets
         ``approved_awaiting_merge`` (F-009-U-4 — matches cycle_review's
         terminal); ``BLOCKED`` flips to ``escalated`` and populates
         ``last_error``; ``BUG_FOUND`` / ``REVIEW_REQUEST_CHANGES`` leave
@@ -1088,51 +975,46 @@ def _record_terminal_marker(
     Returns ``None`` if no marker matched (caller should escalate as no-marker),
     or a dict ``{"marker": <name>, ...extras}`` describing the match.
     """
-    allowed = (lambda _name: True) if markers is None else (lambda name: name in markers)
+    spec = markers_module.scan_response(role, response, allowed=markers)
+    if spec is None:
+        return None
 
-    for spec in _MARKER_SPECS:
-        if spec.role != role or not allowed(spec.marker):
-            continue
-        match = spec.pattern.search(response)
-        if not match:
-            continue
-        extras, event_kwargs = spec.build(match, response)
-        if spec.target_status is not None:
-            _flip_status_if_active(unit_id, target=spec.target_status)
-        state.record_event(
-            unit_id,
-            feature_id,
-            spec.event_type,
-            source=role,
-            cycle_number=cycle_number,
-            session_id=session_id,
-            **event_kwargs,
-        )
-        return {"marker": spec.marker, **extras}
+    # ``address_review`` keeps the historical ``coder_blocked_on_fix``
+    # discriminator. The override lands BEFORE the dedupe key is hashed so
+    # a fix-loop BLOCKED cannot collide with a spawn-time BLOCKED on the
+    # same coder session.
+    event_type = spec.event_type
+    if spec.marker == "BLOCKED" and blocked_event:
+        event_type = blocked_event
 
-    # BLOCKED is universal across roles and uses parse_blocked_marker (not a
-    # plain regex), so it sits outside the spec table.
-    if allowed("BLOCKED"):
-        payload = parse_blocked_marker(response)
-        if payload is not None:
-            _flip_status_if_active(
-                unit_id,
-                target="escalated",
-                error=format_blocked_last_error(payload),
-            )
-            state.record_event(
-                unit_id,
-                feature_id,
-                blocked_event or f"{role}_blocked",
-                source=role,
-                cycle_number=cycle_number,
-                summary=payload.prose,
-                session_id=session_id,
-                details=blocked_event_details(payload, tail(response)),
-            )
-            return {"marker": "BLOCKED", "payload": payload}
+    # BLOCKED's details JSON-encodes the structured payload + response
+    # tail; the pure scan leaves details empty so the recorder owns the
+    # response-truncation side. Other markers use scan_response's details.
+    details = spec.details
+    if spec.blocked_payload is not None:
+        details = blocked_event_details(spec.blocked_payload, tail(response))
 
-    return None
+    if spec.target_status is not None:
+        _flip_status_if_active(unit_id, target=spec.target_status, error=spec.last_error)
+
+    key = markers_module.dedupe_key(
+        session_id=session_id,
+        cycle_number=cycle_number,
+        event_type=event_type,
+        marker_payload=spec.payload,
+    )
+    state.record_event(
+        unit_id,
+        feature_id,
+        event_type,
+        source=role,
+        cycle_number=cycle_number,
+        session_id=session_id,
+        summary=spec.summary,
+        details=details,
+        dedupe_key=key,
+    )
+    return {"marker": spec.marker, **spec.extras}
 
 
 def _escalate_no_marker(

@@ -282,6 +282,100 @@ class TestUltrareviewMigration:
             conn.close()
 
 
+class TestUnitEventsDedupeKeyMigration:
+    """F-016 Phase 0 — ``unit_events.dedupe_key`` must back-fill onto
+    pre-F-016 state.db files and the UNIQUE index must enforce
+    at-most-one row per non-null key.
+
+    Mirrors :class:`TestUltrareviewMigration`'s structure; the migration
+    helper is shaped the same way (PRAGMA-probe → ALTER → swallow
+    duplicate column) but additionally creates the partial-unique
+    index that powers ``INSERT OR IGNORE`` dedupe.
+    """
+
+    def test_migration_adds_column_to_pre_existing_events_table(self, monkeypatch, tmp_path):
+        db_path = tmp_path / "legacy.db"
+        monkeypatch.setattr("orchestrator.state.STATE_DB", db_path)
+
+        # Hand-build a pre-F-016 unit_events table (no dedupe_key).
+        with sqlite3.connect(db_path) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE features (
+                    id            TEXT PRIMARY KEY,
+                    title         TEXT NOT NULL,
+                    description   TEXT NOT NULL,
+                    repo_path     TEXT NOT NULL DEFAULT '',
+                    branch_prefix TEXT NOT NULL DEFAULT '',
+                    status        TEXT NOT NULL DEFAULT 'draft',
+                    created_at    TEXT NOT NULL
+                );
+                CREATE TABLE work_units (
+                    unit_id              TEXT PRIMARY KEY,
+                    feature_id           TEXT NOT NULL,
+                    status               TEXT NOT NULL DEFAULT 'pending',
+                    branch               TEXT NOT NULL DEFAULT '',
+                    pr_number            INTEGER,
+                    coder_session_id     TEXT NOT NULL DEFAULT '',
+                    tester_session_id    TEXT NOT NULL DEFAULT '',
+                    reviewer_session_id  TEXT NOT NULL DEFAULT '',
+                    review_round         INTEGER NOT NULL DEFAULT 0,
+                    last_activity        TEXT NOT NULL DEFAULT '',
+                    last_error           TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE unit_events (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    unit_id       TEXT NOT NULL,
+                    feature_id    TEXT NOT NULL,
+                    ts            TEXT NOT NULL,
+                    event_type    TEXT NOT NULL,
+                    source        TEXT NOT NULL DEFAULT 'orchestrator',
+                    cycle_number  INTEGER,
+                    summary       TEXT NOT NULL DEFAULT '',
+                    details       TEXT NOT NULL DEFAULT '',
+                    session_id    TEXT NOT NULL DEFAULT ''
+                );
+                """
+            )
+
+        # init_db() must add the column + index without touching existing rows.
+        state.init_db()
+
+        with sqlite3.connect(db_path) as conn:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(unit_events)").fetchall()}
+            indexes = {r[1] for r in conn.execute("PRAGMA index_list(unit_events)").fetchall()}
+        assert "dedupe_key" in cols
+        assert "idx_unit_events_dedupe_key" in indexes
+
+    def test_init_db_is_idempotent_after_dedupe_migration(self, monkeypatch, tmp_path):
+        db_path = tmp_path / "idem.db"
+        monkeypatch.setattr("orchestrator.state.STATE_DB", db_path)
+        state.init_db()
+        state.init_db()  # would raise "duplicate column name" if non-idempotent
+        with sqlite3.connect(db_path) as conn:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(unit_events)").fetchall()}
+        assert "dedupe_key" in cols
+
+    def test_unique_index_enforces_at_most_one_row_per_key(self, tmp_state_db):
+        """The whole point of Phase 0: a second INSERT OR IGNORE with
+        the same dedupe_key collapses to a no-op via the UNIQUE index."""
+        state.save_feature(Feature(id="F", title="t", description=""))
+        state.upsert_unit_state(WorkUnitState(unit_id="U1", feature_id="F", status="coding"))
+
+        with sqlite3.connect(tmp_state_db) as conn:
+            conn.execute(
+                "INSERT INTO unit_events (unit_id, feature_id, ts, event_type, dedupe_key) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("U1", "F", "2026-06-01T00:00:00Z", "t", "shared-key"),
+            )
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(
+                    "INSERT INTO unit_events (unit_id, feature_id, ts, event_type, dedupe_key) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    ("U1", "F", "2026-06-01T00:00:01Z", "t", "shared-key"),
+                )
+
+
 # --------------------------- plans ---------------------------
 
 
@@ -450,7 +544,50 @@ class TestEvents:
         assert s["event_counts_by_type"]["spawn_coder"] == 1
 
 
-# --------------------------- cached resources ---------------------------
+class TestEventDedupeKey:
+    """F-016 Phase 0 — ``dedupe_key`` makes terminal-marker recording
+    idempotent.
+
+    ``state.record_event`` writes an INSERT OR IGNORE row. When the key
+    is omitted (legacy callers) every event lands; when supplied, a
+    second call with the same key collapses to a no-op so the watcher
+    daemon re-scanning an idle session can't drift the audit log.
+    """
+
+    def _seed(self, tmp_state_db):
+        state.save_feature(Feature(id="F", title="t", description=""))
+        state.upsert_unit_state(WorkUnitState(unit_id="U1", feature_id="F", status="coding"))
+
+    def test_first_insert_returns_true(self, tmp_state_db):
+        self._seed(tmp_state_db)
+        inserted = state.record_event("U1", "F", "fix_pushed", dedupe_key="key-1", summary="first")
+        assert inserted is True
+        assert len(state.list_events("U1")) == 1
+
+    def test_duplicate_dedupe_key_collapses_to_no_op(self, tmp_state_db):
+        self._seed(tmp_state_db)
+        state.record_event("U1", "F", "fix_pushed", dedupe_key="key-1", summary="first")
+        second = state.record_event("U1", "F", "fix_pushed", dedupe_key="key-1", summary="DUP")
+        assert second is False
+        events = state.list_events("U1")
+        assert len(events) == 1
+        # Original row was preserved — duplicate did not overwrite.
+        assert events[0]["summary"] == "first"
+
+    def test_distinct_keys_each_insert(self, tmp_state_db):
+        self._seed(tmp_state_db)
+        assert state.record_event("U1", "F", "fix_pushed", dedupe_key="k-1") is True
+        assert state.record_event("U1", "F", "fix_pushed", dedupe_key="k-2") is True
+        assert len(state.list_events("U1")) == 2
+
+    def test_null_dedupe_keys_do_not_collide(self, tmp_state_db):
+        """The UNIQUE index treats NULL as distinct so non-marker callers
+        (``spawn_coder``, ``coder_resumed``, ``merged``) keep appending one
+        row per call."""
+        self._seed(tmp_state_db)
+        for _ in range(3):
+            assert state.record_event("U1", "F", "spawn_coder") is True
+        assert len(state.list_events("U1")) == 3
 
 
 class TestCachedResources:
