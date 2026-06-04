@@ -64,7 +64,6 @@ from orchestrator.ci_wait import CIWaitResult
 from orchestrator.models import Feature, WorkUnit, WorkUnitState
 from orchestrator.tools import execution, mcp
 
-
 # --------------------------- autouse: pretend CI is green ---------------------------
 
 
@@ -320,9 +319,7 @@ class TestLastReviewerOutcomeMostRecent:
     def test_none_when_no_reviewer_event(self, tmp_state_db):
         _seed_coded_unit()
         # Only non-reviewer events present — must return None, not crash.
-        state.record_event(
-            "F-001-U-1", "F-001", "spawn_coder", source="orchestrator", summary="x"
-        )
+        state.record_event("F-001-U-1", "F-001", "spawn_coder", source="orchestrator", summary="x")
         assert execution._last_reviewer_outcome("F-001-U-1") is None
 
     def test_ultrareview_fires_when_endorsement_is_latest_after_earlier_changes(
@@ -422,9 +419,7 @@ class TestNextActionChain:
         assert out3["outcome"] == "approved_awaiting_merge"
         # Terminal is the end of the chain.
 
-    def test_already_past_response_also_carries_next_action(
-        self, tmp_state_db, with_github_token
-    ):
+    def test_already_past_response_also_carries_next_action(self, tmp_state_db, with_github_token):
         """The daemon's branch on ``already_past`` must still be able to
         find the next step — otherwise it'd stall the cycle after a
         crash-recovery re-tick. Verify ``next_action`` is populated even
