@@ -2986,3 +2986,317 @@ class TestCycleReviewRecoversOrphanedReviewerSession:
         assert "unexpected outcome: RAW" not in parsed["message"]
         # Positive assertion: cycle reached terminal success
         assert parsed["outcome"] == "approved_awaiting_merge"
+
+
+# --------------------------- F-016-U-3 phase commands ---------------------------
+
+
+class TestAdvanceToTester:
+    """``advance_to_tester`` runs GATE 1 (CI on coder push) + tester phase +
+    GATE 2 (CI on tester push). Idempotent on current ``WorkUnitState.status``:
+    a no-op when the unit is already past the tester boundary.
+    """
+
+    def test_happy_path_advances(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        monkeypatch.setattr(
+            execution,
+            "spawn_tester",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "TESTS_PASS"}),
+        )
+        _stub_github(monkeypatch)
+
+        out = execution.advance_to_tester("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "advanced"
+        assert parsed["next_action"] == "advance_to_reviewer"
+        assert parsed["unit_id"] == "F-001-U-1"
+        assert parsed["status"] == "in_ci"
+
+    def test_idempotent_on_status_past_tester(self, tmp_state_db, with_github_token):
+        """When status is already past the tester boundary, the phase command
+        is a no-op. Status-based idempotence is the Phase 3 daemon's primary
+        safety net (PROPOSAL § Phase 2)."""
+        _seed_coded_unit()
+        for past_status in ("reviewing", "fixing", "approved_awaiting_merge", "done"):
+            s = state.get_unit_state("F-001-U-1")
+            s.status = past_status
+            state.upsert_unit_state(s)
+
+            out = execution.advance_to_tester("F-001", "F-001-U-1")
+            parsed = json.loads(out)
+            assert parsed["outcome"] == "already_past", (
+                f"status={past_status} must be already_past for advance_to_tester"
+            )
+            assert parsed["status"] == past_status
+            assert parsed["next_action"] == "advance_to_reviewer"
+
+    def test_escalated_short_circuits(self, tmp_state_db, with_github_token):
+        _seed_coded_unit()
+        s = state.get_unit_state("F-001-U-1")
+        s.status = "escalated"
+        s.last_error = "previous cap-3 hit"
+        state.upsert_unit_state(s)
+
+        out = execution.advance_to_tester("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "escalated"
+        assert parsed["status"] == "escalated"
+
+    def test_no_unit_state_errors(self, tmp_state_db, with_github_token):
+        _setup_feature()
+        out = execution.advance_to_tester("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] in ("not_ready", "error")
+
+    def test_tester_blocked_escalates(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        monkeypatch.setattr(
+            execution,
+            "spawn_tester",
+            lambda f, u: "BLOCKED — tester for U: spec ambiguous",
+        )
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_escalation",
+            lambda *a, **k: True,
+        )
+
+        out = execution.advance_to_tester("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "escalated"
+
+
+class TestAdvanceToReviewer:
+    """``advance_to_reviewer`` runs Copilot (best-effort) + reviewer phase.
+    Idempotent: no-op when status is already at the terminal-success bucket
+    (``approved_awaiting_merge`` / ``done``).
+    """
+
+    def test_happy_path_advances(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        monkeypatch.setattr(
+            execution,
+            "spawn_reviewer",
+            lambda f, u: json.dumps(
+                {"unit_id": u, "outcome": "REVIEW_RECOMMEND_MERGE", "reason": "clean"}
+            ),
+        )
+        _stub_github(monkeypatch)
+
+        out = execution.advance_to_reviewer("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "advanced"
+        assert parsed["next_action"] == "advance_to_terminal"
+        assert parsed["reviewer_outcome"] == "REVIEW_RECOMMEND_MERGE"
+
+    def test_idempotent_on_status_past_reviewer(self, tmp_state_db, with_github_token):
+        _seed_coded_unit()
+        for past_status in ("approved_awaiting_merge", "done"):
+            s = state.get_unit_state("F-001-U-1")
+            s.status = past_status
+            state.upsert_unit_state(s)
+
+            out = execution.advance_to_reviewer("F-001", "F-001-U-1")
+            parsed = json.loads(out)
+            assert parsed["outcome"] == "already_past", (
+                f"status={past_status} must be already_past for advance_to_reviewer"
+            )
+            assert parsed["next_action"] == "advance_to_terminal"
+
+    def test_escalated_short_circuits(self, tmp_state_db, with_github_token):
+        _seed_coded_unit()
+        s = state.get_unit_state("F-001-U-1")
+        s.status = "escalated"
+        state.upsert_unit_state(s)
+
+        out = execution.advance_to_reviewer("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "escalated"
+
+    def test_reviewer_blocked_escalates(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        monkeypatch.setattr(
+            execution,
+            "spawn_reviewer",
+            lambda f, u: "BLOCKED — reviewer for U: cannot fetch PR",
+        )
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_escalation",
+            lambda *a, **k: True,
+        )
+
+        out = execution.advance_to_reviewer("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "escalated"
+
+
+class TestAdvanceToTerminal:
+    """``advance_to_terminal`` fires the F-007 ultrareview gate if enabled and
+    the most-recent reviewer marker was ``REVIEW_RECOMMEND_MERGE``, then emits
+    the final terminal (ntfy + cycle log + status flip). Idempotent on
+    ``status='done'`` only — ``approved_awaiting_merge`` is a transient
+    state set by the reviewer marker before this tool runs.
+    """
+
+    def test_happy_path_emits_terminal(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        state.record_event(
+            "F-001-U-1",
+            "F-001",
+            "reviewer_recommend_merge",
+            source="reviewer",
+            cycle_number=0,
+            summary="endorsed",
+        )
+        s = state.get_unit_state("F-001-U-1")
+        s.status = "approved_awaiting_merge"
+        state.upsert_unit_state(s)
+
+        _stub_github(monkeypatch)
+        push_calls: list = []
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_ready_to_merge",
+            lambda *a, **k: push_calls.append((a, k)) or True,
+        )
+
+        out = execution.advance_to_terminal("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "approved_awaiting_merge"
+        assert len(push_calls) == 1, "terminal must fire ready-to-merge push"
+
+    def test_idempotent_on_done(self, tmp_state_db, with_github_token):
+        _seed_coded_unit()
+        s = state.get_unit_state("F-001-U-1")
+        s.status = "done"
+        state.upsert_unit_state(s)
+
+        out = execution.advance_to_terminal("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "already_past"
+        assert parsed["status"] == "done"
+
+    def test_escalated_short_circuits(self, tmp_state_db, with_github_token):
+        _seed_coded_unit()
+        s = state.get_unit_state("F-001-U-1")
+        s.status = "escalated"
+        state.upsert_unit_state(s)
+
+        out = execution.advance_to_terminal("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "escalated"
+
+    def test_ultrareview_skipped_when_only_comment(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """REVIEW_COMMENT terminals must not trigger ultrareview, mirroring
+        cycle_review's "endorsement-only" gate (spec.md F-007)."""
+        _seed_coded_unit()
+        _enable_ultrareview()
+        state.record_event(
+            "F-001-U-1",
+            "F-001",
+            "reviewer_comment",
+            source="reviewer",
+            cycle_number=0,
+            summary="comment only",
+        )
+
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_ready_to_merge",
+            lambda *a, **k: True,
+        )
+        calls = _stub_ultrareview(monkeypatch, passed=True)
+
+        out = execution.advance_to_terminal("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "approved_awaiting_merge"
+        assert calls["trigger"] == [], "comment-only must not fire ultrareview"
+
+    def test_ultrareview_runs_after_recommend_merge(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        _seed_coded_unit()
+        _enable_ultrareview()
+        state.record_event(
+            "F-001-U-1",
+            "F-001",
+            "reviewer_recommend_merge",
+            source="reviewer",
+            cycle_number=0,
+            summary="endorsed",
+        )
+
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_ready_to_merge",
+            lambda *a, **k: True,
+        )
+        calls = _stub_ultrareview(monkeypatch, passed=True)
+
+        out = execution.advance_to_terminal("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "approved_awaiting_merge"
+        assert len(calls["trigger"]) == 1, "ultrareview must fire after RECOMMEND_MERGE"
+
+    def test_ultrareview_failure_escalates(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        _enable_ultrareview()
+        state.record_event(
+            "F-001-U-1",
+            "F-001",
+            "reviewer_recommend_merge",
+            source="reviewer",
+            cycle_number=0,
+            summary="endorsed",
+        )
+
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_escalation",
+            lambda *a, **k: True,
+        )
+        _stub_ultrareview(monkeypatch, passed=False, findings=["bad thing"])
+
+        out = execution.advance_to_terminal("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "escalated"
+
+
+class TestCycleReviewIsWrapper:
+    """cycle_review must produce equivalent terminal output and history when
+    expressed as the three-phase sequence — the refactor is observably a
+    no-op on the success path. Keeps the daemon's ``derive_next_action`` and
+    the lead's blocking call walking the same engine (spec § "No parallel
+    state machine").
+    """
+
+    def test_happy_path_history_carries_through_all_phases(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        _seed_coded_unit()
+        monkeypatch.setattr(
+            execution,
+            "spawn_tester",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "TESTS_PASS"}),
+        )
+        monkeypatch.setattr(
+            execution,
+            "spawn_reviewer",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "REVIEW_RECOMMEND_MERGE"}),
+        )
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_ready_to_merge",
+            lambda *a, **k: True,
+        )
+
+        out = execution.cycle_review("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "approved_awaiting_merge"
+        steps = [s.get("step") for s in parsed["history"]]
+        assert "tester" in steps
+        assert "copilot_review" in steps
+        assert "reviewer" in steps
