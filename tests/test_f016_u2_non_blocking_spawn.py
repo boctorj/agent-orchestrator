@@ -135,16 +135,24 @@ class _RecordingAsyncWorker:
 
 
 def _install_worker_factory(monkeypatch, worker: _RecordingAsyncWorker) -> None:
-    monkeypatch.setattr("orchestrator.tools.execution.ManagedAgentWorker", lambda role: worker)
+    # spawn_unit_async / wait_unit go through ``make_worker(role)`` so
+    # ORCH_WORKER_BACKEND is honored — see the F-016-U-2 reviewer thread
+    # on ``orchestrator/tools/execution.py``. Tests patch the factory at
+    # its execution-module import site.
+    monkeypatch.setattr("orchestrator.tools.execution.make_worker", lambda role: worker)
 
 
 # --------------------------- spawn_unit_async ---------------------------
 
 
 class TestSpawnUnitAsyncPersistsSessionId:
-    """The ghost-row guarantee: ``coder_session_id`` is persisted to
-    state.db BEFORE ``worker.spawn_async`` returns to the caller, so a
-    lead killed between submit and return leaves a recoverable row.
+    """The ghost-row defence: ``coder_session_id`` is persisted to
+    state.db BEFORE ``spawn_unit_async`` returns, so a lead killed
+    *between this tool's return and the next call* cannot leave a row
+    with ``status=coding`` and ``coder_session_id=""``. The
+    *mid-spawn_async* window (during the worker call, before the id is
+    known) is the only remaining gap, and it's recoverable via
+    ``scan_unit_session`` from a fresh lead.
     """
 
     def test_returns_session_id_and_coding_status(self, tmp_state_db, monkeypatch):
@@ -164,13 +172,23 @@ class TestSpawnUnitAsyncPersistsSessionId:
         assert unit_state.status == "coding"
 
     def test_session_id_persisted_before_spawn_async_returns(self, tmp_state_db, monkeypatch):
-        """Killing the lead during the worker.spawn_async call must not strand
-        the unit. Reproduce that scenario by raising mid-spawn_async (after the
-        observer has observed the unit row) and asserting state.db carries the
-        unit + a placeholder session marker.
+        """Pin both halves of the ghost-row defence in one test:
 
-        We use a poison-pill observer that runs INSIDE spawn_async to check
-        the state row exists with status=coding before spawn_async returns.
+        1. **During** ``worker.spawn_async`` — the row exists with
+           ``status="coding"`` and ``branch`` set, BUT
+           ``coder_session_id=""`` (we don't have the id yet). A lead
+           killed in this window leaves a row recoverable via
+           ``scan_unit_session`` from a fresh lead, since the worker
+           session is live on the backend.
+        2. **After** ``spawn_unit_async`` returns — the row carries the
+           ``coder_session_id`` returned by ``worker.spawn_async``. A
+           future regression that moved the post-spawn upsert later (or
+           dropped it) would now fail HERE, not silently pass.
+
+        The two assertions together defend the spec contract (*"session
+        id persisted before spawn_unit_async returns"*) without
+        overclaiming the impossible (*"persisted before worker.spawn_async
+        returns"* — that would require knowing the id before getting it).
         """
         _seed_feature()
 
@@ -178,20 +196,33 @@ class TestSpawnUnitAsyncPersistsSessionId:
 
         def observer() -> None:
             # Called from inside the worker.spawn_async stub, BEFORE it
-            # returns the session_id. The unit row must already carry
-            # status=coding so a kill here leaves a recoverable record.
-            row = state.get_unit_state("F-016-U-1")
-            observed["row"] = row
+            # returns the session_id. Snapshot the in-window row so the
+            # post-call assertions can compare both sides.
+            observed["row"] = state.get_unit_state("F-016-U-1")
 
         worker = _RecordingAsyncWorker("coder", session_id="sesn-x", spawn_observer=observer)
         _install_worker_factory(monkeypatch, worker)
 
         execution.spawn_unit_async("F-016", "F-016-U-1")
 
+        # (1) In-window state: row exists, status=coding, branch set,
+        # but session_id is still empty (we haven't received it yet).
         row = observed["row"]
         assert row is not None
         assert row.status == "coding"
         assert row.branch  # branch is set pre-submit
+        assert row.coder_session_id == "", (
+            "in-window state must be (status=coding, session_id='') — the "
+            "row exists for recovery, but the id isn't known yet"
+        )
+
+        # (2) Post-return state: coder_session_id now carries the value
+        # spawn_async returned. This is the load-bearing assertion for
+        # the spec contract.
+        post = state.get_unit_state("F-016-U-1")
+        assert post is not None
+        assert post.coder_session_id == "sesn-x"
+        assert post.status == "coding"
 
     def test_records_spawn_coder_event(self, tmp_state_db, monkeypatch):
         _seed_feature()

@@ -182,10 +182,14 @@ class _NonBlockingWorker:
 
 def _patch_worker(monkeypatch, worker: _NonBlockingWorker) -> None:
     """Install ``worker`` as the value returned by every
-    ``ManagedAgentWorker(role=...)`` construction inside
-    ``orchestrator.tools.execution``.
+    ``make_worker(role)`` call inside ``orchestrator.tools.execution``.
+
+    F-016-U-2 routes ``spawn_unit_async`` / ``wait_unit`` through the
+    ``orchestrator.workers.make_worker`` factory so ``ORCH_WORKER_BACKEND``
+    is honored end-to-end. Patching the factory at the execution-module
+    import site keeps the test stub agnostic to backend selection.
     """
-    monkeypatch.setattr("orchestrator.tools.execution.ManagedAgentWorker", lambda role: worker)
+    monkeypatch.setattr("orchestrator.tools.execution.make_worker", lambda role: worker)
 
 
 # ===========================================================================
@@ -200,7 +204,10 @@ class TestSpawnUnitAsyncLatency:
     a regression that swaps ``spawn_async`` for ``spawn`` (or that
     silently calls ``wait_idle`` to "be helpful") would explode wall
     time. We give the wait_idle path a 5-second sleep and require the
-    whole call to return in well under that.
+    whole call to return well under the **spec** budget (3s) — tighter
+    bounds (e.g. <1s) over-constrain slow CI runners and flake without
+    catching extra regressions; if the impl ever blocks on wait_idle the
+    5-second sleep makes the failure obvious either way.
     """
 
     def test_returns_in_well_under_three_seconds(self, tmp_state_db, monkeypatch, _fake_pat):
@@ -212,10 +219,10 @@ class TestSpawnUnitAsyncLatency:
         result = execution.spawn_unit_async(feature_id, unit_id)
         elapsed = time.monotonic() - t0
 
-        # Tight upper bound: the test harness is doing string composition
-        # + 2 SQLite writes + 1 stub call. The 3-second spec budget is
-        # for real network IO; the unit test should finish in << 1s.
-        assert elapsed < 1.0, f"spawn_unit_async took {elapsed:.3f}s (budget < 1.0s)"
+        # Spec budget is 3s for real network IO. We match it here rather
+        # than over-tightening — a wait_idle-induced regression sleeps 5s
+        # (see ``_NonBlockingWorker.wait_sleep_s``) so 3.0s still catches it.
+        assert elapsed < 3.0, f"spawn_unit_async took {elapsed:.3f}s (spec budget < 3.0s)"
         assert result.startswith("{"), f"expected JSON, got: {result!r}"
 
     def test_does_not_call_wait_idle_even_if_it_would_block(
@@ -225,7 +232,7 @@ class TestSpawnUnitAsyncLatency:
         would defeat the whole point of the dispatcher/watcher split.
 
         Give ``wait_idle`` a 5-second sleep; assert it is never reached
-        and that the spawn call returns immediately.
+        and that the spawn call returns well under the spec budget.
         """
         feature_id, unit_id = _seed_approved()
         worker = _NonBlockingWorker("coder", wait_sleep_s=5.0)
@@ -236,7 +243,9 @@ class TestSpawnUnitAsyncLatency:
         elapsed = time.monotonic() - t0
 
         assert worker.wait_idle_calls == []
-        assert elapsed < 1.0, f"spawn_unit_async took {elapsed:.3f}s — suggests it called wait_idle"
+        # Same 3.0s spec budget — the 5s wait_idle sleep is the
+        # regression signal, well outside the spec window.
+        assert elapsed < 3.0, f"spawn_unit_async took {elapsed:.3f}s — suggests it called wait_idle"
 
 
 # ===========================================================================
@@ -727,7 +736,14 @@ class TestMcpRegistration:
         # FastMCP's tool registry is async-only; spin a dedicated loop
         # to avoid leaning on whatever loop state earlier tests left
         # behind (some plugins close the default loop after teardown).
-        tools = asyncio.new_event_loop().run_until_complete(mcp.list_tools())
+        # The loop MUST be closed in a finally — otherwise the test
+        # leaks an unreaped event loop and the suite emits
+        # ``ResourceWarning: unclosed event loop`` (PR #57 review).
+        loop = asyncio.new_event_loop()
+        try:
+            tools = loop.run_until_complete(mcp.list_tools())
+        finally:
+            loop.close()
         names = {t.name for t in tools}
         assert "spawn_unit_async" in names, (
             f"spawn_unit_async not registered with MCP (have: {sorted(names)[:10]}…)"

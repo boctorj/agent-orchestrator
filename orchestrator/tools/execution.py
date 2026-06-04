@@ -40,6 +40,7 @@ from orchestrator.tools import (
     safe_submit_pr_review,
     tail,
 )
+from orchestrator.workers import make_worker
 
 # --------------------------- task-message context helpers ---------------------------
 
@@ -265,19 +266,27 @@ def spawn_unit_async(feature_id: str, unit_id: str) -> str:
     """Dispatch a coder for one unit; return in ~2s without waiting.
 
     Phase 1 of the dispatcher/watcher split (F-016). Persists
-    ``coder_session_id`` to ``state.db`` BEFORE the worker call returns
-    — a lead killed between submit and return leaves a recoverable row
-    rather than the ghost-row failure mode (status=coding with empty
-    session_id) the F-014-U-1 escalation surfaced. Pair with
+    ``coder_session_id`` to ``state.db`` BEFORE ``spawn_unit_async``
+    returns — a lead killed between this tool's return and the next
+    ``wait_unit`` / daemon tick leaves a recoverable row rather than the
+    ghost-row failure mode (status=coding with empty session_id) the
+    F-014-U-1 escalation surfaced. Pair with
     ``wait_unit(unit_id, 'coder')`` when the caller wants the marker, or
     let the F-016-U-5 watcher daemon advance the unit asynchronously.
+
+    The mid-spawn window — between ``worker.spawn_async`` accepting the
+    dispatch and us writing the session id — is the only state where the
+    row exists with ``coder_session_id=""``; a fresh lead can still
+    recover via ``scan_unit_session`` since the row carries
+    ``status=coding`` and the worker session is live on the backend.
 
     Same preconditions as ``spawn_unit``: feature loaded + approved,
     GITHUB_TOKEN set, target repo fresh-verified.
 
-    Backend support: ``managed_agents`` only today. The ``docker``
-    backend raises ``NotImplementedError`` from ``spawn_async`` — see
-    ``orchestrator.workers.docker_claude_code``.
+    Backend selection follows ``ORCH_WORKER_BACKEND`` via
+    :func:`orchestrator.workers.make_worker`. The ``docker`` backend's
+    ``spawn_async`` raises ``NotImplementedError`` until its async split
+    lands; the lead sees an actionable error rather than a silent block.
     """
     if err := ensure_verified_for_feature(feature_id):
         return err
@@ -333,7 +342,7 @@ def spawn_unit_async(feature_id: str, unit_id: str) -> str:
     )
 
     try:
-        worker = ManagedAgentWorker(role="coder")
+        worker = make_worker("coder")
         session_id = worker.spawn_async(task, title=f"{unit_id}: {unit.title}")
     except Exception as e:  # noqa: BLE001 — surface as orchestrator error
         state.touch_unit(unit_id, status="escalated", error=str(e))
@@ -380,11 +389,12 @@ def spawn_unit_async(feature_id: str, unit_id: str) -> str:
 def wait_unit(unit_id: str, role: str = "coder", timeout_s: int = 600) -> str:
     """Explicit-wait counterpart to ``spawn_unit_async`` / ``resume_async``.
 
-    Streams the worker session via ``ManagedAgentWorker.wait_idle`` and:
+    Streams the worker session via the backend's ``wait_idle`` and:
 
       * on a recognised terminal marker → records the event idempotently
         (Phase-0 dedupe), advances the unit row, returns the parsed
-        marker as JSON.
+        marker plus its extras (``pr_url`` / ``pr_number`` / etc.) as
+        JSON.
       * on ``TimeoutError`` after ``timeout_s`` → returns
         ``{"status": "still_running", "reason": "timeout"}`` WITHOUT
         flipping the unit row. The caller (lead or daemon) decides
@@ -394,7 +404,10 @@ def wait_unit(unit_id: str, role: str = "coder", timeout_s: int = 600) -> str:
         read surface; ``cycle_review`` keeps the "no marker → escalate"
         policy.
 
-    Backend support: ``managed_agents`` only today — see ``spawn_unit_async``.
+    Backend selection follows ``ORCH_WORKER_BACKEND`` via
+    :func:`orchestrator.workers.make_worker` — the ``docker`` backend's
+    ``wait_idle`` raises ``NotImplementedError`` until its async split
+    lands.
 
     Args:
         unit_id: The work unit to wait on.
@@ -413,7 +426,7 @@ def wait_unit(unit_id: str, role: str = "coder", timeout_s: int = 600) -> str:
         return f"ERROR: no {role} session for {unit_id} — likely never spawned"
 
     try:
-        worker = ManagedAgentWorker(role=role)
+        worker = make_worker(role)
         response = worker.wait_idle(session_id, timeout_seconds=timeout_s)
     except TimeoutError:
         return json.dumps(
@@ -455,17 +468,23 @@ def wait_unit(unit_id: str, role: str = "coder", timeout_s: int = 600) -> str:
             indent=2,
         )
 
+    # ``_record_terminal_marker`` returns ``{"marker": <name>, **extras}``
+    # — for PR_URL that includes ``pr_url`` + ``pr_number``; for BLOCKED
+    # the structured payload. Spread it into the response so callers
+    # don't have to call ``unit_history`` to recover the URL the worker
+    # just emitted.
     refreshed = state.get_unit_state(unit_id)
     return json.dumps(
         {
             "unit_id": unit_id,
             "role": role,
             "session_id": session_id,
-            "marker": marker["marker"],
+            **marker,
             "status": refreshed.status if refreshed else unit_state.status,
             "response_tail": tail(response),
         },
         indent=2,
+        default=str,
     )
 
 

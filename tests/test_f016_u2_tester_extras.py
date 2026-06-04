@@ -173,7 +173,9 @@ class _RecordingWorker:
 
 
 def _install_worker(monkeypatch, worker: _RecordingWorker) -> None:
-    monkeypatch.setattr("orchestrator.tools.execution.ManagedAgentWorker", lambda role: worker)
+    # F-016-U-2 routes the new async tools through ``make_worker(role)``
+    # so ``ORCH_WORKER_BACKEND`` is honored. Patch the factory.
+    monkeypatch.setattr("orchestrator.tools.execution.make_worker", lambda role: worker)
 
 
 # ===========================================================================
@@ -500,9 +502,9 @@ class TestPredecessorRoleGateConsistency:
 
         monkeypatch.setattr(state, "get_unit_state", _spy)
         # Don't even need a worker stub — the path must reject before
-        # ``ManagedAgentWorker`` is touched.
+        # ``make_worker`` is touched.
         monkeypatch.setattr(
-            "orchestrator.tools.execution.ManagedAgentWorker",
+            "orchestrator.tools.execution.make_worker",
             lambda role: (_ for _ in ()).throw(
                 AssertionError("worker constructed despite unknown role")
             ),
