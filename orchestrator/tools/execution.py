@@ -1075,7 +1075,19 @@ def _pr_url_for(feature_id: str, unit_state: WorkUnitState | None) -> str | None
 
 
 def _emit_terminal(ctx: CycleContext, outcome: str, msg: str) -> str:
-    """Final return value of cycle_review. Fires ntfy push as side effect."""
+    """Final return value of cycle_review. Fires ntfy push as side effect.
+
+    The ``approved_awaiting_merge`` ntfy push is dedupe-keyed per unit via
+    the ``cycle_terminal_emitted`` event row: ``state.record_event`` with a
+    constant ``cycle_terminal_emitted:<unit_id>`` key uses
+    ``INSERT OR IGNORE`` (Phase 0's primitive) so the second call against
+    the same unit returns ``rowcount == 0`` and the status flip + ntfy push
+    skip. Closes the F-016-U-5 daemon's notification-storm window: a unit
+    sitting in ``approved_awaiting_merge`` for hours waiting on the human
+    merge collects exactly one push, not one per poll interval (PR #58 H1).
+    The escalation branch stays unconditional — re-escalation is rare and
+    the human needs the signal each time.
+    """
     # Finalize the cycle log before the ntfy push so an operator who taps
     # the notification and looks at features/F-XXX/U-N.md sees the
     # current terminal state captured on disk. Covers all cycle_review
@@ -1090,12 +1102,31 @@ def _emit_terminal(ctx: CycleContext, outcome: str, msg: str) -> str:
     if outcome == "escalated":
         ntfy.push_escalation(ctx.unit_id, msg, pr_url=pr_url)
     elif outcome == "approved_awaiting_merge":
-        # Persist the awaiting-merge status before pushing — the ntfy listener
-        # follows the URL to the dashboard, which reads this row. The flip is
-        # gated on an active from-state so a stray re-entry can't drift a
-        # `done` unit back to `approved_awaiting_merge` (F-009-U-4).
-        _flip_status_if_active(ctx.unit_id, target="approved_awaiting_merge")
-        ntfy.push_ready_to_merge(ctx.unit_id, pr_url or "(no PR url)", summary=msg)
+        # Dedupe via cycle_terminal_emitted event. INSERT OR IGNORE on the
+        # per-unit dedupe_key means a re-call (daemon tick, accidental
+        # double cycle_review, etc.) returns False here and skips the
+        # status flip + ntfy push (PR #58 H1). Without this, the F-016-U-5
+        # daemon would re-fire the ntfy push on every tick against a unit
+        # sitting in approved_awaiting_merge — a notification storm for
+        # any unit waiting hours/days for the human merge.
+        inserted = state.record_event(
+            ctx.unit_id,
+            ctx.feature_id,
+            "cycle_terminal_emitted",
+            source="orchestrator",
+            cycle_number=unit_state.review_round if unit_state else None,
+            summary="approved_awaiting_merge terminal fired",
+            details=msg,
+            dedupe_key=f"cycle_terminal_emitted:{ctx.unit_id}",
+        )
+        if inserted:
+            # Persist the awaiting-merge status before pushing — the ntfy
+            # listener follows the URL to the dashboard, which reads this
+            # row. The flip is gated on an active from-state so a stray
+            # re-entry can't drift a `done` unit back to
+            # `approved_awaiting_merge` (F-009-U-4).
+            _flip_status_if_active(ctx.unit_id, target="approved_awaiting_merge")
+            ntfy.push_ready_to_merge(ctx.unit_id, pr_url or "(no PR url)", summary=msg)
 
     final_state_json = get_unit_status(ctx.unit_id)
     try:
@@ -2377,9 +2408,370 @@ def _ultrareview_phase(ctx: CycleContext) -> tuple[bool, str | None]:
     return False, f"ultrareview failed:\n{findings_text}"
 
 
+# --------------------------- F-016 Phase 2: phase commands ---------------------------
+#
+# Status sets define each phase's idempotence boundary: a unit whose status
+# falls in the bucket has already moved past that phase, so the corresponding
+# ``advance_to_X`` returns an ``already_past`` no-op. Single source of truth
+# for the daemon (F-016-U-5) and the lead.
+#
+# Why ``approved_awaiting_merge`` is NOT in ``_PAST_TERMINAL_STATUSES``: the
+# REVIEW_RECOMMEND_MERGE marker flips status to ``approved_awaiting_merge``
+# BEFORE ``advance_to_terminal`` runs; treating it as already-past on the
+# status side alone would skip the ntfy push + cycle-log finalize in
+# ``_emit_terminal``. Re-call dedupe is layered instead via
+# ``_terminal_already_emitted`` (the ``cycle_terminal_emitted`` event row
+# ``_emit_terminal`` records on its first success); a daemon re-tick during
+# the human-merge waiting window reads that event and short-circuits to
+# ``already_past`` without re-pushing ntfy (PR #58 H1). The narrow status
+# bucket + the event-based dedupe together fence the firing window from
+# both sides.
+_PAST_TESTER_STATUSES: frozenset[str] = frozenset(
+    {"reviewing", "fixing", "approved_awaiting_merge", "done"}
+)
+_PAST_REVIEWER_STATUSES: frozenset[str] = frozenset({"approved_awaiting_merge", "done"})
+_PAST_TERMINAL_STATUSES: frozenset[str] = frozenset({"done"})
+
+
+def _not_ready_response(unit_id: str) -> str:
+    """JSON when ``advance_to_X`` is called before ``spawn_unit`` ran.
+
+    The unit row doesn't exist yet — no PR, no worker session. Distinct
+    from ``escalated`` (a terminal failure with last_error context) so a
+    Phase-3 daemon can branch on it: ``not_ready`` means "wait" or
+    "spawn first", not "human triage needed".
+    """
+    return json.dumps(
+        {
+            "unit_id": unit_id,
+            "outcome": "not_ready",
+            "message": f"no state for unit {unit_id} — call spawn_unit first",
+        },
+        indent=2,
+    )
+
+
+def _already_past_response(unit_id: str, unit_state: WorkUnitState, next_action: str | None) -> str:
+    """JSON for a no-op ``advance_to_X`` call.
+
+    Shape mirrors the success-advance JSON so callers (lead chat + daemon)
+    don't need to special-case the idempotent path: same ``unit_id`` /
+    ``status`` / ``next_action`` keys, distinguished only by
+    ``outcome == "already_past"``.
+    """
+    return json.dumps(
+        {
+            "unit_id": unit_id,
+            "outcome": "already_past",
+            "status": unit_state.status,
+            "next_action": next_action,
+        },
+        indent=2,
+    )
+
+
+def _escalated_response(unit_id: str, unit_state: WorkUnitState) -> str:
+    """JSON for an ``advance_to_X`` call on an already-escalated unit.
+
+    Surfaces ``last_error`` so the lead can see why the unit was escalated
+    without an extra ``unit_history`` round-trip. Distinct outcome from
+    ``already_past`` so a Phase-3 daemon can branch on it: escalated units
+    need a human decision, not the next advance.
+    """
+    return json.dumps(
+        {
+            "unit_id": unit_id,
+            "outcome": "escalated",
+            "status": "escalated",
+            "message": unit_state.last_error or "unit already escalated",
+        },
+        indent=2,
+    )
+
+
+def _advance_response(unit_id: str, next_action: str, ctx: CycleContext, **extras: Any) -> str:
+    """JSON for a successful ``advance_to_X`` mid-pipeline advance.
+
+    Intermediate phases (tester, reviewer) don't emit the terminal — that's
+    ``advance_to_terminal``'s job. This helper packages the post-phase
+    status + accumulated history into a uniform shape for the chat and the
+    daemon's reconcile loop.
+    """
+    refreshed = state.get_unit_state(unit_id)
+    body: dict[str, Any] = {
+        "unit_id": unit_id,
+        "outcome": "advanced",
+        "status": refreshed.status if refreshed else "unknown",
+        "next_action": next_action,
+        "history": ctx.history,
+    }
+    body.update(extras)
+    return json.dumps(body, indent=2)
+
+
+def _last_reviewer_outcome(unit_id: str) -> str | None:
+    """Most-recent reviewer terminal marker for the unit, as a marker name.
+
+    Returns ``"REVIEW_RECOMMEND_MERGE"`` / ``"REVIEW_COMMENT"`` /
+    ``"REVIEW_REQUEST_CHANGES"`` or ``None`` if no reviewer marker has
+    landed yet. Used by ``advance_to_terminal`` to decide whether to fire
+    the F-007 ultrareview gate — only endorsements (RECOMMEND_MERGE)
+    trigger it. Reads events rather than threading the outcome through a
+    separate state column so the lead+daemon callers don't need to share
+    in-memory context across MCP calls.
+    """
+    events = state.list_events(unit_id)
+    # Events are oldest-first; we want the most recent reviewer marker.
+    marker_for_event = {
+        "reviewer_recommend_merge": "REVIEW_RECOMMEND_MERGE",
+        "reviewer_comment": "REVIEW_COMMENT",
+        "reviewer_request_changes": "REVIEW_REQUEST_CHANGES",
+    }
+    for event in reversed(events):
+        marker = marker_for_event.get(event.get("event_type", ""))
+        if marker is not None:
+            return marker
+    return None
+
+
+def _terminal_already_emitted(unit_id: str) -> bool:
+    """True iff ``_emit_terminal`` has already fired the
+    ``approved_awaiting_merge`` ntfy push for this unit.
+
+    Checks for the ``cycle_terminal_emitted`` event ``_emit_terminal``
+    records via the per-unit dedupe_key. The single-row read lets
+    ``advance_to_terminal`` short-circuit a daemon re-tick (PR #58 H1)
+    against a unit waiting hours/days for the human merge: status sits
+    in ``approved_awaiting_merge`` for the duration but the dedupe event
+    pins "the terminal already fired", so the second call returns
+    ``already_past`` rather than re-pushing the ntfy.
+    """
+    return any(e.get("event_type") == "cycle_terminal_emitted" for e in state.list_events(unit_id))
+
+
+def _run_tester_advance(ctx: CycleContext) -> tuple[bool, str | None]:
+    """Tester-phase work: GATE 1 (CI on coder push) → tester → GATE 2.
+
+    Returns ``(success, escalation_msg)``. Shared by ``advance_to_tester``
+    and the ``cycle_review`` wrapper so both paths walk the same engine
+    (spec § "No parallel state machine").
+    """
+    ok, msg = _wait_ci_with_fix_loop(ctx, "coder PR push")
+    if not ok:
+        return False, msg or "CI gate failed before tester"
+
+    passed, msg = _tester_phase(ctx)
+    if not passed:
+        return False, msg or "tester phase failed"
+
+    ok, msg = _wait_ci_with_fix_loop(ctx, "tester test push")
+    if not ok:
+        return False, msg or "CI gate failed before reviewer"
+
+    return True, None
+
+
+def _run_reviewer_advance(ctx: CycleContext) -> tuple[bool, str | None, str | None]:
+    """Reviewer-phase work: copilot best-effort + reviewer fix-loop.
+
+    Returns ``(success, escalation_msg, reviewer_outcome)`` where
+    ``reviewer_outcome`` is the final reviewer marker name
+    (``"REVIEW_RECOMMEND_MERGE"`` / ``"REVIEW_COMMENT"`` / ``"BLOCKED…"``)
+    so callers can branch on endorsement vs. comment-only.
+    """
+    _copilot_phase(ctx)
+    approved, msg, reviewer_outcome = _reviewer_phase(ctx)
+    if not approved:
+        return False, msg or "reviewer phase failed", reviewer_outcome
+    return True, None, reviewer_outcome
+
+
+def _run_terminal_advance(
+    ctx: CycleContext, reviewer_outcome: str | None
+) -> tuple[bool, str | None]:
+    """Terminal-phase work: optional ultrareview gate per F-007.
+
+    Doesn't emit the terminal itself — the caller does, so the wrapper can
+    share one ``_emit_terminal`` call (one ntfy push, one cycle-log write)
+    across the three phases. ``reviewer_outcome`` gates the ultrareview
+    fire: only ``REVIEW_RECOMMEND_MERGE`` triggers the audit (comment-only
+    terminals aren't endorsements; the gate stays quiet).
+    """
+    feature = state.get_feature(ctx.feature_id)
+    if (
+        reviewer_outcome == "REVIEW_RECOMMEND_MERGE"
+        and feature is not None
+        and feature.ultrareview_enabled
+    ):
+        ur_passed, ur_msg = _ultrareview_phase(ctx)
+        if not ur_passed:
+            return False, ur_msg or "ultrareview phase failed"
+    return True, None
+
+
+_TERMINAL_SUCCESS_MSG = (
+    "Review terminal (approved/comment/recommend_merge), CI green. PR awaits human merge."
+)
+
+
+@mcp.tool()
+def advance_to_tester(feature_id: str, unit_id: str) -> str:
+    """Phase 1 of the cycle pipeline: wait for CI green → tester → CI green.
+
+    Idempotent on current ``WorkUnitState.status``: returns ``already_past``
+    when the unit has moved past the tester boundary (status in
+    ``{reviewing, fixing, approved_awaiting_merge, done}``). On escalation,
+    fires the same terminal handler as ``cycle_review`` so the cycle log +
+    ntfy push land.
+
+    Returns JSON ``{unit_id, outcome, status, next_action, ...}`` where
+    ``outcome`` is one of ``advanced`` / ``already_past`` / ``escalated`` /
+    ``not_ready``. F-016 Phase 2 — pair with ``advance_to_reviewer`` and
+    ``advance_to_terminal`` to drive the pipeline phase-by-phase.
+    """
+    if err := ensure_verified_for_feature(feature_id):
+        return err
+
+    unit_state = state.get_unit_state(unit_id)
+    if unit_state is None:
+        return _not_ready_response(unit_id)
+
+    if unit_state.status == "escalated":
+        return _escalated_response(unit_id, unit_state)
+
+    if unit_state.status in _PAST_TESTER_STATUSES:
+        return _already_past_response(unit_id, unit_state, next_action="advance_to_reviewer")
+
+    ctx = CycleContext(feature_id=feature_id, unit_id=unit_id, history=[])
+    ok, msg = _run_tester_advance(ctx)
+    if not ok:
+        return _emit_terminal(ctx, "escalated", msg or "tester phase failed")
+
+    return _advance_response(unit_id, next_action="advance_to_reviewer", ctx=ctx)
+
+
+@mcp.tool()
+def advance_to_reviewer(feature_id: str, unit_id: str) -> str:
+    """Phase 2 of the cycle pipeline: Copilot review (best-effort) + reviewer.
+
+    Idempotent on current ``WorkUnitState.status``: returns ``already_past``
+    when status is in ``{approved_awaiting_merge, done}``. On reviewer
+    BLOCKED or cap-3 hit, fires the terminal handler. Mid-flight restart
+    (lead killed between tester and reviewer phases) is supported via
+    ``_resume_or_spawn_reviewer`` — the existing reviewer session is reused
+    for a cheap verdict re-emission rather than a cold spawn (F-013-U-2).
+    """
+    if err := ensure_verified_for_feature(feature_id):
+        return err
+
+    unit_state = state.get_unit_state(unit_id)
+    if unit_state is None:
+        return _not_ready_response(unit_id)
+
+    if unit_state.status == "escalated":
+        return _escalated_response(unit_id, unit_state)
+
+    if unit_state.status in _PAST_REVIEWER_STATUSES:
+        return _already_past_response(unit_id, unit_state, next_action="advance_to_terminal")
+
+    ctx = CycleContext(feature_id=feature_id, unit_id=unit_id, history=[])
+    ok, msg, reviewer_outcome = _run_reviewer_advance(ctx)
+    if not ok:
+        return _emit_terminal(ctx, "escalated", msg or "reviewer phase failed")
+
+    return _advance_response(
+        unit_id,
+        next_action="advance_to_terminal",
+        ctx=ctx,
+        reviewer_outcome=reviewer_outcome,
+    )
+
+
+@mcp.tool()
+def advance_to_terminal(feature_id: str, unit_id: str) -> str:
+    """Phase 3 of the cycle pipeline: optional F-007 ultrareview gate, then
+    emit the terminal (ntfy push + cycle-log finalize + status flip).
+
+    **Reviewer-marker precondition (PR #58 C1).** The success path requires
+    a prior ``reviewer_recommend_merge`` or ``reviewer_comment`` event for
+    this unit. Without one, the call returns ``not_ready`` and does NOT
+    flip status, fire ntfy, or finalize cycle-log — exactly the false
+    "ready to merge" notification the daemon (F-016-U-5) would otherwise
+    push on every poll of a unit still in ``coding`` / ``testing`` /
+    ``in_ci`` / ``reviewing`` / ``fixing``. ``reviewer_request_changes``
+    and the absence of a marker both fall under "no terminal possible
+    yet"; the caller's right next step is ``advance_to_reviewer``.
+
+    **Idempotence on terminal emit (PR #58 H1).** The first successful
+    terminal-emit records a ``cycle_terminal_emitted`` event keyed on the
+    unit; subsequent calls (daemon re-ticks, accidental double
+    ``cycle_review``) read the event in the early already-emitted check
+    and return ``already_past`` without re-firing the ntfy push. The
+    ``status='done'`` short-circuit handles the post-merge path; the
+    event check handles the ``approved_awaiting_merge`` waiting window
+    where a unit can sit for hours/days before a human merges.
+
+    Reads the latest reviewer marker from ``unit_events`` to decide
+    whether to fire ultrareview — only ``REVIEW_RECOMMEND_MERGE``
+    endorsements trigger it (REVIEW_COMMENT terminals are comment-only,
+    not endorsements).
+    """
+    if err := ensure_verified_for_feature(feature_id):
+        return err
+
+    unit_state = state.get_unit_state(unit_id)
+    if unit_state is None:
+        return _not_ready_response(unit_id)
+
+    if unit_state.status == "escalated":
+        return _escalated_response(unit_id, unit_state)
+
+    if unit_state.status in _PAST_TERMINAL_STATUSES:
+        return _already_past_response(unit_id, unit_state, next_action=None)
+
+    # H1 dedupe: if a previous _emit_terminal already fired the ntfy push
+    # and flipped status, the dedupe-keyed cycle_terminal_emitted event
+    # lives in unit_events. Treat the unit as already_past so the daemon's
+    # repeated calls during the human-merge waiting window are no-ops.
+    if _terminal_already_emitted(unit_id):
+        return _already_past_response(unit_id, unit_state, next_action=None)
+
+    reviewer_outcome = _last_reviewer_outcome(unit_id)
+
+    # C1 precondition: no reviewer endorsement / comment means the
+    # terminal phase is not the next action. Returning not_ready (rather
+    # than silently emitting a false-positive "ready to merge") is the
+    # contract every misuse route (lead typo, daemon speculative tick,
+    # test forgetting to seed events) needs.
+    if reviewer_outcome not in ("REVIEW_RECOMMEND_MERGE", "REVIEW_COMMENT"):
+        return json.dumps(
+            {
+                "unit_id": unit_id,
+                "outcome": "not_ready",
+                "status": unit_state.status,
+                "message": (
+                    "no reviewer marker yet — run advance_to_reviewer first "
+                    "(latest reviewer event: " + (reviewer_outcome or "none") + ")"
+                ),
+            },
+            indent=2,
+        )
+
+    ctx = CycleContext(feature_id=feature_id, unit_id=unit_id, history=[])
+    ok, msg = _run_terminal_advance(ctx, reviewer_outcome)
+    if not ok:
+        return _emit_terminal(ctx, "escalated", msg or "ultrareview phase failed")
+
+    return _emit_terminal(ctx, "approved_awaiting_merge", _TERMINAL_SUCCESS_MSG)
+
+
 @mcp.tool()
 def cycle_review(feature_id: str, unit_id: str) -> str:
-    """Full automated post-spawn loop:
+    """Convenience wrapper: ``advance_to_tester`` → ``advance_to_reviewer``
+    → ``advance_to_terminal``, sharing one ``CycleContext`` so history,
+    ntfy push, and cycle-log finalize happen exactly once.
+
+    The post-spawn loop:
       tester → (if BUG: address_review → tester) → Copilot review →
       our reviewer → (if CHANGES: address_review → reviewer) → optional
       ultrareview gate (if feature.ultrareview_enabled) → terminal.
@@ -2398,51 +2790,32 @@ def cycle_review(feature_id: str, unit_id: str) -> str:
     verdict) rather than spawning a fresh one. See
     ``docs/STATE-MACHINE-AUDIT.md``
     § "Stale-session recovery at tester/reviewer re-entry".
+
+    Why a shared ``CycleContext`` rather than three nested MCP calls: the
+    three ``_run_*_advance`` helpers are the engine, the MCP tools are
+    thin wrappers around them with their own idempotence checks. Sharing
+    one ctx keeps history contiguous and lets ``_emit_terminal`` fire
+    exactly once with the full timeline — spec § "No parallel state
+    machine" makes the engine the contract, not the MCP-call topology.
     """
     if err := ensure_verified_for_feature(feature_id):
         return err
 
     ctx = CycleContext(feature_id=feature_id, unit_id=unit_id, history=[])
 
-    # GATE 1: wait for CI on the coder's initial PR push before testing.
-    # If CI is red, the helper runs an embedded fix loop (counts toward CAP_3).
-    ok, msg = _wait_ci_with_fix_loop(ctx, "coder PR push")
+    ok, msg = _run_tester_advance(ctx)
     if not ok:
-        return _emit_terminal(ctx, "escalated", msg or "CI gate failed before tester")
-
-    passed, msg = _tester_phase(ctx)
-    if not passed:
         return _emit_terminal(ctx, "escalated", msg or "tester phase failed")
 
-    # GATE 2: tester pushed its tests; wait for CI green before Copilot + reviewer.
-    ok, msg = _wait_ci_with_fix_loop(ctx, "tester test push")
+    ok, msg, reviewer_outcome = _run_reviewer_advance(ctx)
     if not ok:
-        return _emit_terminal(ctx, "escalated", msg or "CI gate failed before reviewer")
-
-    _copilot_phase(ctx)
-
-    approved, msg, reviewer_outcome = _reviewer_phase(ctx)
-    if not approved:
         return _emit_terminal(ctx, "escalated", msg or "reviewer phase failed")
 
-    # F-007 ultrareview gate: opt-in per feature, fires only after our
-    # reviewer endorsed via REVIEW_RECOMMEND_MERGE (REVIEW_COMMENT is a
-    # comment-only terminal — not an endorsement, so the gate is skipped).
-    feature = state.get_feature(ctx.feature_id)
-    if (
-        reviewer_outcome == "REVIEW_RECOMMEND_MERGE"
-        and feature is not None
-        and feature.ultrareview_enabled
-    ):
-        ur_passed, ur_msg = _ultrareview_phase(ctx)
-        if not ur_passed:
-            return _emit_terminal(ctx, "escalated", ur_msg or "ultrareview phase failed")
+    ok, msg = _run_terminal_advance(ctx, reviewer_outcome)
+    if not ok:
+        return _emit_terminal(ctx, "escalated", msg or "ultrareview phase failed")
 
-    return _emit_terminal(
-        ctx,
-        "approved_awaiting_merge",
-        "Review terminal (approved/comment/recommend_merge), CI green. PR awaits human merge.",
-    )
+    return _emit_terminal(ctx, "approved_awaiting_merge", _TERMINAL_SUCCESS_MSG)
 
 
 # --------------------------- send_to_unit (low-level) ---------------------------

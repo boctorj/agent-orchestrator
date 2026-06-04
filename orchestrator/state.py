@@ -543,10 +543,21 @@ def record_event(
 
 
 def list_events(unit_id: str, limit: int = 200) -> list[dict]:
-    """Return events for a unit, oldest first."""
+    """Return events for a unit, oldest first.
+
+    Ties on ``ts`` (the ISO-formatted timestamp) break by ``id`` —
+    SQLite's primary-key autoincrement, monotonic with insertion order —
+    so callers reading the timeline get a stable, insertion-faithful
+    order regardless of clock resolution. ``datetime.now(UTC)`` on
+    Windows can return identical microsecond strings for back-to-back
+    ``record_event`` calls in a tight loop; without the secondary key
+    the order of those rows is implementation-defined and breaks
+    downstream readers like ``_last_reviewer_outcome`` that look for
+    the most-recent marker.
+    """
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT * FROM unit_events WHERE unit_id = ? ORDER BY ts LIMIT ?",
+            "SELECT * FROM unit_events WHERE unit_id = ? ORDER BY ts, id LIMIT ?",
             (unit_id, limit),
         ).fetchall()
     return [dict(r) for r in rows]
