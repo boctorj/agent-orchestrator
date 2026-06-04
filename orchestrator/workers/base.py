@@ -72,6 +72,41 @@ class Worker(Protocol):
         """Send a follow-up message to an existing session. Returns final text."""
         ...
 
+    # ----- F-016 Phase 1: non-blocking dispatch primitives ----
+    # The dispatcher/watcher split (docs/PROPOSAL-async-orchestrator.md)
+    # leans on a submit/wait split: ``spawn_async`` / ``resume_async``
+    # return as soon as the user-message event lands; ``wait_idle``
+    # blocks for the response. Backends that can't split today
+    # (synchronous container backends, for example) raise
+    # ``NotImplementedError`` so callers see the gap immediately
+    # instead of a silent multi-minute block.
+
+    def spawn_async(self, task: str, *, title: str | None = None) -> str:
+        """Create a session, submit the initial task, return the session id.
+
+        Does NOT wait for the agent's response. Pair with
+        ``wait_idle(session_id)`` when the caller wants to block for the
+        terminal marker.
+        """
+        ...
+
+    def resume_async(self, session_id: str, msg: str) -> None:
+        """Send a follow-up user message; do NOT wait for the response.
+
+        Submit-only mirror of ``spawn_async`` for an existing session.
+        Pair with ``wait_idle(session_id)`` later.
+        """
+        ...
+
+    def wait_idle(self, session_id: str, *, timeout_seconds: int = 1800) -> str:
+        """Stream events until the session goes idle; return concatenated text.
+
+        Raises ``TimeoutError`` after ``timeout_seconds``. The caller
+        decides what to do on timeout (retry, escalate, hand off to the
+        daemon).
+        """
+        ...
+
     def archive(self, session_id: str) -> None:
         """Mark a session as done; preserves history but blocks new events."""
         ...
