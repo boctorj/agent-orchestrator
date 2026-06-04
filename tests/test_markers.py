@@ -128,6 +128,23 @@ class TestScanResponseCrossRoleIgnored:
         assert scan_response("reviewer", "just thinking out loud") is None
 
 
+class TestScanResponseUnknownRoleGate:
+    """An unknown role string must NOT slip through the universal BLOCKED
+    branch — otherwise a typo'd caller writes a ``<role>_blocked`` event
+    the recorder will happily persist (reviewer-found regression on the
+    original Phase 0 PR)."""
+
+    @pytest.mark.parametrize("role", ["noodler", "", "Coder", "TESTER"])
+    def test_unknown_role_blocked_does_not_match(self, role):
+        assert scan_response(role, "BLOCKED: reason=auth_failure | bad") is None
+
+    @pytest.mark.parametrize("role", ["noodler", ""])
+    def test_unknown_role_skips_per_marker_rules(self, role):
+        assert scan_response(role, "TESTS_PASS") is None
+        assert scan_response(role, "FIX_PUSHED") is None
+        assert scan_response(role, "REVIEW_RECOMMEND_MERGE: x") is None
+
+
 class TestScanResponseAllowedNarrowing:
     def test_pr_url_excluded_when_only_fix_pushed_blocked_allowed(self):
         # mirrors the address_review narrowing — a coder resume that

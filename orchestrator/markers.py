@@ -276,6 +276,17 @@ def _format_blocked_last_error(payload: BlockedPayload) -> str:
     return f"BLOCKED [{payload.reason}]: {payload.prose}"
 
 
+# --------------------------- role gate ---------------------------
+
+# Worker roles whose responses the parser understands. Lifted to module
+# scope so :func:`scan_response` can short-circuit on a typo'd or empty
+# role string *before* the universal-BLOCKED branch — otherwise an
+# arbitrary role would produce a ``<role>_blocked`` event_type and the
+# daemon (F-016-U-5) could write audit rows for nonexistent roles. Kept
+# in step with the per-role rules in ``_RULES`` above.
+_KNOWN_ROLES: frozenset[str] = frozenset({"coder", "tester", "reviewer"})
+
+
 # --------------------------- public scan entry point ---------------------------
 
 
@@ -294,11 +305,16 @@ def scan_response(
 
     Role-scoped markers: a ``tester`` response carrying
     ``REVIEW_RECOMMEND_MERGE`` returns ``None`` (not a tester marker).
-    ``BLOCKED`` is universal across roles.
+    ``BLOCKED`` is universal across the *known* roles in
+    :data:`_KNOWN_ROLES`.
 
     Args:
-        role: ``coder`` / ``tester`` / ``reviewer``. Unknown roles
-            silently match nothing (return ``None``).
+        role: ``coder`` / ``tester`` / ``reviewer``. Any other value —
+            including the empty string — returns ``None`` immediately,
+            before the per-marker rules and the universal-BLOCKED
+            fall-through run. Without that gate a typo'd role string
+            would produce a spurious ``<role>_blocked`` event_type the
+            recorder would write to ``unit_events``.
         text: The agent's full response text. The marker can sit
             anywhere; per-marker regexes anchor to line boundaries
             where appropriate.
@@ -308,6 +324,8 @@ def scan_response(
             resume excludes ``PR_URL`` because the unit already has a
             PR from ``spawn_unit``).
     """
+    if role not in _KNOWN_ROLES:
+        return None
     permit = (lambda _name: True) if allowed is None else (lambda name: name in allowed)
 
     for rule in _RULES:

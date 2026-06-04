@@ -658,6 +658,18 @@ class TestScopeBoundary:
     def test_unknown_role_returns_none(self):
         """Defensive — an unknown role string from a typo'd MCP call
         must not match anything (silent matching would be the worst
-        possible regression: writing audit rows for the wrong role)."""
+        possible regression: writing audit rows for the wrong role).
+
+        Per-role markers (``TESTS_PASS`` here) skip via the rule.role
+        gate trivially. The case that actually exercises the role gate
+        is the universal-BLOCKED branch — without a known-role guard
+        an unknown role string produces a ``<role>_blocked`` event_type
+        that the recorder happily writes (reviewer-found regression on
+        the original Phase 0 PR).
+        """
         assert scan_response("noodler", "TESTS_PASS") is None
         assert scan_response("", "TESTS_PASS") is None
+        # BLOCKED is the actual contract surface — pre-fix it matched
+        # for any role and produced event_type=f"{role}_blocked".
+        assert scan_response("noodler", "BLOCKED: reason=auth_failure | bad") is None
+        assert scan_response("", "BLOCKED: reason=auth_failure | bad") is None
