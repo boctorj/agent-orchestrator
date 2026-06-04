@@ -231,12 +231,12 @@ gate that refuses to spawn against repos without branch protection.
 **Verification gating (automatic — you don't call this):**
 
   Every spawn surface (`spawn_unit`, `spawn_tester`, `spawn_reviewer`,
-  `address_review`, `cycle_review`, `send_to_unit`, `parallel_units`,
-  `parallel_units_global`) blocks if the target repo isn't fresh-verified
-  (<24h). On block, the tool returns an ERROR with a fix-it message
-  telling the user to run `verify_repo(<url>)`. Surface that message
-  verbatim; offer to run `verify_repo` for them. After verification
-  succeeds, retry the original spawn.
+  `address_review`, `cycle_review`, `send_to_unit`, `send_to_unit_async`,
+  `cancel_unit`, `parallel_units`, `parallel_units_global`) blocks if the
+  target repo isn't fresh-verified (<24h). On block, the tool returns an
+  ERROR with a fix-it message telling the user to run `verify_repo(<url>)`.
+  Surface that message verbatim; offer to run `verify_repo` for them.
+  After verification succeeds, retry the original spawn.
 
   `load_feature` only WARNS (doesn't block) for an unverified repo —
   planning is free, action requires verification. When you see a ⚠ in
@@ -245,8 +245,40 @@ gate that refuses to spawn against repos without branch protection.
 
 **Low-level / introspection:**
 - `send_to_unit(unit_id, role, message)` — manually resume any role's
-  session with arbitrary text. Use sparingly; prefer the structured tools.
+  session with arbitrary text (synchronous; blocks for the worker's
+  reply). Use sparingly; prefer the structured tools.
 - `get_unit_status(unit_id)`, `list_units(feature_id)`
+
+**Lead/daemon interaction primitives (F-016 Phase 2.5):**
+
+Three primitives — "Observe any time. Send-message is ~1s. Cancel is
+sticky. Graph edits are orthogonal."
+
+- `send_to_unit_async(unit_id, message, role="")` — submit-only mirror
+  of `send_to_unit`. Returns in ~1s after the user-message event lands
+  on the worker's queue; the worker's reply arrives later via the
+  daemon's normal poll (or via `wait_unit` if you want to block).
+  Holds a per-unit advance-lock during the ~1s submit window so a
+  Phase-3 daemon doesn't race the state machine on the same tick.
+  Default role is picked from the unit's current status when `role=""`
+  (coding/in_ci/fixing → coder, testing → tester, reviewing →
+  reviewer; terminal statuses return a structured error). Returns JSON
+  with `{delivered, role, session_id}` on success or `{delivered:
+  false, reason, role_diagnostics, next_steps}` on a not-actionable
+  delivery.
+- `cancel_unit(unit_id)` — sticky cancel: archives every role's worker
+  session and marks the unit `cancelled` with a `cancelled_at`
+  timestamp. The daemon reads `cancelled_at` on every tick and stops
+  driving the unit; downstream dep-evaluation treats it as not-done
+  (depending units stay blocked until you reshape the graph via
+  `update_unit_deps`). Idempotent — a second call returns
+  `already_cancelled`.
+- `update_unit_deps(feature_id, unit_id, depends_on)` — re-shape the
+  DAG for future scheduling without touching any in-flight worker.
+  Validates the resulting graph is still acyclic and every dep refers
+  to a unit in the same plan. Use when the user says "U-3 also depends
+  on U-2 now"; the change takes effect on the next
+  `next_ready_units` / `next_ready_units_all` call.
 
 ### The standard flow per unit (recommended)
 

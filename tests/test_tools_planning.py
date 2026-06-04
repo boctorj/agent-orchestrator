@@ -700,3 +700,84 @@ def test_approve_plan_succeeds(tmp_state_db):
     msg = planning.approve_plan("F-001")
     assert "APPROVED" in msg
     assert state.get_plan("F-001").status == "approved"
+
+
+# --------------------------- update_unit_deps (F-016 Phase 2.5) ---------------
+
+
+def _setup_two_unit_plan(feature_id: str = "F-001") -> None:
+    """Approved feature with two units, no deps yet."""
+    planning.load_feature(title="t", description="d", id=feature_id)
+    planning.save_plan(
+        feature_id,
+        [
+            {"id": f"{feature_id}-U-1", "title": "u1", "description": "d", "depends_on": []},
+            {"id": f"{feature_id}-U-2", "title": "u2", "description": "d", "depends_on": []},
+        ],
+    )
+    planning.approve_plan(feature_id)
+
+
+class TestUpdateUnitDeps:
+    def test_happy_path_adds_dep(self, tmp_state_db):
+        _setup_two_unit_plan()
+        out = planning.update_unit_deps("F-001", "F-001-U-2", ["F-001-U-1"])
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "updated"
+        plan = state.get_plan("F-001")
+        u2 = next(u for u in plan.units if u.id == "F-001-U-2")
+        assert u2.depends_on == ["F-001-U-1"]
+
+    def test_happy_path_clears_deps(self, tmp_state_db):
+        """Empty list means "remove all deps" — not "leave deps alone"."""
+        _setup_two_unit_plan()
+        planning.update_unit_deps("F-001", "F-001-U-2", ["F-001-U-1"])
+        out = planning.update_unit_deps("F-001", "F-001-U-2", [])
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "updated"
+        plan = state.get_plan("F-001")
+        u2 = next(u for u in plan.units if u.id == "F-001-U-2")
+        assert u2.depends_on == []
+
+    def test_rejects_self_dep(self, tmp_state_db):
+        _setup_two_unit_plan()
+        out = planning.update_unit_deps("F-001", "F-001-U-1", ["F-001-U-1"])
+        assert "ERROR" in out and "cannot depend on itself" in out
+
+    def test_rejects_unknown_unit(self, tmp_state_db):
+        _setup_two_unit_plan()
+        out = planning.update_unit_deps("F-001", "F-001-U-99", [])
+        assert "ERROR" in out and "not in plan" in out
+
+    def test_rejects_unknown_dep(self, tmp_state_db):
+        _setup_two_unit_plan()
+        out = planning.update_unit_deps("F-001", "F-001-U-2", ["F-XXX-U-99"])
+        assert "ERROR" in out and "unknown unit" in out
+
+    def test_rejects_no_plan(self, tmp_state_db):
+        out = planning.update_unit_deps("F-MISSING", "U1", [])
+        assert "ERROR" in out and "no plan" in out
+
+    def test_rejects_cycle_two_node(self, tmp_state_db):
+        """U-1 -> U-2 then U-2 -> U-1 closes the cycle."""
+        _setup_two_unit_plan()
+        planning.update_unit_deps("F-001", "F-001-U-1", ["F-001-U-2"])
+        out = planning.update_unit_deps("F-001", "F-001-U-2", ["F-001-U-1"])
+        assert "ERROR" in out and "cycle" in out.lower()
+
+    def test_cycle_rejection_does_not_partially_write(self, tmp_state_db):
+        """A would-be cycle must not corrupt the plan — the original
+        deps for the unit must be intact after the failed call."""
+        _setup_two_unit_plan()
+        planning.update_unit_deps("F-001", "F-001-U-1", ["F-001-U-2"])
+        # Take a snapshot of u1's deps.
+        plan_before = state.get_plan("F-001")
+        u1_deps_before = next(u.depends_on for u in plan_before.units if u.id == "F-001-U-1")
+        # Try to close the cycle.
+        planning.update_unit_deps("F-001", "F-001-U-2", ["F-001-U-1"])
+        plan_after = state.get_plan("F-001")
+        u2_deps_after = next(u.depends_on for u in plan_after.units if u.id == "F-001-U-2")
+        u1_deps_after = next(u.depends_on for u in plan_after.units if u.id == "F-001-U-1")
+        # u2 unchanged (still []), u1 unchanged.
+        assert u2_deps_after == []
+        assert u1_deps_after == u1_deps_before

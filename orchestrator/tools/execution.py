@@ -2930,6 +2930,327 @@ def send_to_unit(unit_id: str, role: str, message: str) -> str:
     return response
 
 
+# --------------------------- F-016 Phase 2.5: lead/daemon contract ---------------------------
+#
+# Three primitives the lead has at runtime to influence a unit while the
+# (Phase 3) daemon drives it:
+#
+#   * ``send_to_unit_async`` — submit-only message; holds the per-unit
+#     advance-lock for the ~1s submit window so the daemon's tick
+#     doesn't race ``advance_state_machine`` against an in-flight send.
+#   * ``cancel_unit`` — sticky cancel; archives every role's session and
+#     marks the unit ``cancelled`` so the daemon's next tick stops
+#     driving it.
+#
+# The graph-mutation primitive ``update_unit_deps`` lives in
+# ``orchestrator/tools/planning.py`` because it edits the plan, not the
+# work-unit row.
+
+
+# Per the spec § "Routing rule for send_to_unit(unit_id, message, role=None)":
+# default role by current ``WorkUnitState.status``. Statuses where no
+# role is actionable map to ``None`` so :func:`_resolve_default_role`
+# returns ``None`` and :func:`send_to_unit_async` surfaces a structured
+# error rather than picking a wrong role.
+_DEFAULT_ROLE_BY_STATUS: dict[str, str | None] = {
+    "coding": "coder",
+    "in_ci": "coder",
+    "fixing": "coder",
+    "testing": "tester",
+    "reviewing": "reviewer",
+    "escalated": "coder",
+    "approved_awaiting_merge": None,
+    "done": None,
+    "cancelled": None,
+}
+
+
+def _role_session_status(unit_state: WorkUnitState, role: str) -> dict[str, Any]:
+    """Per-role actionability digest for :func:`send_to_unit_async`.
+
+    Returns ``{"status": str, "actionable": bool}`` per the spec's
+    "Not-actionable delivery responses" section. ``actionable`` is True
+    only when ``session_id`` is non-empty and the worker session is in a
+    state that can receive a follow-up message (Phase 2.5 ships a
+    coarse signal — non-empty session_id — and leaves the
+    ``terminated``/``archived`` distinction to the F-014 unit-health
+    surface a caller can consult separately).
+    """
+    sid = _resolve_session_id(unit_state, role)
+    if not sid:
+        return {"status": "no_session", "actionable": False}
+    return {"status": "idle", "actionable": True, "session_id": sid}
+
+
+def _role_diagnostics_payload(unit_state: WorkUnitState) -> dict[str, dict[str, Any]]:
+    """``{role: {status, actionable, ...}}`` for every worker role."""
+    return {
+        role: _role_session_status(unit_state, role) for role in ("coder", "tester", "reviewer")
+    }
+
+
+def _resolve_default_role(unit_state: WorkUnitState) -> str | None:
+    """Pick the default role for an unspecified ``send_to_unit_async`` call.
+
+    Returns one of ``"coder"`` / ``"tester"`` / ``"reviewer"`` per the
+    spec's routing table, or ``None`` when the current status has no
+    actionable role (terminal: ``approved_awaiting_merge`` / ``done`` /
+    ``cancelled``). The caller surfaces ``None`` as a structured error.
+    """
+    return _DEFAULT_ROLE_BY_STATUS.get(unit_state.status)
+
+
+@mcp.tool()
+def send_to_unit_async(unit_id: str, message: str, role: str = "") -> str:
+    """Submit a follow-up message to a worker session WITHOUT waiting for the reply.
+
+    Async counterpart to :func:`send_to_unit`. Per the spec, ``send_to_unit``
+    becomes a ~1s submit window once ``worker.resume_async`` is available:
+    the user-message event lands on the worker's queue, the per-unit
+    advance-lock is held during the submit so a Phase 3 daemon doesn't
+    race ``advance_state_machine`` on the same tick, and the worker's
+    response arrives later via the daemon's normal poll (or via
+    :func:`wait_unit` if the lead chooses to block).
+
+    Routing — when ``role`` is empty, the default is picked from the
+    unit's current ``WorkUnitState.status`` per the spec's routing table::
+
+        coding | in_ci | fixing | escalated -> coder
+        testing                              -> tester
+        reviewing                            -> reviewer
+        approved_awaiting_merge | done | cancelled -> ERROR (terminal)
+
+    The lead overrides explicitly when its intent diverges from the
+    current phase. No content heuristics, no auto-fallback to a
+    different role on delivery failure — silently sending to the wrong
+    role would corrupt intent worse than a structured error.
+
+    Returns JSON. Successful submit::
+
+        {
+          "delivered": true,
+          "unit_id": "...",
+          "role": "coder",
+          "session_id": "sess_abc...",
+          "advance_lock": "released"
+        }
+
+    Not-actionable delivery (per spec §"Not-actionable delivery responses")::
+
+        {
+          "delivered": false,
+          "reason": "<unit_terminal|unit_cancelled|no_session|no_default_role|...>",
+          "role_diagnostics": {
+              "coder":    {"status": "...", "actionable": <bool>},
+              "tester":   {"status": "...", "actionable": <bool>},
+              "reviewer": {"status": "...", "actionable": <bool>}
+          },
+          "next_steps": ["...", "..."]
+        }
+
+    Repo must be fresh-verified (call ``verify_repo(<url>)`` if blocked).
+    """
+    if err := ensure_verified_for_unit(unit_id):
+        return err
+
+    unit_state = state.get_unit_state(unit_id)
+    if not unit_state:
+        return f"ERROR: no state for unit {unit_id}"
+
+    # Terminal-cancel is sticky per F-016 Phase 2.5: a cancelled unit
+    # can never receive new messages. Surface a structured error so the
+    # lead can offer the user `update_unit_deps` (graph repair) or a
+    # fresh spawn rather than silently sending into the void.
+    if state.is_cancelled(unit_id):
+        return json.dumps(
+            {
+                "delivered": False,
+                "reason": "unit_cancelled",
+                "unit_id": unit_id,
+                "next_steps": [
+                    "unit was cancelled via cancel_unit; spawn fresh or pick a different unit",
+                ],
+            },
+            indent=2,
+        )
+
+    if role == "":
+        default_role = _resolve_default_role(unit_state)
+        if default_role is None:
+            return json.dumps(
+                {
+                    "delivered": False,
+                    "reason": "no_default_role",
+                    "unit_id": unit_id,
+                    "status": unit_state.status,
+                    "role_diagnostics": _role_diagnostics_payload(unit_state),
+                    "next_steps": [
+                        "unit is in a terminal status; no role can receive a message",
+                    ],
+                },
+                indent=2,
+            )
+        role = default_role
+
+    if role not in ("coder", "tester", "reviewer"):
+        return f"ERROR: role must be coder|tester|reviewer, got {role!r}"
+
+    session_id = _resolve_session_id(unit_state, role)
+    if not session_id:
+        return json.dumps(
+            {
+                "delivered": False,
+                "reason": f"no_{role}_session",
+                "unit_id": unit_id,
+                "role": role,
+                "role_diagnostics": _role_diagnostics_payload(unit_state),
+                "next_steps": [
+                    f"{role} has not been spawned for {unit_id}; "
+                    "use spawn_unit / spawn_tester / spawn_reviewer first",
+                ],
+            },
+            indent=2,
+        )
+
+    # Hold the advance-lock for the ~1s submit window. Per spec the lock
+    # is unit-wide (not per-role) so a same-tick daemon doesn't advance
+    # the reviewer while the coder is mid-receive. The DB-side
+    # ``owner='lead'`` write makes the claim visible to the Phase 3
+    # daemon (separate process); the in-process RLock serializes
+    # concurrent leads in the same MCP server.
+    with state.lead_advance_lock(unit_id):
+        try:
+            worker = make_worker(role)
+            worker.resume_async(session_id, message)
+        except Exception as e:  # noqa: BLE001 — surface as orchestrator error
+            state.touch_unit(unit_id, error=str(e))
+            return json.dumps(
+                {
+                    "delivered": False,
+                    "reason": f"{role}_resume_async_error",
+                    "unit_id": unit_id,
+                    "role": role,
+                    "session_id": session_id,
+                    "error": str(e),
+                },
+                indent=2,
+            )
+
+        # Audit row mirrors the synchronous ``send_to_unit`` path so the
+        # event log shows lead-issued messages whether the lead waited
+        # for the reply or not.
+        _record_manual_message(
+            unit_id=unit_id,
+            feature_id=unit_state.feature_id,
+            role=role,
+            session_id=session_id,
+            message=message,
+            cycle_number=unit_state.review_round,
+        )
+
+    return json.dumps(
+        {
+            "delivered": True,
+            "unit_id": unit_id,
+            "role": role,
+            "session_id": session_id,
+            "advance_lock": "released",
+        },
+        indent=2,
+    )
+
+
+def _archive_unit_sessions(unit_state: WorkUnitState) -> dict[str, str]:
+    """Best-effort archive every worker session associated with the unit.
+
+    Returns ``{role: outcome}`` where outcome is ``"archived"``,
+    ``"no_session"``, or ``"error: <exception>"``. Cancellation must
+    proceed even when a backend call raises (transient gh / Anthropic
+    outage shouldn't strand the unit in ``coding``); the caller decides
+    whether to surface partial failures to the user.
+    """
+    outcomes: dict[str, str] = {}
+    for role in ("coder", "tester", "reviewer"):
+        sid = _resolve_session_id(unit_state, role)
+        if not sid:
+            outcomes[role] = "no_session"
+            continue
+        try:
+            worker = make_worker(role)
+            worker.archive(sid)
+            outcomes[role] = "archived"
+        except Exception as e:  # noqa: BLE001 — proceed with cancel
+            outcomes[role] = f"error: {e}"
+    return outcomes
+
+
+@mcp.tool()
+def cancel_unit(unit_id: str) -> str:
+    """Sticky-cancel a unit: archive every worker session, mark ``cancelled``.
+
+    F-016 Phase 2.5 primitive. The unit's status is flipped to
+    ``cancelled`` and ``cancelled_at`` is stamped — both sticky: the
+    Phase 3 daemon reads ``cancelled_at`` on every tick and stops
+    driving the unit. Every role's worker session is best-effort
+    archived (a backend error does not block the cancel).
+
+    Idempotent: re-calling on an already-cancelled unit returns
+    ``outcome: already_cancelled`` without re-archiving sessions.
+
+    Downstream dep-evaluation treats a ``cancelled`` unit as not-done —
+    units depending on it stay blocked until the lead reshapes the
+    graph via :func:`update_unit_deps`. Spec § "cancel_unit archives
+    the worker session and marks the unit cancelled".
+
+    Repo must be fresh-verified (call ``verify_repo(<url>)`` if blocked).
+    """
+    if err := ensure_verified_for_unit(unit_id):
+        return err
+
+    unit_state = state.get_unit_state(unit_id)
+    if not unit_state:
+        return f"ERROR: no state for unit {unit_id}"
+
+    if unit_state.status == "cancelled":
+        return json.dumps(
+            {
+                "unit_id": unit_id,
+                "outcome": "already_cancelled",
+                "cancelled_at": unit_state.cancelled_at,
+            },
+            indent=2,
+        )
+
+    archive_outcomes = _archive_unit_sessions(unit_state)
+
+    if not state.cancel_unit(unit_id):
+        # Row vanished between the get and the cancel — surface as an
+        # error rather than claiming a successful cancel.
+        return f"ERROR: cancel_unit failed for {unit_id} (row missing)"
+
+    state.record_event(
+        unit_id,
+        unit_state.feature_id,
+        "unit_cancelled",
+        source="human",
+        cycle_number=unit_state.review_round,
+        summary="Unit cancelled via cancel_unit",
+        details=json.dumps({"archive_outcomes": archive_outcomes}),
+    )
+
+    refreshed = state.get_unit_state(unit_id)
+    return json.dumps(
+        {
+            "unit_id": unit_id,
+            "outcome": "cancelled",
+            "status": refreshed.status if refreshed else "cancelled",
+            "cancelled_at": refreshed.cancelled_at if refreshed else None,
+            "archive_outcomes": archive_outcomes,
+        },
+        indent=2,
+    )
+
+
 # Re-export for cycle_review's _emit_terminal (avoids circular import via observability)
 def get_unit_status(unit_id: str) -> str:
     """Persisted state of one unit as JSON. Mirrors observability.get_unit_status."""

@@ -3422,3 +3422,104 @@ class TestCycleReviewIsWrapper:
         assert "tester" in steps
         assert "copilot_review" in steps
         assert "reviewer" in steps
+
+
+# --------------------------- F-016 Phase 2.5: send_to_unit_async ---------
+
+
+class TestSendToUnitAsync:
+    """Coder-side coverage of the async submit path. Spec-acceptance
+    cases live in ``tests/test_f016_u4_tester.py``; this class pins the
+    coder-implementation contract: structured shape, error handling,
+    and audit row."""
+
+    def test_bad_role(self, tmp_state_db):
+        _setup_feature()
+        state.upsert_unit_state(
+            WorkUnitState(unit_id="F-001-U-1", feature_id="F-001", status="coding")
+        )
+        out = execution.send_to_unit_async("F-001-U-1", "hi", role="hacker")
+        assert "ERROR" in out and "role must be" in out
+
+    def test_no_state(self, tmp_state_db):
+        out = execution.send_to_unit_async("nope", "hi")
+        assert "ERROR" in out and "no state for" in out
+
+    def test_audit_row_written_on_success(self, tmp_state_db, monkeypatch):
+        _seed_coded_unit()
+
+        class AsyncWorker:
+            def __init__(self, role):
+                self.role = role
+                self.async_calls = []
+
+            def resume_async(self, sid, msg):
+                self.async_calls.append((sid, msg))
+
+        monkeypatch.setattr("orchestrator.tools.execution.make_worker", AsyncWorker)
+        out = execution.send_to_unit_async("F-001-U-1", "carry on", role="coder")
+        parsed = json.loads(out)
+        assert parsed["delivered"] is True
+        events = state.list_events("F-001-U-1")
+        manual_msgs = [e for e in events if e["event_type"] == "coder_manual_message"]
+        assert len(manual_msgs) == 1
+        assert "carry on" in manual_msgs[0]["details"]
+
+    def test_resume_async_error_returns_structured_error(self, tmp_state_db, monkeypatch):
+        _seed_coded_unit()
+
+        class BlowUp:
+            def __init__(self, role):
+                pass
+
+            def resume_async(self, *a, **k):
+                raise RuntimeError("network down")
+
+        monkeypatch.setattr("orchestrator.tools.execution.make_worker", BlowUp)
+        out = execution.send_to_unit_async("F-001-U-1", "hi", role="coder")
+        parsed = json.loads(out)
+        assert parsed["delivered"] is False
+        assert parsed["reason"] == "coder_resume_async_error"
+        assert "network down" in parsed["error"]
+        # The error must still release the advance lock (the
+        # ``with state.lead_advance_lock`` block guarantees this).
+        assert state.has_active_advance_lock("F-001-U-1") is False
+
+
+# --------------------------- F-016 Phase 2.5: cancel_unit ---------------
+
+
+class TestCancelUnitTool:
+    def test_no_state(self, tmp_state_db):
+        out = execution.cancel_unit("nope")
+        assert "ERROR" in out and "no state for" in out
+
+    def test_flips_status_and_records_event(self, tmp_state_db, monkeypatch):
+        _seed_coded_unit()
+
+        class Recorder:
+            def __init__(self, role):
+                self.role = role
+                self.archived = []
+
+            def archive(self, sid):
+                self.archived.append(sid)
+
+        monkeypatch.setattr("orchestrator.tools.execution.make_worker", Recorder)
+        out = execution.cancel_unit("F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "cancelled"
+        assert parsed["status"] == "cancelled"
+        events = state.list_events("F-001-U-1")
+        assert any(e["event_type"] == "unit_cancelled" for e in events)
+
+    def test_idempotent_second_call(self, tmp_state_db, monkeypatch):
+        _seed_coded_unit()
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.make_worker",
+            lambda role: type("W", (), {"archive": lambda self, sid: None})(),
+        )
+        execution.cancel_unit("F-001-U-1")
+        out2 = execution.cancel_unit("F-001-U-1")
+        parsed = json.loads(out2)
+        assert parsed["outcome"] == "already_cancelled"

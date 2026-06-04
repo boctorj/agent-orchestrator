@@ -794,3 +794,166 @@ class TestVerifiedRepoTTL:
         state.save_verified_repo(_passing_result())
         # 0-hour TTL → anything is stale
         assert state.get_fresh_verified_repo("https://github.com/owner/repo", ttl_hours=0) is None
+
+
+# --------------------------- F-016 Phase 2.5 ---------------------------
+
+
+def _seed_phase25_unit(unit_id: str = "U1", feature_id: str = "F1") -> None:
+    """Minimal feature + work_unit setup for the Phase 2.5 helpers."""
+    state.save_feature(Feature(id=feature_id, title="t", description="d", status="approved"))
+    state.upsert_unit_state(WorkUnitState(unit_id=unit_id, feature_id=feature_id, status="coding"))
+
+
+class TestLeadAdvanceLock:
+    def test_owner_set_under_lock_and_cleared_after(self, tmp_state_db):
+        _seed_phase25_unit()
+        assert state.has_active_advance_lock("U1") is False
+        with state.lead_advance_lock("U1"):
+            s = state.get_unit_state("U1")
+            assert s is not None and s.owner == state.LEAD_OWNER
+            assert state.has_active_advance_lock("U1") is True
+        s = state.get_unit_state("U1")
+        assert s is not None and s.owner == ""
+        assert state.has_active_advance_lock("U1") is False
+
+    def test_lock_is_reentrant_same_thread(self, tmp_state_db):
+        """RLock semantics — same thread can re-enter without deadlock.
+        Required for nested helper paths that hold the lock and then
+        call another helper that also takes it."""
+        _seed_phase25_unit()
+        with state.lead_advance_lock("U1"), state.lead_advance_lock("U1"):
+            assert state.has_active_advance_lock("U1") is True
+
+    def test_owner_cleared_on_exception(self, tmp_state_db):
+        _seed_phase25_unit()
+        with pytest.raises(ValueError), state.lead_advance_lock("U1"):
+            raise ValueError("boom")
+        s = state.get_unit_state("U1")
+        assert s is not None and s.owner == ""
+
+
+class TestUnitOwnerCAS:
+    def test_claim_owner_succeeds_when_unowned(self, tmp_state_db):
+        _seed_phase25_unit()
+        assert state.claim_unit_owner("U1", "daemon") is True
+        assert state.get_unit_state("U1").owner == "daemon"
+
+    def test_claim_owner_fails_when_already_owned(self, tmp_state_db):
+        _seed_phase25_unit()
+        state.claim_unit_owner("U1", "daemon")
+        # A second claim with expected_owner="" must fail — somebody
+        # already holds it.
+        assert state.claim_unit_owner("U1", "lead") is False
+        assert state.get_unit_state("U1").owner == "daemon"
+
+    def test_release_owner_succeeds_when_holder_matches(self, tmp_state_db):
+        _seed_phase25_unit()
+        state.claim_unit_owner("U1", "daemon")
+        assert state.release_unit_owner("U1", expected_owner="daemon") is True
+        assert state.get_unit_state("U1").owner == ""
+
+    def test_release_owner_fails_when_holder_mismatch(self, tmp_state_db):
+        _seed_phase25_unit()
+        state.claim_unit_owner("U1", "daemon")
+        # Lead trying to release the daemon's claim — no-op.
+        assert state.release_unit_owner("U1", expected_owner="lead") is False
+        assert state.get_unit_state("U1").owner == "daemon"
+
+
+class TestCancelUnitState:
+    def test_cancel_flips_status_and_stamps(self, tmp_state_db):
+        _seed_phase25_unit()
+        assert state.cancel_unit("U1") is True
+        s = state.get_unit_state("U1")
+        assert s is not None
+        assert s.status == "cancelled"
+        assert s.cancelled_at is not None
+
+    def test_cancel_preserves_existing_cancelled_at(self, tmp_state_db):
+        """A second cancel must not overwrite ``cancelled_at`` — the
+        timestamp anchors when the user originally pulled the unit."""
+        _seed_phase25_unit()
+        state.cancel_unit("U1")
+        first_ts = state.get_unit_state("U1").cancelled_at
+        # Re-cancel.
+        state.cancel_unit("U1")
+        assert state.get_unit_state("U1").cancelled_at == first_ts
+
+    def test_cancel_missing_unit_returns_false(self, tmp_state_db):
+        assert state.cancel_unit("nope") is False
+
+    def test_cancel_clears_owner(self, tmp_state_db):
+        """Cancel must drop any active owner claim — otherwise a daemon
+        crash between claim + cancel could leave a stale owner forever."""
+        _seed_phase25_unit()
+        state.claim_unit_owner("U1", "daemon")
+        state.cancel_unit("U1")
+        assert state.get_unit_state("U1").owner == ""
+
+    def test_is_cancelled_predicate(self, tmp_state_db):
+        _seed_phase25_unit()
+        assert state.is_cancelled("U1") is False
+        state.cancel_unit("U1")
+        assert state.is_cancelled("U1") is True
+        # Missing unit returns False (not an error).
+        assert state.is_cancelled("nope") is False
+
+
+class TestUpdateUnitDepsState:
+    def _seed_plan(self) -> None:
+        state.save_feature(Feature(id="F", title="t", description="d", status="approved"))
+        state.save_plan(
+            "F",
+            [
+                WorkUnit(id="F-U-1", feature_id="F", title="u1", description=""),
+                WorkUnit(id="F-U-2", feature_id="F", title="u2", description=""),
+            ],
+        )
+        state.approve_plan("F")
+
+    def test_update_deps_persists_to_plan(self, tmp_state_db):
+        self._seed_plan()
+        state.update_unit_deps("F", "F-U-2", ["F-U-1"])
+        plan = state.get_plan("F")
+        assert plan is not None
+        u2 = next(u for u in plan.units if u.id == "F-U-2")
+        assert u2.depends_on == ["F-U-1"]
+
+    def test_update_deps_no_plan_raises(self, tmp_state_db):
+        with pytest.raises(ValueError, match="no plan"):
+            state.update_unit_deps("F-MISSING", "U1", [])
+
+    def test_update_deps_unknown_unit_raises(self, tmp_state_db):
+        self._seed_plan()
+        with pytest.raises(ValueError, match="not in plan"):
+            state.update_unit_deps("F", "F-U-99", [])
+
+    def test_update_deps_unknown_dep_raises(self, tmp_state_db):
+        self._seed_plan()
+        with pytest.raises(ValueError, match="unknown unit"):
+            state.update_unit_deps("F", "F-U-2", ["F-U-99"])
+
+
+class TestPhase25Migration:
+    """Pre-Phase-2.5 DBs (missing ``cancelled_at`` / ``owner`` columns)
+    must migrate on next ``init_db`` without losing rows."""
+
+    def test_adds_cancelled_at_and_owner_idempotently(self, tmp_state_db):
+        """``init_db`` from the fixture already added both columns;
+        re-running it must be a no-op (same shape, no ALTER errors)."""
+        import sqlite3 as _sql
+
+        def cols() -> set[str]:
+            with _sql.connect(tmp_state_db) as conn:
+                conn.row_factory = _sql.Row
+                return {r["name"] for r in conn.execute("PRAGMA table_info(work_units)")}
+
+        before = cols()
+        assert "cancelled_at" in before
+        assert "owner" in before
+        # Re-run init_db — idempotent.
+        state.init_db()
+        after = cols()
+        assert "cancelled_at" in after
+        assert "owner" in after
