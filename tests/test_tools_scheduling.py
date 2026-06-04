@@ -114,12 +114,26 @@ def test_next_ready_units_all_empty(tmp_state_db):
 # --------------------------- parallel_units + parallel_units_global ---------------------------
 
 
-def _make_fake_one(call_log, log_lock, sleep_s=0.1):
-    """Create a fake do_one that mimics a successful spawn+cycle."""
+def _make_fake_one(call_log, log_lock, sleep_s=0.1, barrier=None):
+    """Create a fake do_one that mimics a successful spawn+cycle.
+
+    When ``barrier`` is supplied, each invocation blocks on it before
+    returning, so every pooled task is provably in-flight simultaneously.
+    That makes the "distinct threads used" assertion deterministic:
+    ``ThreadPoolExecutor(max_workers=N)`` treats N as a *ceiling*, so a
+    task that finishes before the pool lazily spins up the Nth worker may
+    legally reuse an idle thread — yielding <N distinct ids and a flake on
+    slow runners (seen on windows-py3.11). Gating every task on the
+    barrier forces one live thread per concurrent task. The timeout turns
+    a genuine concurrency regression (serial execution) into a loud
+    failure instead of a hang.
+    """
 
     def fake(*args, **kwargs):
         with log_lock:
             call_log.append((threading.get_ident(), time.time()))
+        if barrier is not None:
+            barrier.wait(timeout=5.0)
         time.sleep(sleep_s)
         return {
             "feature_id": args[0] if args else kwargs.get("feature_id", "F"),
@@ -142,7 +156,8 @@ def test_parallel_units_empty(tmp_state_db):
 def test_parallel_units_runs_concurrently(tmp_state_db, monkeypatch):
     call_log = []
     log_lock = threading.Lock()
-    fake = _make_fake_one(call_log, log_lock, sleep_s=0.2)
+    barrier = threading.Barrier(3)
+    fake = _make_fake_one(call_log, log_lock, sleep_s=0.2, barrier=barrier)
     monkeypatch.setattr(scheduling, "_run_one", fake)
 
     start = time.time()
@@ -196,7 +211,8 @@ def test_parallel_units_global_rejects_bad_refs(tmp_state_db):
 def test_parallel_units_global_runs_cross_feature_concurrent(tmp_state_db, monkeypatch):
     call_log = []
     log_lock = threading.Lock()
-    fake = _make_fake_one(call_log, log_lock, sleep_s=0.15)
+    barrier = threading.Barrier(3)
+    fake = _make_fake_one(call_log, log_lock, sleep_s=0.15, barrier=barrier)
     monkeypatch.setattr(scheduling, "_run_one", fake)
 
     refs = [

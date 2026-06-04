@@ -40,6 +40,7 @@ from orchestrator.tools import (
     safe_submit_pr_review,
     tail,
 )
+from orchestrator.workers import make_worker
 
 # --------------------------- task-message context helpers ---------------------------
 
@@ -254,6 +255,236 @@ def spawn_unit(feature_id: str, unit_id: str) -> str:
     return (
         f"ESCALATED — coder did not emit a clear marker.\n"
         f"Session: {session_id}\nLast output:\n{tail(response)}"
+    )
+
+
+# --------------------------- spawn_unit_async (F-016 Phase 1) ---------------------------
+
+
+@mcp.tool()
+def spawn_unit_async(feature_id: str, unit_id: str) -> str:
+    """Dispatch a coder for one unit; return in ~2s without waiting.
+
+    Phase 1 of the dispatcher/watcher split (F-016). Persists
+    ``coder_session_id`` to ``state.db`` BEFORE ``spawn_unit_async``
+    returns — a lead killed between this tool's return and the next
+    ``wait_unit`` / daemon tick leaves a recoverable row rather than the
+    ghost-row failure mode (status=coding with empty session_id) the
+    F-014-U-1 escalation surfaced. Pair with
+    ``wait_unit(unit_id, 'coder')`` when the caller wants the marker, or
+    let the F-016-U-5 watcher daemon advance the unit asynchronously.
+
+    The mid-spawn window — between ``worker.spawn_async`` accepting the
+    dispatch and us writing the session id — is the only state where the
+    row exists with ``coder_session_id=""``; a fresh lead can still
+    recover via ``scan_unit_session`` since the row carries
+    ``status=coding`` and the worker session is live on the backend.
+
+    Same preconditions as ``spawn_unit``: feature loaded + approved,
+    GITHUB_TOKEN set, target repo fresh-verified.
+
+    Backend selection follows ``ORCH_WORKER_BACKEND`` via
+    :func:`orchestrator.workers.make_worker`. The ``docker`` backend's
+    ``spawn_async`` raises ``NotImplementedError`` until its async split
+    lands; the lead sees an actionable error rather than a silent block.
+    """
+    if err := ensure_verified_for_feature(feature_id):
+        return err
+
+    feature = state.get_feature(feature_id)
+    if not feature:
+        return f"ERROR: feature {feature_id} not found"
+    if feature.status != "approved":
+        return f"ERROR: feature {feature_id} status is '{feature.status}' — must be 'approved'."
+    if not feature.repo_path:
+        return f"ERROR: feature {feature_id} has no repo_path."
+
+    plan = state.get_plan(feature_id)
+    if not plan:
+        return f"ERROR: no plan for {feature_id}"
+
+    unit = next((u for u in plan.units if u.id == unit_id), None)
+    if not unit:
+        return f"ERROR: unit {unit_id} not in plan for {feature_id}"
+
+    existing = state.get_unit_state(unit_id)
+    if existing and existing.coder_session_id:
+        return (
+            f"ERROR: unit {unit_id} already has coder session {existing.coder_session_id}. "
+            f"Use wait_unit, cycle_review, or address_review to advance it."
+        )
+
+    if err := need_github_token():
+        return err
+    github_token = get_agent_token()
+
+    branch = branch_for(feature, unit)
+    task = compose_coder_task(
+        feature, unit, branch, github_token, **_task_context_kwargs(feature, unit)
+    )
+
+    # Seed the row BEFORE the worker call so a kill between the
+    # ``spawn_async`` submit and our session-id write still leaves a
+    # ``status=coding`` row the next restart can recover (worst case
+    # via ``scan_unit_session`` once the lead manually correlates the
+    # Anthropic-side session). Order matters: row first, then submit,
+    # then session_id write.
+    state.upsert_unit_state(
+        WorkUnitState(unit_id=unit_id, feature_id=feature_id, status="coding", branch=branch)
+    )
+    state.record_event(
+        unit_id,
+        feature_id,
+        "spawn_coder_async",
+        source="orchestrator",
+        cycle_number=0,
+        summary=f"Dispatching coder for {unit_id} (non-blocking)",
+    )
+
+    try:
+        worker = make_worker("coder")
+        session_id = worker.spawn_async(task, title=f"{unit_id}: {unit.title}")
+    except Exception as e:  # noqa: BLE001 — surface as orchestrator error
+        state.touch_unit(unit_id, status="escalated", error=str(e))
+        state.record_event(
+            unit_id,
+            feature_id,
+            "coder_error",
+            source="orchestrator",
+            cycle_number=0,
+            summary=str(e),
+        )
+        return f"ERROR spawning coder for {unit_id}: {e}"
+
+    # Persist session_id immediately. A kill from here on still leaves
+    # ``coder_session_id`` recorded — ``wait_unit`` / the daemon can pick
+    # up the still-running worker. ``last_activity`` advances as part of
+    # the upsert and surfaces in the JSON below.
+    state.upsert_unit_state(
+        WorkUnitState(
+            unit_id=unit_id,
+            feature_id=feature_id,
+            status="coding",
+            branch=branch,
+            coder_session_id=session_id,
+        )
+    )
+    refreshed = state.get_unit_state(unit_id)
+
+    result: dict[str, Any] = {
+        "unit_id": unit_id,
+        "feature_id": feature_id,
+        "session_id": session_id,
+        "branch": branch,
+        "status": "coding",
+        "submitted_at": refreshed.last_activity if refreshed else "",
+    }
+    return json.dumps(result, indent=2)
+
+
+# --------------------------- wait_unit (F-016 Phase 1) ---------------------------
+
+
+@mcp.tool()
+def wait_unit(unit_id: str, role: str = "coder", timeout_s: int = 600) -> str:
+    """Explicit-wait counterpart to ``spawn_unit_async`` / ``resume_async``.
+
+    Streams the worker session via the backend's ``wait_idle`` and:
+
+      * on a recognised terminal marker → records the event idempotently
+        (Phase-0 dedupe), advances the unit row, returns the parsed
+        marker plus its extras (``pr_url`` / ``pr_number`` / etc.) as
+        JSON.
+      * on ``TimeoutError`` after ``timeout_s`` → returns
+        ``{"status": "still_running", "reason": "timeout"}`` WITHOUT
+        flipping the unit row. The caller (lead or daemon) decides
+        whether to retry, escalate, or hand off.
+      * on idle-with-no-marker → returns ``{"status": "still_running",
+        "reason": "no_marker"}`` (status unchanged). Phase-1 wait is a
+        read surface; ``cycle_review`` keeps the "no marker → escalate"
+        policy.
+
+    Backend selection follows ``ORCH_WORKER_BACKEND`` via
+    :func:`orchestrator.workers.make_worker` — the ``docker`` backend's
+    ``wait_idle`` raises ``NotImplementedError`` until its async split
+    lands.
+
+    Args:
+        unit_id: The work unit to wait on.
+        role: ``coder`` / ``tester`` / ``reviewer``.
+        timeout_s: Max seconds before returning ``still_running``.
+    """
+    if role not in ("coder", "tester", "reviewer"):
+        return f"ERROR: role must be coder|tester|reviewer, got {role!r}"
+
+    unit_state = state.get_unit_state(unit_id)
+    if not unit_state:
+        return f"ERROR: no state for unit {unit_id}"
+
+    session_id = _resolve_session_id(unit_state, role)
+    if not session_id:
+        return f"ERROR: no {role} session for {unit_id} — likely never spawned"
+
+    try:
+        worker = make_worker(role)
+        response = worker.wait_idle(session_id, timeout_seconds=timeout_s)
+    except TimeoutError:
+        return json.dumps(
+            {
+                "unit_id": unit_id,
+                "role": role,
+                "session_id": session_id,
+                "status": "still_running",
+                "reason": "timeout",
+                "timeout_s": timeout_s,
+            },
+            indent=2,
+        )
+    except Exception as e:  # noqa: BLE001
+        return f"ERROR waiting on {role} session {session_id}: {e}"
+
+    marker = _record_terminal_marker(
+        unit_id=unit_id,
+        feature_id=unit_state.feature_id,
+        role=role,
+        response=response,
+        session_id=session_id,
+        cycle_number=unit_state.review_round,
+    )
+    if marker is None:
+        # Idled without a recognised marker. Don't escalate here — the
+        # cycle_review and daemon paths own that policy. Phase-1 wait
+        # reports observations; the caller decides next step.
+        return json.dumps(
+            {
+                "unit_id": unit_id,
+                "role": role,
+                "session_id": session_id,
+                "status": "still_running",
+                "reason": "no_marker",
+                "marker": None,
+                "response_tail": tail(response),
+            },
+            indent=2,
+        )
+
+    # ``_record_terminal_marker`` returns ``{"marker": <name>, **extras}``
+    # — for PR_URL that includes ``pr_url`` + ``pr_number``; for BLOCKED
+    # the structured payload. Spread it into the response so callers
+    # don't have to call ``unit_history`` to recover the URL the worker
+    # just emitted.
+    refreshed = state.get_unit_state(unit_id)
+    return json.dumps(
+        {
+            "unit_id": unit_id,
+            "role": role,
+            "session_id": session_id,
+            **marker,
+            "status": refreshed.status if refreshed else unit_state.status,
+            "response_tail": tail(response),
+        },
+        indent=2,
+        default=str,
     )
 
 

@@ -241,6 +241,18 @@ class ManagedAgentWorker:
     def resume(self, session_id: str, msg: str) -> str:
         return self._send_and_collect(session_id, msg)
 
+    def resume_async(self, session_id: str, msg: str) -> None:
+        """Send a follow-up user message; do NOT wait for the worker's reply.
+
+        Submit-only mirror of ``spawn_async`` for an already-spawned
+        session. Pair with ``wait_idle(session_id)`` later when the
+        caller (lead or F-016 watcher daemon) wants the response.
+        """
+        self.client.beta.sessions.events.send(
+            session_id,
+            events=[{"type": "user.message", "content": [{"type": "text", "text": msg}]}],
+        )
+
     def archive(self, session_id: str) -> None:
         self.client.beta.sessions.archive(session_id)
 

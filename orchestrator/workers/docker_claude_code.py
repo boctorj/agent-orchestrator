@@ -1239,6 +1239,37 @@ class DockerClaudeCodeWorker:
         """
         return None
 
+    # ----- F-016 Phase 1: async dispatch (managed-agents-only today) ----
+    # The docker backend runs `docker run` synchronously: there's no
+    # submit/wait split today, so the non-blocking dispatch contract
+    # F-016-U-2 wires up isn't reachable here. Raising surfaces the gap
+    # the moment a docker-configured lead calls `spawn_unit_async` rather
+    # than silently blocking. See `docs/PROPOSAL-async-orchestrator.md`
+    # Phase 1: "The Docker backend may need a parallel spawn_async /
+    # wait_idle / resume_async trio if it doesn't already split them" —
+    # a follow-up unit owns the actual implementation.
+
+    def spawn_async(self, task: str, *, title: str | None = None) -> str:
+        raise NotImplementedError(
+            "docker backend does not yet support spawn_async — "
+            "use spawn(), or switch ORCH_WORKER_BACKEND to managed_agents. "
+            "See docs/PROPOSAL-async-orchestrator.md Phase 1."
+        )
+
+    def wait_idle(self, session_id: str, *, timeout_seconds: int = 1800) -> str:
+        raise NotImplementedError(
+            "docker backend does not yet support wait_idle — "
+            "use spawn() / resume(), or switch ORCH_WORKER_BACKEND to managed_agents. "
+            "See docs/PROPOSAL-async-orchestrator.md Phase 1."
+        )
+
+    def resume_async(self, session_id: str, msg: str) -> None:
+        raise NotImplementedError(
+            "docker backend does not yet support resume_async — "
+            "use resume(), or switch ORCH_WORKER_BACKEND to managed_agents. "
+            "See docs/PROPOSAL-async-orchestrator.md Phase 1."
+        )
+
     def tail_messages(self, session_id: str, *, limit: int = 50) -> TailResult:
         """Return the worker container's state + its most recent messages.
 
