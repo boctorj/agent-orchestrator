@@ -72,25 +72,18 @@ from orchestrator import state
 from orchestrator.models import Feature, WorkUnit, WorkUnitState
 from orchestrator.tools import execution, mcp
 
-
 # --------------------------- fixtures ---------------------------
 
 
 @pytest.fixture(autouse=True)
 def _bypass_verify_gate(monkeypatch):
-    monkeypatch.setattr(
-        "orchestrator.tools.execution.ensure_verified_for_feature", lambda _f: None
-    )
-    monkeypatch.setattr(
-        "orchestrator.tools.execution.ensure_verified_for_unit", lambda _u: None
-    )
+    monkeypatch.setattr("orchestrator.tools.execution.ensure_verified_for_feature", lambda _f: None)
+    monkeypatch.setattr("orchestrator.tools.execution.ensure_verified_for_unit", lambda _u: None)
 
 
 @pytest.fixture(autouse=True)
 def _no_github_writes(monkeypatch):
-    monkeypatch.setattr(
-        "orchestrator.tools.execution.safe_amend_pr_body", lambda *a, **kw: None
-    )
+    monkeypatch.setattr("orchestrator.tools.execution.safe_amend_pr_body", lambda *a, **kw: None)
 
 
 @pytest.fixture
@@ -160,9 +153,7 @@ class _RecordingWorker:
         return self._session_id
 
     def wait_idle(self, session_id: str, *, timeout_seconds: int = 1800) -> str:
-        self.wait_idle_calls.append(
-            {"session_id": session_id, "timeout_seconds": timeout_seconds}
-        )
+        self.wait_idle_calls.append({"session_id": session_id, "timeout_seconds": timeout_seconds})
         if self._wait_raises is not None:
             raise self._wait_raises
         return self._wait_response
@@ -182,9 +173,7 @@ class _RecordingWorker:
 
 
 def _install_worker(monkeypatch, worker: _RecordingWorker) -> None:
-    monkeypatch.setattr(
-        "orchestrator.tools.execution.ManagedAgentWorker", lambda role: worker
-    )
+    monkeypatch.setattr("orchestrator.tools.execution.ManagedAgentWorker", lambda role: worker)
 
 
 # ===========================================================================
@@ -207,9 +196,7 @@ class TestSpawnUnitAsyncEventProvenance:
 
         execution.spawn_unit_async(feature_id, unit_id)
 
-        events = [
-            e for e in state.list_events(unit_id) if e["event_type"] == "spawn_coder_async"
-        ]
+        events = [e for e in state.list_events(unit_id) if e["event_type"] == "spawn_coder_async"]
         assert len(events) == 1, f"expected exactly one spawn_coder_async event, got {events}"
         ev = events[0]
         # ``source`` must be "orchestrator" (not the role — the lead's
@@ -259,9 +246,7 @@ class TestSpawnUnitAsyncWorkerArguments:
     the spec contract.
     """
 
-    def test_title_kwarg_has_unit_id_and_unit_title(
-        self, tmp_state_db, monkeypatch, _fake_pat
-    ):
+    def test_title_kwarg_has_unit_id_and_unit_title(self, tmp_state_db, monkeypatch, _fake_pat):
         """``scan_unit_session`` / ``tail_worker`` surface the Anthropic
         title to users triaging an in-flight session — it has to be
         human-recognisable. The contract is ``{unit_id}: {unit.title}``.
@@ -280,9 +265,7 @@ class TestSpawnUnitAsyncWorkerArguments:
             f"unit.title missing from worker title {title!r}"
         )
 
-    def test_task_arg_is_compose_coder_task_output(
-        self, tmp_state_db, monkeypatch, _fake_pat
-    ):
+    def test_task_arg_is_compose_coder_task_output(self, tmp_state_db, monkeypatch, _fake_pat):
         """``worker.spawn_async(task, …)`` must receive the result of
         ``compose_coder_task`` — the marker-grammar coder prompt. A
         regression that passed the bare ``unit.description`` would still
@@ -332,9 +315,7 @@ class TestSpawnUnitAsyncReturnShape:
             f"feature_id missing/incorrect in response: {payload!r}"
         )
 
-    def test_response_session_id_matches_persisted_row(
-        self, tmp_state_db, monkeypatch, _fake_pat
-    ):
+    def test_response_session_id_matches_persisted_row(self, tmp_state_db, monkeypatch, _fake_pat):
         """The returned ``session_id`` must equal the value persisted
         to ``work_units.coder_session_id``. A divergence here means
         the caller is reading one value while the daemon is reading
@@ -349,9 +330,7 @@ class TestSpawnUnitAsyncReturnShape:
         assert row is not None
         assert payload["session_id"] == row.coder_session_id == "sesn-roundtrip"
 
-    def test_response_branch_matches_persisted_row(
-        self, tmp_state_db, monkeypatch, _fake_pat
-    ):
+    def test_response_branch_matches_persisted_row(self, tmp_state_db, monkeypatch, _fake_pat):
         feature_id, unit_id = _seed_feature()
         _install_worker(monkeypatch, _RecordingWorker("coder", session_id="sesn-branch"))
 
@@ -403,9 +382,7 @@ class TestWaitUnitTimeoutPropagation:
         )
         assert call["session_id"] == "sesn-coder"
 
-    def test_timeout_value_echoed_in_still_running_payload(
-        self, tmp_state_db, monkeypatch
-    ):
+    def test_timeout_value_echoed_in_still_running_payload(self, tmp_state_db, monkeypatch):
         """When ``worker.wait_idle`` raises TimeoutError, the JSON
         response must include the original ``timeout_s`` so the daemon /
         operator can see what budget was honoured.
@@ -454,9 +431,7 @@ class TestWaitUnitResponseShape:
         )
         return unit_id
 
-    def test_marker_path_includes_response_tail_and_session_id(
-        self, tmp_state_db, monkeypatch
-    ):
+    def test_marker_path_includes_response_tail_and_session_id(self, tmp_state_db, monkeypatch):
         unit_id = self._seed("coder", "sesn-rt-1")
         worker = _RecordingWorker(
             "coder",
@@ -510,9 +485,7 @@ class TestPredecessorRoleGateConsistency:
     corrupted role argument can't probe orchestrator internals.
     """
 
-    def test_unknown_role_rejected_without_state_db_read(
-        self, tmp_state_db, monkeypatch
-    ):
+    def test_unknown_role_rejected_without_state_db_read(self, tmp_state_db, monkeypatch):
         """The role guard must short-circuit BEFORE
         ``state.get_unit_state`` — otherwise an unknown-role wait_unit
         call could exfiltrate "does this unit exist" info to a corrupted
@@ -556,13 +529,11 @@ class TestPredecessorRoleGateConsistency:
         for role in ("coder", "tester", "reviewer"):
             # Known roles must NOT trip the role-guard message.
             err = execution.wait_unit("does-not-exist", role, timeout_s=1)
-            assert "role must be" not in err, (
-                f"wait_unit rejected known role {role!r}: {err}"
-            )
+            assert "role must be" not in err, f"wait_unit rejected known role {role!r}: {err}"
 
         # Plus assert the marker module's gate set matches what we
         # accept — predecessor contract.
-        assert markers._KNOWN_ROLES == frozenset({"coder", "tester", "reviewer"})
+        assert frozenset({"coder", "tester", "reviewer"}) == markers._KNOWN_ROLES
 
 
 # ===========================================================================
@@ -582,9 +553,7 @@ class TestScopeInvariants:
         sig = inspect.signature(markers.scan_response)
         params = list(sig.parameters)
         # Predecessor F-016-U-1 contract: (role, text, *, allowed=None).
-        assert params[:2] == ["role", "text"], (
-            f"markers.scan_response signature drifted: {params}"
-        )
+        assert params[:2] == ["role", "text"], f"markers.scan_response signature drifted: {params}"
         assert "allowed" in sig.parameters
 
     def test_dedupe_key_signature_unchanged(self):
@@ -593,9 +562,7 @@ class TestScopeInvariants:
         sig = inspect.signature(markers.dedupe_key)
         # F-016-U-1 lock: dedupe_key(*, session_id, cycle_number,
         # event_type, marker_payload).
-        kw_only = {
-            name for name, p in sig.parameters.items() if p.kind == p.KEYWORD_ONLY
-        }
+        kw_only = {name for name, p in sig.parameters.items() if p.kind == p.KEYWORD_ONLY}
         assert {"session_id", "cycle_number", "event_type", "marker_payload"} <= kw_only, (
             f"markers.dedupe_key kw-only set drifted: {sorted(kw_only)}"
         )
@@ -603,7 +570,7 @@ class TestScopeInvariants:
     def test_known_roles_set_unchanged(self):
         from orchestrator import markers
 
-        assert markers._KNOWN_ROLES == frozenset({"coder", "tester", "reviewer"}), (
+        assert frozenset({"coder", "tester", "reviewer"}) == markers._KNOWN_ROLES, (
             f"_KNOWN_ROLES drifted: {markers._KNOWN_ROLES}"
         )
 
@@ -631,6 +598,5 @@ class TestMcpToolDocstrings:
             # tools do without reading source. A bare one-line title
             # wouldn't be enough; require a couple of sentences.
             assert len(desc) > 80, (
-                f"{name} description is suspiciously short ({len(desc)} chars): "
-                f"{desc!r}"
+                f"{name} description is suspiciously short ({len(desc)} chars): {desc!r}"
             )
