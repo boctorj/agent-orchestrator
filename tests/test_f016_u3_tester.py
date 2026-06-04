@@ -614,11 +614,16 @@ class TestMcpRegistration:
 
     @staticmethod
     def _list_tool_names() -> set[str]:
-        loop = asyncio.new_event_loop()
-        try:
-            tools = loop.run_until_complete(mcp.list_tools())
-        finally:
-            loop.close()
+        # FastMCP's tool registry is async-only. Use ``asyncio.run`` (not a
+        # bare ``new_event_loop`` + ``loop.close``) so ``shutdown_asyncgens``
+        # + ``shutdown_default_executor`` fire on teardown — Python 3.12 on
+        # Windows is stricter about cleanup and the bare-loop pattern,
+        # repeated across the five tests in this class, would leak the
+        # default executor and trip the next test's loop. Matches the
+        # ``asyncio.run(mcp.list_tools())`` pattern in
+        # ``tests/test_tools_health.py`` / ``tests/test_tools_ops.py`` /
+        # ``tests/test_f014_u2_tester.py``.
+        tools = asyncio.run(mcp.list_tools())
         return {t.name for t in tools}
 
     def test_advance_to_tester_registered(self):
