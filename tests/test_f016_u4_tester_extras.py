@@ -313,8 +313,7 @@ class TestUpdateUnitDepsApprovalPreservation:
         assert plan is not None
         u3 = next(u for u in plan.units if u.id == "F-DEPS-U-3")
         assert u3.depends_on == [], (
-            "empty depends_on must CLEAR existing deps; "
-            f"got {u3.depends_on}"
+            f"empty depends_on must CLEAR existing deps; got {u3.depends_on}"
         )
 
     def test_unaffected_units_keep_their_deps(self, tmp_state_db):
@@ -515,9 +514,7 @@ class TestNextReadyUnitsAllAggregatesCancelled:
 
         raw = scheduling.next_ready_units_all()
         parsed = json.loads(raw)
-        cancelled_refs = {
-            (e["feature_id"], e["unit_id"]) for e in parsed.get("cancelled", [])
-        }
+        cancelled_refs = {(e["feature_id"], e["unit_id"]) for e in parsed.get("cancelled", [])}
         assert ("F-A", "F-A-U-1") in cancelled_refs
         assert ("F-B", "F-B-U-1") in cancelled_refs
         # And no F-?-U-2 in ready_to_spawn (cancelled deps don't satisfy).
