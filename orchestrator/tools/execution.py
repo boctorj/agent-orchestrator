@@ -1075,7 +1075,19 @@ def _pr_url_for(feature_id: str, unit_state: WorkUnitState | None) -> str | None
 
 
 def _emit_terminal(ctx: CycleContext, outcome: str, msg: str) -> str:
-    """Final return value of cycle_review. Fires ntfy push as side effect."""
+    """Final return value of cycle_review. Fires ntfy push as side effect.
+
+    The ``approved_awaiting_merge`` ntfy push is dedupe-keyed per unit via
+    the ``cycle_terminal_emitted`` event row: ``state.record_event`` with a
+    constant ``cycle_terminal_emitted:<unit_id>`` key uses
+    ``INSERT OR IGNORE`` (Phase 0's primitive) so the second call against
+    the same unit returns ``rowcount == 0`` and the status flip + ntfy push
+    skip. Closes the F-016-U-5 daemon's notification-storm window: a unit
+    sitting in ``approved_awaiting_merge`` for hours waiting on the human
+    merge collects exactly one push, not one per poll interval (PR #58 H1).
+    The escalation branch stays unconditional — re-escalation is rare and
+    the human needs the signal each time.
+    """
     # Finalize the cycle log before the ntfy push so an operator who taps
     # the notification and looks at features/F-XXX/U-N.md sees the
     # current terminal state captured on disk. Covers all cycle_review
@@ -1090,12 +1102,31 @@ def _emit_terminal(ctx: CycleContext, outcome: str, msg: str) -> str:
     if outcome == "escalated":
         ntfy.push_escalation(ctx.unit_id, msg, pr_url=pr_url)
     elif outcome == "approved_awaiting_merge":
-        # Persist the awaiting-merge status before pushing — the ntfy listener
-        # follows the URL to the dashboard, which reads this row. The flip is
-        # gated on an active from-state so a stray re-entry can't drift a
-        # `done` unit back to `approved_awaiting_merge` (F-009-U-4).
-        _flip_status_if_active(ctx.unit_id, target="approved_awaiting_merge")
-        ntfy.push_ready_to_merge(ctx.unit_id, pr_url or "(no PR url)", summary=msg)
+        # Dedupe via cycle_terminal_emitted event. INSERT OR IGNORE on the
+        # per-unit dedupe_key means a re-call (daemon tick, accidental
+        # double cycle_review, etc.) returns False here and skips the
+        # status flip + ntfy push (PR #58 H1). Without this, the F-016-U-5
+        # daemon would re-fire the ntfy push on every tick against a unit
+        # sitting in approved_awaiting_merge — a notification storm for
+        # any unit waiting hours/days for the human merge.
+        inserted = state.record_event(
+            ctx.unit_id,
+            ctx.feature_id,
+            "cycle_terminal_emitted",
+            source="orchestrator",
+            cycle_number=unit_state.review_round if unit_state else None,
+            summary="approved_awaiting_merge terminal fired",
+            details=msg,
+            dedupe_key=f"cycle_terminal_emitted:{ctx.unit_id}",
+        )
+        if inserted:
+            # Persist the awaiting-merge status before pushing — the ntfy
+            # listener follows the URL to the dashboard, which reads this
+            # row. The flip is gated on an active from-state so a stray
+            # re-entry can't drift a `done` unit back to
+            # `approved_awaiting_merge` (F-009-U-4).
+            _flip_status_if_active(ctx.unit_id, target="approved_awaiting_merge")
+            ntfy.push_ready_to_merge(ctx.unit_id, pr_url or "(no PR url)", summary=msg)
 
     final_state_json = get_unit_status(ctx.unit_id)
     try:
@@ -2386,11 +2417,15 @@ def _ultrareview_phase(ctx: CycleContext) -> tuple[bool, str | None]:
 #
 # Why ``approved_awaiting_merge`` is NOT in ``_PAST_TERMINAL_STATUSES``: the
 # REVIEW_RECOMMEND_MERGE marker flips status to ``approved_awaiting_merge``
-# BEFORE ``advance_to_terminal`` runs; treating it as already-past would
-# skip the ntfy push + cycle-log finalize in ``_emit_terminal``. The bucket
-# is intentionally narrower than the others to give the terminal emitter a
-# clean firing window. The wrapper ``cycle_review`` calls the three phases
-# sequentially so this asymmetry is invisible on the happy path.
+# BEFORE ``advance_to_terminal`` runs; treating it as already-past on the
+# status side alone would skip the ntfy push + cycle-log finalize in
+# ``_emit_terminal``. Re-call dedupe is layered instead via
+# ``_terminal_already_emitted`` (the ``cycle_terminal_emitted`` event row
+# ``_emit_terminal`` records on its first success); a daemon re-tick during
+# the human-merge waiting window reads that event and short-circuits to
+# ``already_past`` without re-pushing ntfy (PR #58 H1). The narrow status
+# bucket + the event-based dedupe together fence the firing window from
+# both sides.
 _PAST_TESTER_STATUSES: frozenset[str] = frozenset(
     {"reviewing", "fixing", "approved_awaiting_merge", "done"}
 )
@@ -2497,6 +2532,21 @@ def _last_reviewer_outcome(unit_id: str) -> str | None:
         if marker is not None:
             return marker
     return None
+
+
+def _terminal_already_emitted(unit_id: str) -> bool:
+    """True iff ``_emit_terminal`` has already fired the
+    ``approved_awaiting_merge`` ntfy push for this unit.
+
+    Checks for the ``cycle_terminal_emitted`` event ``_emit_terminal``
+    records via the per-unit dedupe_key. The single-row read lets
+    ``advance_to_terminal`` short-circuit a daemon re-tick (PR #58 H1)
+    against a unit waiting hours/days for the human merge: status sits
+    in ``approved_awaiting_merge`` for the duration but the dedupe event
+    pins "the terminal already fired", so the second call returns
+    ``already_past`` rather than re-pushing the ntfy.
+    """
+    return any(e.get("event_type") == "cycle_terminal_emitted" for e in state.list_events(unit_id))
 
 
 def _run_tester_advance(ctx: CycleContext) -> tuple[bool, str | None]:
@@ -2642,11 +2692,24 @@ def advance_to_terminal(feature_id: str, unit_id: str) -> str:
     """Phase 3 of the cycle pipeline: optional F-007 ultrareview gate, then
     emit the terminal (ntfy push + cycle-log finalize + status flip).
 
-    Idempotent on ``status='done'`` only. ``approved_awaiting_merge`` is
-    NOT treated as already-past: the REVIEW_RECOMMEND_MERGE marker flips
-    status to that bucket BEFORE this tool runs, so the wrapper still
-    needs the terminal-emit fire window. The narrow bucket is the spec's
-    accepted asymmetry (PROPOSAL § Phase 2).
+    **Reviewer-marker precondition (PR #58 C1).** The success path requires
+    a prior ``reviewer_recommend_merge`` or ``reviewer_comment`` event for
+    this unit. Without one, the call returns ``not_ready`` and does NOT
+    flip status, fire ntfy, or finalize cycle-log — exactly the false
+    "ready to merge" notification the daemon (F-016-U-5) would otherwise
+    push on every poll of a unit still in ``coding`` / ``testing`` /
+    ``in_ci`` / ``reviewing`` / ``fixing``. ``reviewer_request_changes``
+    and the absence of a marker both fall under "no terminal possible
+    yet"; the caller's right next step is ``advance_to_reviewer``.
+
+    **Idempotence on terminal emit (PR #58 H1).** The first successful
+    terminal-emit records a ``cycle_terminal_emitted`` event keyed on the
+    unit; subsequent calls (daemon re-ticks, accidental double
+    ``cycle_review``) read the event in the early already-emitted check
+    and return ``already_past`` without re-firing the ntfy push. The
+    ``status='done'`` short-circuit handles the post-merge path; the
+    event check handles the ``approved_awaiting_merge`` waiting window
+    where a unit can sit for hours/days before a human merges.
 
     Reads the latest reviewer marker from ``unit_events`` to decide
     whether to fire ultrareview — only ``REVIEW_RECOMMEND_MERGE``
@@ -2666,7 +2729,33 @@ def advance_to_terminal(feature_id: str, unit_id: str) -> str:
     if unit_state.status in _PAST_TERMINAL_STATUSES:
         return _already_past_response(unit_id, unit_state, next_action=None)
 
+    # H1 dedupe: if a previous _emit_terminal already fired the ntfy push
+    # and flipped status, the dedupe-keyed cycle_terminal_emitted event
+    # lives in unit_events. Treat the unit as already_past so the daemon's
+    # repeated calls during the human-merge waiting window are no-ops.
+    if _terminal_already_emitted(unit_id):
+        return _already_past_response(unit_id, unit_state, next_action=None)
+
     reviewer_outcome = _last_reviewer_outcome(unit_id)
+
+    # C1 precondition: no reviewer endorsement / comment means the
+    # terminal phase is not the next action. Returning not_ready (rather
+    # than silently emitting a false-positive "ready to merge") is the
+    # contract every misuse route (lead typo, daemon speculative tick,
+    # test forgetting to seed events) needs.
+    if reviewer_outcome not in ("REVIEW_RECOMMEND_MERGE", "REVIEW_COMMENT"):
+        return json.dumps(
+            {
+                "unit_id": unit_id,
+                "outcome": "not_ready",
+                "status": unit_state.status,
+                "message": (
+                    "no reviewer marker yet — run advance_to_reviewer first "
+                    "(latest reviewer event: " + (reviewer_outcome or "none") + ")"
+                ),
+            },
+            indent=2,
+        )
 
     ctx = CycleContext(feature_id=feature_id, unit_id=unit_id, history=[])
     ok, msg = _run_terminal_advance(ctx, reviewer_outcome)

@@ -3047,7 +3047,7 @@ class TestAdvanceToTester:
         _setup_feature()
         out = execution.advance_to_tester("F-001", "F-001-U-1")
         parsed = json.loads(out)
-        assert parsed["outcome"] in ("not_ready", "error")
+        assert parsed["outcome"] == "not_ready"
 
     def test_tester_blocked_escalates(self, tmp_state_db, with_github_token, monkeypatch):
         _seed_coded_unit()
@@ -3263,6 +3263,128 @@ class TestAdvanceToTerminal:
         out = execution.advance_to_terminal("F-001", "F-001-U-1")
         parsed = json.loads(out)
         assert parsed["outcome"] == "escalated"
+
+    def test_no_reviewer_marker_returns_not_ready(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """🔴 C1 regression guard (PR #58): without a reviewer endorsement
+        or comment marker for this unit, ``advance_to_terminal`` MUST refuse
+        — no status flip, no ntfy push. The daemon (F-016-U-5) will call
+        this speculatively on every poll; firing terminal on a unit still
+        in ``coding`` / ``testing`` / ``in_ci`` / ``reviewing`` would push
+        a false "ready to merge" notification to the human's phone.
+        """
+        _seed_coded_unit()  # status=in_ci, no reviewer events seeded
+        _stub_github(monkeypatch)
+        push_calls: list = []
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_ready_to_merge",
+            lambda *a, **k: push_calls.append((a, k)) or True,
+        )
+
+        out = execution.advance_to_terminal("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "not_ready"
+        # Negative side: must NOT flip status, must NOT push ntfy.
+        assert state.get_unit_state("F-001-U-1").status == "in_ci"
+        assert push_calls == []
+
+    def test_no_reviewer_marker_rejects_every_active_status(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """C1 corollary: not_ready holds for every non-terminal status when
+        no reviewer marker exists. Covers the full attack surface called
+        out in the review: ``coding``, ``testing``, ``in_ci``, ``reviewing``,
+        ``fixing`` all flow through the same `_emit_terminal` if not gated.
+        """
+        _seed_coded_unit()
+        _stub_github(monkeypatch)
+        push_calls: list = []
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_ready_to_merge",
+            lambda *a, **k: push_calls.append((a, k)) or True,
+        )
+
+        for from_status in ("coding", "testing", "in_ci", "reviewing", "fixing"):
+            s = state.get_unit_state("F-001-U-1")
+            s.status = from_status
+            state.upsert_unit_state(s)
+
+            out = execution.advance_to_terminal("F-001", "F-001-U-1")
+            parsed = json.loads(out)
+            assert parsed["outcome"] == "not_ready", from_status
+            assert state.get_unit_state("F-001-U-1").status == from_status
+        assert push_calls == [], "no ntfy push allowed without reviewer marker"
+
+    def test_daemon_re_tick_on_approved_awaiting_merge_does_not_re_push(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """🟠 H1 regression guard (PR #58): the F-016-U-5 daemon ticks
+        ``advance_to_terminal`` on every poll interval. A unit waiting
+        hours/days for the human merge must not collect one phone push per
+        poll — terminal emit is dedupe-keyed on the unit so the second
+        call is a no-op.
+        """
+        _seed_coded_unit()
+        state.record_event(
+            "F-001-U-1",
+            "F-001",
+            "reviewer_recommend_merge",
+            source="reviewer",
+            cycle_number=0,
+            summary="endorsed",
+        )
+        s = state.get_unit_state("F-001-U-1")
+        s.status = "approved_awaiting_merge"
+        state.upsert_unit_state(s)
+
+        _stub_github(monkeypatch)
+        push_calls: list = []
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_ready_to_merge",
+            lambda *a, **k: push_calls.append((a, k)) or True,
+        )
+
+        # First call: real terminal emit; ntfy fires once.
+        first = json.loads(execution.advance_to_terminal("F-001", "F-001-U-1"))
+        assert first["outcome"] == "approved_awaiting_merge"
+        assert len(push_calls) == 1, "first call must fire ready-to-merge push"
+
+        # Subsequent calls: dedupe short-circuits — no second push.
+        for _ in range(3):
+            second = json.loads(execution.advance_to_terminal("F-001", "F-001-U-1"))
+            assert second["outcome"] == "already_past", second
+        assert len(push_calls) == 1, "daemon re-ticks must not re-fire ntfy"
+
+    def test_cycle_review_double_call_does_not_re_push(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """H1 belt-and-suspenders: even if the lead accidentally calls
+        ``cycle_review`` twice on the same unit, the second call must not
+        re-push ntfy. Dedupe lives in ``_emit_terminal``, not in the
+        wrapper, so both entry points are protected.
+        """
+        _seed_coded_unit()
+        monkeypatch.setattr(
+            execution,
+            "spawn_tester",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "TESTS_PASS"}),
+        )
+        monkeypatch.setattr(
+            execution,
+            "spawn_reviewer",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "REVIEW_RECOMMEND_MERGE"}),
+        )
+        _stub_github(monkeypatch)
+        push_calls: list = []
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_ready_to_merge",
+            lambda *a, **k: push_calls.append((a, k)) or True,
+        )
+
+        execution.cycle_review("F-001", "F-001-U-1")
+        execution.cycle_review("F-001", "F-001-U-1")
+        assert len(push_calls) == 1, "second cycle_review must dedupe the ntfy push"
 
 
 class TestCycleReviewIsWrapper:

@@ -164,6 +164,38 @@ def _silence_ntfy(monkeypatch) -> None:
     )
 
 
+def _faithful_spawn_reviewer_stub(outcome: str = "REVIEW_RECOMMEND_MERGE"):
+    """Stub ``spawn_reviewer`` that also records the reviewer marker event.
+
+    The pre-PR #58 stubs returned the JSON outcome but skipped the
+    ``state.record_event(...)`` side effect the real ``spawn_reviewer`` /
+    ``_record_terminal_marker`` pair performs. ``advance_to_terminal``'s
+    C1 precondition (PR #58) reads ``unit_events`` to confirm the
+    reviewer actually emitted a marker before firing the ntfy push — so
+    a stub that skips the event would fail the precondition and route
+    ``not_ready`` even on the happy path. This helper closes the gap by
+    mirroring the production side effect.
+    """
+    event_type = {
+        "REVIEW_RECOMMEND_MERGE": "reviewer_recommend_merge",
+        "REVIEW_COMMENT": "reviewer_comment",
+        "REVIEW_REQUEST_CHANGES": "reviewer_request_changes",
+    }[outcome]
+
+    def _stub(feature_id: str, unit_id: str) -> str:
+        state.record_event(
+            unit_id,
+            feature_id,
+            event_type,
+            source="reviewer",
+            cycle_number=0,
+            summary=outcome,
+        )
+        return json.dumps({"unit_id": unit_id, "outcome": outcome})
+
+    return _stub
+
+
 # ===========================================================================
 # Idempotence is a *behavioural* contract, not just an outcome string
 # ===========================================================================
@@ -389,6 +421,11 @@ class TestNextActionChain:
         _seed_coded_unit()
 
         # Stub each phase's spawn out so the engine just walks history.
+        # The reviewer stub records the marker event the real
+        # ``spawn_reviewer`` records via ``_record_terminal_marker`` — the
+        # C1 precondition added in PR #58 reads that event before firing
+        # the terminal, so a return-only stub would now route to
+        # ``not_ready`` even on the happy path.
         monkeypatch.setattr(
             execution,
             "spawn_tester",
@@ -397,7 +434,7 @@ class TestNextActionChain:
         monkeypatch.setattr(
             execution,
             "spawn_reviewer",
-            lambda f, u: json.dumps({"unit_id": u, "outcome": "REVIEW_RECOMMEND_MERGE"}),
+            _faithful_spawn_reviewer_stub("REVIEW_RECOMMEND_MERGE"),
         )
         _stub_github_noop(monkeypatch)
         _silence_ntfy(monkeypatch)
@@ -445,6 +482,8 @@ class TestSequentialCompositionEqualsCycleReview:
 
     @staticmethod
     def _stub_full_pipeline(monkeypatch):
+        # The reviewer stub records the marker event the real
+        # ``spawn_reviewer`` records (PR #58 C1 precondition reads it).
         monkeypatch.setattr(
             execution,
             "spawn_tester",
@@ -453,7 +492,7 @@ class TestSequentialCompositionEqualsCycleReview:
         monkeypatch.setattr(
             execution,
             "spawn_reviewer",
-            lambda f, u: json.dumps({"unit_id": u, "outcome": "REVIEW_RECOMMEND_MERGE"}),
+            _faithful_spawn_reviewer_stub("REVIEW_RECOMMEND_MERGE"),
         )
         _stub_github_noop(monkeypatch)
         _silence_ntfy(monkeypatch)
@@ -461,29 +500,34 @@ class TestSequentialCompositionEqualsCycleReview:
     def test_three_calls_terminate_same_status_as_wrapper(
         self, tmp_state_db, with_github_token, monkeypatch
     ):
-        # ----- Decomposed path -----
-        _seed_coded_unit(unit_id="F-001-U-1", feature_id="F-001")
+        # Two independent units (rather than re-seeding the same row): PR
+        # #58's H1 dedupe event ``cycle_terminal_emitted`` lives in
+        # ``unit_events`` and would correctly short-circuit a second
+        # ``_emit_terminal`` against the same unit_id. Distinct units
+        # keep both paths' first-cycle behaviour cleanly observable.
+        _setup_feature("F-001")
+        for uid in ("F-001-U-1", "F-001-U-2"):
+            state.upsert_unit_state(
+                WorkUnitState(
+                    unit_id=uid,
+                    feature_id="F-001",
+                    status="in_ci",
+                    branch="feat/branch",
+                    pr_number=5,
+                    coder_session_id="sesn-c",
+                )
+            )
         self._stub_full_pipeline(monkeypatch)
 
+        # ----- Decomposed path -----
         execution.advance_to_tester("F-001", "F-001-U-1")
         execution.advance_to_reviewer("F-001", "F-001-U-1")
         execution.advance_to_terminal("F-001", "F-001-U-1")
         decomposed_status = state.get_unit_state("F-001-U-1").status
 
-        # ----- Wrapper path (fresh DB row) -----
-        # Drop the unit row and re-seed for the wrapper run.
-        state.upsert_unit_state(
-            WorkUnitState(
-                unit_id="F-001-U-1",
-                feature_id="F-001",
-                status="in_ci",
-                branch="feat/branch",
-                pr_number=5,
-                coder_session_id="sesn-c",
-            )
-        )
-        execution.cycle_review("F-001", "F-001-U-1")
-        wrapper_status = state.get_unit_state("F-001-U-1").status
+        # ----- Wrapper path -----
+        execution.cycle_review("F-001", "F-001-U-2")
+        wrapper_status = state.get_unit_state("F-001-U-2").status
 
         assert decomposed_status == wrapper_status == "approved_awaiting_merge", (
             f"decomposed={decomposed_status} wrapper={wrapper_status} — "
