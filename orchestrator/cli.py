@@ -109,6 +109,59 @@ def dashboard() -> None:
     raise SystemExit(dashboard_main())
 
 
+# --------------------------- daemon ---------------------------
+
+
+@cli.group(help="Watcher daemon (F-016 Phase 3) — opt-in via ORCH_DAEMON_DRIVE=true.")
+def daemon() -> None:
+    """Manage the reconciliation daemon.
+
+    The daemon runs the level-triggered reconciler from
+    :mod:`orchestrator.daemon`. One daemon per workspace (keyed by the
+    absolute ``state.db`` path); a second ``daemon start`` against the
+    same workspace prints the existing holder's heartbeat and exits.
+    """
+
+
+@daemon.command("start", help="Run the reconciliation daemon in the foreground.")
+def daemon_start() -> None:
+    """Loop until SIGINT / SIGTERM.
+
+    Loads the workspace's ``.env`` so ``GITHUB_TOKEN`` / ``ANTHROPIC_API_KEY``
+    / ``ORCH_DAEMON_DRIVE`` reach the loop. Without ``ORCH_DAEMON_DRIVE=true``
+    the loop is a no-op (the daemon refuses to claim the lock).
+    """
+    from dotenv import load_dotenv
+
+    from orchestrator import daemon as daemon_module
+    from orchestrator import state
+
+    load_dotenv(dotenv_path=Path(".env"))
+    state.init_db()
+    raise SystemExit(0 if daemon_module.run_daemon() >= 0 else 1)
+
+
+@daemon.command("status", help="Show the current daemon lock holder (if any).")
+def daemon_status() -> None:
+    """Print the workspace's ``daemon_locks`` row in JSON.
+
+    Read-only — does not claim, heartbeat, or release. Use to debug
+    "is the daemon actually running?" without restarting it.
+    """
+    import json as _json
+
+    from orchestrator import state
+
+    state.init_db()
+    path = str(state.STATE_DB.resolve())
+    row = state.get_daemon_lock(path)
+    console = Console()
+    if row is None:
+        console.print(f"[dim]No daemon lock for {path}[/dim]")
+        raise SystemExit(0)
+    console.print(_json.dumps(row, indent=2))
+
+
 # --------------------------- run ---------------------------
 
 

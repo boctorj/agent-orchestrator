@@ -1005,3 +1005,184 @@ class TestPhase25Migration:
         after = cols()
         assert "cancelled_at" in after
         assert "owner" in after
+
+
+# --------------------------- F-016 Phase 3: daemon_locks ---------------------------
+
+
+def _age_lock(state_db_path: str, age_seconds: float) -> None:
+    """Push ``daemon_locks.heartbeat_at`` back ``age_seconds`` for stale-takeover tests."""
+    aged = (datetime.now(UTC) - timedelta(seconds=age_seconds)).isoformat()
+    with sqlite3.connect(state.STATE_DB) as conn:
+        conn.execute(
+            "UPDATE daemon_locks SET heartbeat_at = ? WHERE state_db_path = ?",
+            (aged, state_db_path),
+        )
+        conn.commit()
+
+
+class TestDaemonLockClaim:
+    """``claim_daemon_lock`` — the workspace-scoped singleton primitive."""
+
+    PATH = "/abs/state.db"
+
+    def test_empty_table_claim_succeeds(self, tmp_state_db):
+        assert state.claim_daemon_lock(self.PATH, "h1") is True
+        row = state.get_daemon_lock(self.PATH)
+        assert row is not None
+        assert row["holder_id"] == "h1"
+
+    def test_fresh_holder_blocks_other(self, tmp_state_db):
+        state.claim_daemon_lock(self.PATH, "h1")
+        assert state.claim_daemon_lock(self.PATH, "h2") is False
+        # h1 still holds.
+        assert state.get_daemon_lock(self.PATH)["holder_id"] == "h1"
+
+    def test_own_holder_reclaim_is_idempotent_and_refreshes_heartbeat(self, tmp_state_db):
+        state.claim_daemon_lock(self.PATH, "h1")
+        before = state.get_daemon_lock(self.PATH)["heartbeat_at"]
+        time.sleep(0.01)
+        assert state.claim_daemon_lock(self.PATH, "h1") is True
+        after = state.get_daemon_lock(self.PATH)["heartbeat_at"]
+        # Same holder, but heartbeat refreshed.
+        assert after >= before
+
+    def test_stale_heartbeat_allows_takeover(self, tmp_state_db):
+        state.claim_daemon_lock(self.PATH, "h1")
+        _age_lock(self.PATH, age_seconds=60)
+        assert state.claim_daemon_lock(self.PATH, "h2", stale_after_s=30) is True
+        assert state.get_daemon_lock(self.PATH)["holder_id"] == "h2"
+
+    def test_takeover_respects_stale_window(self, tmp_state_db):
+        """A heartbeat younger than ``stale_after_s`` blocks takeover."""
+        state.claim_daemon_lock(self.PATH, "h1")
+        _age_lock(self.PATH, age_seconds=5)
+        assert state.claim_daemon_lock(self.PATH, "h2", stale_after_s=30) is False
+        assert state.get_daemon_lock(self.PATH)["holder_id"] == "h1"
+
+    def test_distinct_paths_get_distinct_locks(self, tmp_state_db):
+        """Two workspaces (distinct ``state_db_path`` rows) coexist."""
+        assert state.claim_daemon_lock("/a/state.db", "h1") is True
+        assert state.claim_daemon_lock("/b/state.db", "h2") is True
+        assert state.get_daemon_lock("/a/state.db")["holder_id"] == "h1"
+        assert state.get_daemon_lock("/b/state.db")["holder_id"] == "h2"
+
+    def test_unparseable_heartbeat_treats_as_fresh(self, tmp_state_db):
+        """A row with a malformed timestamp must NOT auto-take-over — that
+        would let a corrupted clock cause a false takeover storm. The
+        helper treats unparseable as fresh and refuses."""
+        state.claim_daemon_lock(self.PATH, "h1")
+        with sqlite3.connect(state.STATE_DB) as conn:
+            conn.execute(
+                "UPDATE daemon_locks SET heartbeat_at = ? WHERE state_db_path = ?",
+                ("not-a-timestamp", self.PATH),
+            )
+            conn.commit()
+        assert state.claim_daemon_lock(self.PATH, "h2") is False
+
+
+class TestDaemonLockHeartbeat:
+    PATH = "/abs/state.db"
+
+    def test_heartbeat_succeeds_for_holder(self, tmp_state_db):
+        state.claim_daemon_lock(self.PATH, "h1")
+        before = state.get_daemon_lock(self.PATH)["heartbeat_at"]
+        time.sleep(0.01)
+        assert state.heartbeat_daemon_lock(self.PATH, "h1") is True
+        after = state.get_daemon_lock(self.PATH)["heartbeat_at"]
+        assert after > before
+
+    def test_heartbeat_fails_for_other(self, tmp_state_db):
+        state.claim_daemon_lock(self.PATH, "h1")
+        assert state.heartbeat_daemon_lock(self.PATH, "h2") is False
+
+    def test_heartbeat_fails_when_row_missing(self, tmp_state_db):
+        # No claim yet.
+        assert state.heartbeat_daemon_lock(self.PATH, "h1") is False
+
+
+class TestDaemonLockRelease:
+    PATH = "/abs/state.db"
+
+    def test_release_succeeds_for_holder_and_deletes_row(self, tmp_state_db):
+        state.claim_daemon_lock(self.PATH, "h1")
+        assert state.release_daemon_lock(self.PATH, "h1") is True
+        assert state.get_daemon_lock(self.PATH) is None
+
+    def test_release_fails_for_other(self, tmp_state_db):
+        state.claim_daemon_lock(self.PATH, "h1")
+        assert state.release_daemon_lock(self.PATH, "h2") is False
+        # h1 still owns.
+        assert state.get_daemon_lock(self.PATH)["holder_id"] == "h1"
+
+    def test_release_is_idempotent_on_missing_row(self, tmp_state_db):
+        # No claim — release returns False, doesn't raise.
+        assert state.release_daemon_lock(self.PATH, "h1") is False
+
+
+# --------------------------- F-016 Phase 3: list_active_units ---------------------------
+
+
+class TestListActiveUnits:
+    """``list_active_units`` returns rows in agent-driving + awaiting-merge
+    statuses; ``done`` / ``escalated`` / ``cancelled`` / ``pending`` are
+    excluded."""
+
+    def _seed_feature(self, fid: str = "F-A") -> None:
+        state.save_feature(Feature(id=fid, title="t", description="d"))
+
+    def _seed(self, unit_id: str, status: str, feature_id: str = "F-A") -> None:
+        state.upsert_unit_state(
+            WorkUnitState(unit_id=unit_id, feature_id=feature_id, status=status)
+        )
+
+    def test_includes_active_and_awaiting_merge(self, tmp_state_db):
+        self._seed_feature()
+        for s in (
+            "coding",
+            "testing",
+            "opening_pr",
+            "in_ci",
+            "reviewing",
+            "fixing",
+            "approved_awaiting_merge",
+        ):
+            self._seed(f"U-{s}", s)
+        ids = {u.unit_id for u in state.list_active_units()}
+        assert ids == {
+            "U-coding",
+            "U-testing",
+            "U-opening_pr",
+            "U-in_ci",
+            "U-reviewing",
+            "U-fixing",
+            "U-approved_awaiting_merge",
+        }
+
+    def test_excludes_terminal_and_cancelled_and_pending(self, tmp_state_db):
+        self._seed_feature()
+        for s in ("pending", "done", "escalated", "cancelled"):
+            self._seed(f"U-{s}", s)
+        assert state.list_active_units() == []
+
+    def test_ordered_by_last_activity(self, tmp_state_db):
+        self._seed_feature()
+        # Manually order: U-2 newer than U-1.
+        state.upsert_unit_state(
+            WorkUnitState(
+                unit_id="U-1",
+                feature_id="F-A",
+                status="coding",
+                last_activity="2024-01-01T00:00:00",
+            )
+        )
+        state.upsert_unit_state(
+            WorkUnitState(
+                unit_id="U-2",
+                feature_id="F-A",
+                status="coding",
+                last_activity="2024-01-02T00:00:00",
+            )
+        )
+        ordered = state.list_active_units()
+        assert [u.unit_id for u in ordered] == ["U-1", "U-2"]
