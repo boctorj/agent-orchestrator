@@ -3651,47 +3651,58 @@ class TestCancelUnitTakesAdvanceLock:
     and concurrent cancels can't race the archive + audit-event writes.
     """
 
-    def test_concurrent_cancel_archives_once(self, tmp_state_db, monkeypatch):
-        """Two threads racing ``cancel_unit`` on the same unit must
-        archive each session exactly once (the lock serializes; the
-        second pass falls through the ``already_cancelled`` short-circuit).
-        """
-        import threading
+    def test_lock_is_held_during_archive_body(self, tmp_state_db, monkeypatch):
+        """While ``cancel_unit``'s archive runs, the per-unit advance-lock
+        must be held — the daemon-visible signal
+        (:func:`state.has_active_advance_lock`) must be True for the
+        entire body. This is the contract the spec § Phase 2.5 needs:
+        a daemon tick that lands mid-archive sees ``owner='lead'`` and
+        defers; a concurrent ``cancel_unit`` blocks on the RLock until
+        the first finishes (and then short-circuits at the
+        ``already_cancelled`` check).
 
-        _seed_coded_unit()
-        archive_calls: list[str] = []
-        lock_obs: list[str] = []
+        Replaces an earlier threading-based test that proved the same
+        contract but leaked background threads on slow Windows CI when
+        ``Thread.join(5)`` timed out before the workers finished —
+        leaked threads continued issuing SQLite ops against the
+        tmp_state_db file, blocking the touch_unit calls in
+        subsequent tests (PR #59 windows-3.12 deadlock). The
+        lock-observability probe pins the same invariant without
+        spawning a thread.
+        """
+        observed: dict[str, list[bool]] = {"under_lock": []}
 
         def factory(role: str):
             class _W:
-                def archive(self, sid):
-                    archive_calls.append(f"{role}:{sid}")
+                def archive(self, sid: str) -> None:  # noqa: ARG002
+                    # Probe the daemon's view from inside the lock:
+                    # has_active_advance_lock reads ``owner`` from
+                    # state.db; True means the CAS claim landed and
+                    # the daemon (separate process) would defer.
+                    observed["under_lock"].append(state.has_active_advance_lock("F-001-U-1"))
 
             return _W()
 
+        _seed_coded_unit()
         monkeypatch.setattr("orchestrator.tools.execution.make_worker", factory)
 
-        barrier = threading.Barrier(2)
+        # Before cancel: lock is not held.
+        assert state.has_active_advance_lock("F-001-U-1") is False
 
-        def go():
-            barrier.wait()
-            out = execution.cancel_unit("F-001-U-1")
-            lock_obs.append(out)
+        out = execution.cancel_unit("F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "cancelled"
 
-        t1 = threading.Thread(target=go)
-        t2 = threading.Thread(target=go)
-        t1.start()
-        t2.start()
-        t1.join(5)
-        t2.join(5)
-        # Exactly one archive call per role (the unit only has a coder
-        # session in _seed_coded_unit).
-        assert archive_calls.count("coder:sesn-c") == 1, (
-            f"expected exactly one coder archive call; got {archive_calls}"
+        # The archive callback ran inside the with state.lead_advance_lock
+        # block, so the daemon-visible signal must have been True at the
+        # observation point. Without the lock wrapping, the probe would
+        # see False and the daemon would race the cancel's state writes.
+        assert observed["under_lock"] == [True], (
+            f"cancel_unit must hold lead_advance_lock during archive (PR #59 M3); got {observed}"
         )
-        # Exactly one unit_cancelled row.
-        rows = [e for e in state.list_events("F-001-U-1") if e["event_type"] == "unit_cancelled"]
-        assert len(rows) == 1, f"expected one unit_cancelled row; got {len(rows)}"
+
+        # After cancel: lock released.
+        assert state.has_active_advance_lock("F-001-U-1") is False
 
     def test_unit_cancelled_event_is_dedupe_keyed(self, tmp_state_db, monkeypatch):
         """The ``unit_cancelled`` audit row must carry a dedupe_key so
@@ -3706,3 +3717,29 @@ class TestCancelUnitTakesAdvanceLock:
         rows = [e for e in state.list_events("F-001-U-1") if e["event_type"] == "unit_cancelled"]
         assert len(rows) == 1
         assert rows[0]["dedupe_key"], "unit_cancelled event row must carry a dedupe_key"
+
+    def test_sequential_double_cancel_archives_once(self, tmp_state_db, monkeypatch):
+        """Idempotent re-call: a second ``cancel_unit`` (sequential,
+        same process) must short-circuit on the ``already_cancelled``
+        check inside the lock and NOT re-invoke ``_archive_unit_sessions``.
+        Together with the dedupe-key test above this covers the
+        ``cancel_unit`` contract that the deleted threading test was
+        proving — a per-unit archive call lands exactly once."""
+        _seed_coded_unit()
+        archive_calls: list[str] = []
+
+        def factory(role: str):
+            class _W:
+                def archive(self, sid: str) -> None:
+                    archive_calls.append(f"{role}:{sid}")
+
+            return _W()
+
+        monkeypatch.setattr("orchestrator.tools.execution.make_worker", factory)
+        first = execution.cancel_unit("F-001-U-1")
+        second = execution.cancel_unit("F-001-U-1")
+        assert json.loads(first)["outcome"] == "cancelled"
+        assert json.loads(second)["outcome"] == "already_cancelled"
+        assert archive_calls == ["coder:sesn-c"], (
+            f"archive must land exactly once across the two calls; got {archive_calls}"
+        )
