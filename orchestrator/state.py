@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -82,6 +83,31 @@ def _migrate_features_ultrareview(conn: sqlite3.Connection) -> None:
     except sqlite3.OperationalError as e:
         if "duplicate column name" not in str(e).lower():
             raise
+
+
+def _migrate_work_units_cancel_owner(conn: sqlite3.Connection) -> None:
+    """Add F-016 Phase 2.5 columns to ``work_units`` for pre-Phase-2.5 DBs.
+
+    ``cancelled_at`` (nullable TEXT) records when ``cancel_unit`` ran;
+    ``owner`` (TEXT, default '') is the daemon/lead claim slot used by
+    ``lead_advance_lock`` and by the Phase 3 daemon's terminal-advance
+    CAS. SQLite has no ``ADD COLUMN IF NOT EXISTS`` so we PRAGMA-probe
+    each column first and treat ``duplicate column name`` as success
+    (mirrors :func:`_migrate_features_ultrareview` race-safety).
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(work_units)").fetchall()}
+    if "cancelled_at" not in cols:
+        try:
+            conn.execute("ALTER TABLE work_units ADD COLUMN cancelled_at TEXT")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
+    if "owner" not in cols:
+        try:
+            conn.execute("ALTER TABLE work_units ADD COLUMN owner TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
 
 
 def _migrate_unit_events_dedupe_key(conn: sqlite3.Connection) -> None:
@@ -160,6 +186,8 @@ def init_db() -> None:
                 review_round         INTEGER NOT NULL DEFAULT 0,
                 last_activity        TEXT NOT NULL DEFAULT '',
                 last_error           TEXT NOT NULL DEFAULT '',
+                cancelled_at         TEXT,
+                owner                TEXT NOT NULL DEFAULT '',
                 FOREIGN KEY (feature_id) REFERENCES features(id) ON DELETE CASCADE
             );
 
@@ -211,6 +239,7 @@ def init_db() -> None:
             """
         )
         _migrate_features_ultrareview(conn)
+        _migrate_work_units_cancel_owner(conn)
         _migrate_unit_events_dedupe_key(conn)
 
 
@@ -384,6 +413,17 @@ def approve_plan(feature_id: str) -> str:
 
 
 def upsert_unit_state(unit: WorkUnitState) -> None:
+    """Insert or update the ``work_units`` row for ``unit``.
+
+    ``cancelled_at`` and ``owner`` (F-016 Phase 2.5) are intentionally NOT
+    overwritten on UPDATE — they are managed via the dedicated
+    :func:`cancel_unit` / :func:`lead_advance_lock` helpers and a stray
+    ``upsert_unit_state`` call from somewhere else in the codebase (which
+    constructs a fresh :class:`WorkUnitState` from the model defaults) must
+    not silently clear a sticky cancel or break the daemon's CAS. To
+    deliberately change either column, use the dedicated helper or run a
+    direct SQL UPDATE.
+    """
     if not unit.last_activity:
         unit.last_activity = _now()
     with _connect() as conn:
@@ -392,9 +432,10 @@ def upsert_unit_state(unit: WorkUnitState) -> None:
             INSERT INTO work_units (
                 unit_id, feature_id, status, branch, pr_number,
                 coder_session_id, tester_session_id, reviewer_session_id,
-                review_round, last_activity, last_error
+                review_round, last_activity, last_error,
+                cancelled_at, owner
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(unit_id) DO UPDATE SET
                 status=excluded.status,
                 branch=excluded.branch,
@@ -418,6 +459,8 @@ def upsert_unit_state(unit: WorkUnitState) -> None:
                 unit.review_round,
                 unit.last_activity,
                 unit.last_error,
+                unit.cancelled_at,
+                unit.owner,
             ),
         )
 
@@ -483,6 +526,231 @@ def increment_review_round(unit_id: str) -> int:
             "SELECT review_round FROM work_units WHERE unit_id = ?", (unit_id,)
         ).fetchone()
     return row["review_round"] if row else 0
+
+
+# --------------------------- F-016 Phase 2.5: lead/daemon contract ----------
+#
+# Three primitives the lead and the (Phase 3) daemon both rely on:
+#
+#   * ``lead_advance_lock(unit_id)`` — context manager held during a
+#     lead's ~1s ``send_to_unit_async`` submit window. The in-process
+#     :class:`threading.RLock` serializes concurrent leads in the same
+#     MCP server; setting ``owner='lead'`` on enter and clearing on exit
+#     makes the lock visible across processes so the Phase 3 daemon
+#     (separate process) sees it via ``has_active_advance_lock`` and
+#     skips its ``advance_state_machine`` tick for that unit.
+#
+#   * ``cancel_unit`` / ``is_cancelled`` — sticky cancel. Once
+#     ``cancelled_at`` is set, the unit's state machine stops — the
+#     daemon's per-tick check (``if unit.cancelled_at: continue``)
+#     guarantees no further transitions land.
+#
+#   * ``claim_unit_owner`` / ``release_unit_owner`` — atomic CAS on the
+#     ``owner`` column for daemon-vs-lead terminal advances (Phase 3 uses
+#     this; Phase 2.5 ships it so the daemon can adopt it without a
+#     schema bump).
+
+
+_UNIT_ADVANCE_LOCKS: dict[str, threading.RLock] = {}
+_UNIT_ADVANCE_LOCKS_MUTEX = threading.Lock()
+LEAD_OWNER = "lead"
+"""``owner`` column value while a lead holds :func:`lead_advance_lock`."""
+
+
+def _get_unit_advance_lock(unit_id: str) -> threading.RLock:
+    """Return the process-wide :class:`threading.RLock` for ``unit_id``.
+
+    Lazily allocates one lock per unit. The master mutex serializes
+    insertion so two concurrent ``send_to_unit_async`` calls on the same
+    unit get the *same* underlying lock object and one blocks on the other.
+    """
+    with _UNIT_ADVANCE_LOCKS_MUTEX:
+        lock = _UNIT_ADVANCE_LOCKS.get(unit_id)
+        if lock is None:
+            lock = threading.RLock()
+            _UNIT_ADVANCE_LOCKS[unit_id] = lock
+        return lock
+
+
+@contextmanager
+def lead_advance_lock(unit_id: str) -> Iterator[None]:
+    """Hold the lead's ~1s advance window for ``unit_id``.
+
+    Serializes concurrent leads in the same MCP server via a per-unit
+    :class:`threading.RLock`, and — when the ``owner`` column is
+    currently free — CAS-claims ``owner='lead'`` so the Phase 3 daemon
+    (separate process) sees the claim via
+    :func:`has_active_advance_lock` and skips its
+    ``advance_state_machine`` tick for the unit.
+
+    **CAS, not a blind write.** If the row's ``owner`` is already held
+    by something else (a Phase 3 daemon that grabbed the slot via
+    :func:`claim_unit_owner`), the lead does NOT overwrite it — the
+    in-process RLock still serializes concurrent leads, but the DB-side
+    claim stays with whoever owned it on entry. The exit step is
+    symmetric: ``owner`` is cleared *only if* the lead's CAS claim
+    landed on entry. This preserves the spec's CAS contract for the
+    ``owner`` column (spec § "State.db additions": ``owner`` is the CAS
+    target preventing lead/daemon double-write) instead of silently
+    revoking concurrent claims.
+
+    **Nested cleanup.** The ``release_unit_owner`` call can raise on a
+    SQLite hiccup (locked DB, disk full, transient backend blip). Nest
+    the DB cleanup inside ``lock.release()``'s ``finally`` so the
+    in-process RLock is released even when the DB write fails — a
+    raised exception during cleanup must not strand every subsequent
+    ``send_to_unit_async`` on a held RLock waiting forever.
+
+    Per-unit (not per-role) per the spec: a same-tick daemon must not
+    advance the reviewer while a coder is mid-receive. With the lock
+    held for ~1s, the cost of unit-wide serialization is negligible.
+    """
+    lock = _get_unit_advance_lock(unit_id)
+    lock.acquire()
+    try:
+        # CAS: swap ''→'lead' only when the slot is free. If a daemon
+        # holds it (owner='daemon'), the lead's in-process RLock still
+        # serializes concurrent leads, but the DB-side claim is left
+        # untouched — preserving the daemon's CAS section.
+        cas_claimed = claim_unit_owner(unit_id, LEAD_OWNER, expected_owner="")
+        try:
+            yield
+        finally:
+            if cas_claimed:
+                # Release the claim we placed. Use the CAS-helper so a
+                # daemon that interleaved an overwrite (it shouldn't
+                # under normal flow, but the helper is defensive) is
+                # left alone. The release can fail (DB locked, disk
+                # full) — the outer ``finally`` below still runs and
+                # releases the in-process RLock.
+                release_unit_owner(unit_id, expected_owner=LEAD_OWNER)
+    finally:
+        lock.release()
+
+
+def has_active_advance_lock(unit_id: str) -> bool:
+    """True iff the row's ``owner`` column equals :data:`LEAD_OWNER`.
+
+    The Phase 3 daemon calls this before deriving an action. The
+    lock-window is ~1s so a True read corresponds to a lead actively
+    submitting; the daemon should defer its tick by one cycle and
+    re-read on the next poll.
+    """
+    s = get_unit_state(unit_id)
+    return s is not None and s.owner == LEAD_OWNER
+
+
+def claim_unit_owner(unit_id: str, new_owner: str, *, expected_owner: str = "") -> bool:
+    """Atomic CAS on the ``owner`` column. Returns True iff the swap landed.
+
+    Caller-supplied ``expected_owner`` is the current value the caller
+    asserts (``""`` means "unowned"). ``new_owner`` lands only when
+    the row's actual ``owner`` matches; otherwise the call is a no-op
+    and returns False. Used by the Phase 3 daemon for terminal-advance
+    races where lead and daemon both reach the same transition; the
+    losing writer sees False and bails.
+    """
+    with _connect() as conn:
+        cur = conn.execute(
+            "UPDATE work_units SET owner = ? WHERE unit_id = ? AND owner = ?",
+            (new_owner, unit_id, expected_owner),
+        )
+        return cur.rowcount > 0
+
+
+def release_unit_owner(unit_id: str, *, expected_owner: str) -> bool:
+    """Conditionally clear the ``owner`` column. Returns True if it landed.
+
+    Symmetric to :func:`claim_unit_owner` — the caller releases only if
+    it still holds the claim. A False return means someone else
+    (presumably the recovery path) took over.
+    """
+    return claim_unit_owner(unit_id, "", expected_owner=expected_owner)
+
+
+def cancel_unit(unit_id: str) -> bool:
+    """Sticky-cancel ``unit_id``: flip status, stamp ``cancelled_at``.
+
+    Returns True if the row existed and was updated; False if no row
+    exists (caller never spawned this unit). Idempotent: a second call
+    on an already-cancelled unit is a no-op (timestamp preserved). The
+    side-effects ``cancel_unit`` MCP tool layers on top — archiving
+    worker sessions, recording the audit event — live in
+    ``orchestrator/tools/execution.py`` so this helper stays pure-state.
+
+    ``cancelled_at`` and ``last_activity`` share one captured timestamp
+    so the cancellation row is internally consistent — two ``_now()``
+    calls in one UPDATE statement can drift by microseconds on a slow
+    interpreter or under GC pressure, which would make the row's two
+    timestamps disagree about *when* the cancel happened.
+    """
+    now = _now()
+    with _connect() as conn:
+        cur = conn.execute(
+            "UPDATE work_units "
+            "SET status = 'cancelled', "
+            "    cancelled_at = COALESCE(cancelled_at, ?), "
+            "    last_activity = ?, "
+            "    owner = '' "
+            "WHERE unit_id = ?",
+            (now, now, unit_id),
+        )
+        return cur.rowcount > 0
+
+
+def is_cancelled(unit_id: str) -> bool:
+    """True iff the unit has been ``cancel_unit``'d.
+
+    Reads ``cancelled_at`` rather than ``status == 'cancelled'``
+    because ``cancelled_at`` is the *durable* source of truth: it is
+    only ever set by :func:`cancel_unit`, never cleared by
+    :func:`touch_unit`, and the SQL ``COALESCE`` clause in cancel_unit
+    preserves the original timestamp across re-calls. ``status`` is the
+    same signal in the happy path (cancel_unit sets both atomically
+    in one UPDATE), but a future code path that flips ``status`` via
+    :func:`touch_unit` without going through :func:`cancel_unit` would
+    diverge from the sticky-cancel guarantee — ``cancelled_at`` stays
+    pinned regardless.
+    """
+    s = get_unit_state(unit_id)
+    return s is not None and s.cancelled_at is not None
+
+
+def update_unit_deps(feature_id: str, unit_id: str, depends_on: list[str]) -> None:
+    """Re-shape the DAG for ``feature_id``: replace ``unit_id``'s ``depends_on``.
+
+    Plans are stored as ``units_json`` on the ``plans`` row; this helper
+    parses the JSON, mutates the matching ``WorkUnit``, and writes back.
+    Raises :class:`ValueError` if the plan is missing, the unit is not
+    in the plan, or any dep references a unit not in the plan. Cycle
+    detection lives in the calling MCP tool — the state layer just does
+    the I/O. Orthogonal to ``work_units`` runtime state: the in-flight
+    worker, if any, is untouched.
+    """
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT units_json, status FROM plans WHERE feature_id = ?",
+            (feature_id,),
+        ).fetchone()
+        if not row:
+            raise ValueError(f"no plan for {feature_id}")
+        units_data = json.loads(row["units_json"])
+        unit_ids = {u["id"] for u in units_data}
+        if unit_id not in unit_ids:
+            raise ValueError(f"unit {unit_id} not in plan for {feature_id}")
+        for dep in depends_on:
+            if dep not in unit_ids:
+                raise ValueError(
+                    f"unit {unit_id} cannot depend on unknown unit {dep} in plan {feature_id}"
+                )
+        for u in units_data:
+            if u["id"] == unit_id:
+                u["depends_on"] = list(depends_on)
+                break
+        conn.execute(
+            "UPDATE plans SET units_json = ? WHERE feature_id = ?",
+            (json.dumps(units_data), feature_id),
+        )
 
 
 # --------------------------- unit events (audit log) ---------------------------
@@ -597,6 +865,8 @@ def _state_to_dict(s: WorkUnitState) -> dict:
         "has_coder_session": bool(s.coder_session_id),
         "has_tester_session": bool(s.tester_session_id),
         "has_reviewer_session": bool(s.reviewer_session_id),
+        "cancelled_at": s.cancelled_at,
+        "owner": s.owner,
     }
 
 

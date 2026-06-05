@@ -3422,3 +3422,324 @@ class TestCycleReviewIsWrapper:
         assert "tester" in steps
         assert "copilot_review" in steps
         assert "reviewer" in steps
+
+
+# --------------------------- F-016 Phase 2.5: send_to_unit_async ---------
+
+
+class TestSendToUnitAsync:
+    """Coder-side coverage of the async submit path. Spec-acceptance
+    cases live in ``tests/test_f016_u4_tester.py``; this class pins the
+    coder-implementation contract: structured shape, error handling,
+    and audit row."""
+
+    def test_bad_role(self, tmp_state_db):
+        _setup_feature()
+        state.upsert_unit_state(
+            WorkUnitState(unit_id="F-001-U-1", feature_id="F-001", status="coding")
+        )
+        out = execution.send_to_unit_async("F-001-U-1", "hi", role="hacker")
+        assert "ERROR" in out and "role must be" in out
+
+    def test_no_state(self, tmp_state_db):
+        out = execution.send_to_unit_async("nope", "hi")
+        assert "ERROR" in out and "no state for" in out
+
+    def test_audit_row_written_on_success(self, tmp_state_db, monkeypatch):
+        _seed_coded_unit()
+
+        class AsyncWorker:
+            def __init__(self, role):
+                self.role = role
+                self.async_calls = []
+
+            def resume_async(self, sid, msg):
+                self.async_calls.append((sid, msg))
+
+        monkeypatch.setattr("orchestrator.tools.execution.make_worker", AsyncWorker)
+        out = execution.send_to_unit_async("F-001-U-1", "carry on", role="coder")
+        parsed = json.loads(out)
+        assert parsed["delivered"] is True
+        events = state.list_events("F-001-U-1")
+        manual_msgs = [e for e in events if e["event_type"] == "coder_manual_message"]
+        assert len(manual_msgs) == 1
+        assert "carry on" in manual_msgs[0]["details"]
+
+    def test_resume_async_error_returns_structured_error(self, tmp_state_db, monkeypatch):
+        _seed_coded_unit()
+
+        class BlowUp:
+            def __init__(self, role):
+                pass
+
+            def resume_async(self, *a, **k):
+                raise RuntimeError("network down")
+
+        monkeypatch.setattr("orchestrator.tools.execution.make_worker", BlowUp)
+        out = execution.send_to_unit_async("F-001-U-1", "hi", role="coder")
+        parsed = json.loads(out)
+        assert parsed["delivered"] is False
+        assert parsed["reason"] == "coder_resume_async_error"
+        assert "network down" in parsed["error"]
+        # PR #59 Copilot finding 3: the resume_async error response must
+        # carry role_diagnostics + next_steps so the shape matches every
+        # other not-actionable branch — a lead surfacing this to the
+        # user shouldn't have to special-case the network-error
+        # branch's structured payload.
+        assert "role_diagnostics" in parsed
+        assert "next_steps" in parsed
+        # The error must still release the advance lock (the
+        # ``with state.lead_advance_lock`` block guarantees this).
+        assert state.has_active_advance_lock("F-001-U-1") is False
+
+
+# --------------------------- F-016 Phase 2.5: cancel_unit ---------------
+
+
+class TestCancelUnitTool:
+    def test_no_state(self, tmp_state_db):
+        out = execution.cancel_unit("nope")
+        assert "ERROR" in out and "no state for" in out
+
+    def test_flips_status_and_records_event(self, tmp_state_db, monkeypatch):
+        _seed_coded_unit()
+
+        class Recorder:
+            def __init__(self, role):
+                self.role = role
+                self.archived = []
+
+            def archive(self, sid):
+                self.archived.append(sid)
+
+        monkeypatch.setattr("orchestrator.tools.execution.make_worker", Recorder)
+        out = execution.cancel_unit("F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "cancelled"
+        assert parsed["status"] == "cancelled"
+        events = state.list_events("F-001-U-1")
+        assert any(e["event_type"] == "unit_cancelled" for e in events)
+
+    def test_idempotent_second_call(self, tmp_state_db, monkeypatch):
+        _seed_coded_unit()
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.make_worker",
+            lambda role: type("W", (), {"archive": lambda self, sid: None})(),
+        )
+        execution.cancel_unit("F-001-U-1")
+        out2 = execution.cancel_unit("F-001-U-1")
+        parsed = json.loads(out2)
+        assert parsed["outcome"] == "already_cancelled"
+
+
+# --------------------------- F-016 Phase 2.5: cancel terminal-refuse + lock ---
+
+
+class TestCancelUnitRefusesTerminalStatuses:
+    """Reviewer PR #59 C1: ``cancel_unit`` MUST NOT silently rewrite a
+    terminal status. A merged ``done`` unit's status is the scheduler's
+    dep-satisfaction anchor; an ``approved_awaiting_merge`` row is the
+    user's ready-to-merge indicator; an ``escalated`` row holds the
+    triage error. Cancelling any of them silently breaks invariants and
+    permanently strands downstream units.
+    """
+
+    def _setup(self, status: str, monkeypatch) -> None:
+        _seed_coded_unit()
+        # The seed leaves status="in_ci"; flip to the terminal we want.
+        state.touch_unit("F-001-U-1", status=status)
+        # No archive calls expected — assert via a counter-recording worker.
+        self.archive_calls: list[tuple[str, str]] = []
+
+        def factory(role: str):
+            self_ref = self
+
+            class _W:
+                def archive(self, sid):
+                    self_ref.archive_calls.append((role, sid))
+
+            return _W()
+
+        monkeypatch.setattr("orchestrator.tools.execution.make_worker", factory)
+
+    def test_done_status_refused(self, tmp_state_db, monkeypatch):
+        self._setup("done", monkeypatch)
+        out = execution.cancel_unit("F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "refused"
+        assert parsed["status"] == "done"
+        # Row unchanged.
+        s = state.get_unit_state("F-001-U-1")
+        assert s is not None
+        assert s.status == "done"
+        assert s.cancelled_at is None
+        # No sessions archived (no API burn).
+        assert self.archive_calls == []
+
+    def test_approved_awaiting_merge_refused(self, tmp_state_db, monkeypatch):
+        self._setup("approved_awaiting_merge", monkeypatch)
+        out = execution.cancel_unit("F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "refused"
+        s = state.get_unit_state("F-001-U-1")
+        assert s is not None and s.status == "approved_awaiting_merge"
+        assert self.archive_calls == []
+
+    def test_escalated_refused(self, tmp_state_db, monkeypatch):
+        self._setup("escalated", monkeypatch)
+        # Preserve a last_error so we can prove it's untouched.
+        state.touch_unit("F-001-U-1", error="cap-3 hit on reviewer changes")
+        out = execution.cancel_unit("F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "refused"
+        s = state.get_unit_state("F-001-U-1")
+        assert s is not None
+        assert s.status == "escalated"
+        assert s.last_error == "cap-3 hit on reviewer changes"
+        assert self.archive_calls == []
+
+    def test_downstream_dep_not_blocked_by_refused_cancel(self, tmp_state_db, monkeypatch):
+        """The C1 reproducer: a ``done`` unit must remain the scheduler's
+        dep-satisfaction anchor even after a fat-fingered ``cancel_unit``."""
+        from orchestrator.tools import scheduling
+
+        state.save_feature(
+            Feature(
+                id="F-DEP",
+                title="t",
+                description="d",
+                repo_path="https://github.com/o/r",
+                status="approved",
+            )
+        )
+        state.save_plan(
+            "F-DEP",
+            [
+                WorkUnit(id="F-DEP-U-1", feature_id="F-DEP", title="u1", description=""),
+                WorkUnit(
+                    id="F-DEP-U-2",
+                    feature_id="F-DEP",
+                    title="u2",
+                    description="",
+                    depends_on=["F-DEP-U-1"],
+                ),
+            ],
+        )
+        state.approve_plan("F-DEP")
+        state.upsert_unit_state(
+            WorkUnitState(unit_id="F-DEP-U-1", feature_id="F-DEP", status="done")
+        )
+        # Before: U-2 is ready (U-1 is done).
+        ready_before = json.loads(scheduling.next_ready_units("F-DEP"))
+        assert {u["unit_id"] for u in ready_before["ready_to_spawn"]} == {"F-DEP-U-2"}
+        # Cancel U-1 (which is done).
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.make_worker",
+            lambda role: type("W", (), {"archive": lambda self, sid: None})(),
+        )
+        execution.cancel_unit("F-DEP-U-1")
+        # After: U-2 is STILL ready (the refused cancel left U-1 as done).
+        ready_after = json.loads(scheduling.next_ready_units("F-DEP"))
+        assert {u["unit_id"] for u in ready_after["ready_to_spawn"]} == {"F-DEP-U-2"}, (
+            f"refused cancel must leave the done-anchor intact; got {ready_after}"
+        )
+
+
+class TestCancelUnitTakesAdvanceLock:
+    """Reviewer PR #59 M3: ``cancel_unit`` must hold ``lead_advance_lock``
+    around the side-effecting block so a concurrent Phase 3 daemon tick
+    and concurrent cancels can't race the archive + audit-event writes.
+    """
+
+    def test_lock_is_held_during_archive_body(self, tmp_state_db, monkeypatch):
+        """While ``cancel_unit``'s archive runs, the per-unit advance-lock
+        must be held — the daemon-visible signal
+        (:func:`state.has_active_advance_lock`) must be True for the
+        entire body. This is the contract the spec § Phase 2.5 needs:
+        a daemon tick that lands mid-archive sees ``owner='lead'`` and
+        defers; a concurrent ``cancel_unit`` blocks on the RLock until
+        the first finishes (and then short-circuits at the
+        ``already_cancelled`` check).
+
+        Replaces an earlier threading-based test that proved the same
+        contract but leaked background threads on slow Windows CI when
+        ``Thread.join(5)`` timed out before the workers finished —
+        leaked threads continued issuing SQLite ops against the
+        tmp_state_db file, blocking the touch_unit calls in
+        subsequent tests (PR #59 windows-3.12 deadlock). The
+        lock-observability probe pins the same invariant without
+        spawning a thread.
+        """
+        observed: dict[str, list[bool]] = {"under_lock": []}
+
+        def factory(role: str):
+            class _W:
+                def archive(self, sid: str) -> None:  # noqa: ARG002
+                    # Probe the daemon's view from inside the lock:
+                    # has_active_advance_lock reads ``owner`` from
+                    # state.db; True means the CAS claim landed and
+                    # the daemon (separate process) would defer.
+                    observed["under_lock"].append(state.has_active_advance_lock("F-001-U-1"))
+
+            return _W()
+
+        _seed_coded_unit()
+        monkeypatch.setattr("orchestrator.tools.execution.make_worker", factory)
+
+        # Before cancel: lock is not held.
+        assert state.has_active_advance_lock("F-001-U-1") is False
+
+        out = execution.cancel_unit("F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "cancelled"
+
+        # The archive callback ran inside the with state.lead_advance_lock
+        # block, so the daemon-visible signal must have been True at the
+        # observation point. Without the lock wrapping, the probe would
+        # see False and the daemon would race the cancel's state writes.
+        assert observed["under_lock"] == [True], (
+            f"cancel_unit must hold lead_advance_lock during archive (PR #59 M3); got {observed}"
+        )
+
+        # After cancel: lock released.
+        assert state.has_active_advance_lock("F-001-U-1") is False
+
+    def test_unit_cancelled_event_is_dedupe_keyed(self, tmp_state_db, monkeypatch):
+        """The ``unit_cancelled`` audit row must carry a dedupe_key so
+        a cross-process MCP retry that bypasses the in-process lock
+        still produces one row."""
+        _seed_coded_unit()
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.make_worker",
+            lambda role: type("W", (), {"archive": lambda self, sid: None})(),
+        )
+        execution.cancel_unit("F-001-U-1")
+        rows = [e for e in state.list_events("F-001-U-1") if e["event_type"] == "unit_cancelled"]
+        assert len(rows) == 1
+        assert rows[0]["dedupe_key"], "unit_cancelled event row must carry a dedupe_key"
+
+    def test_sequential_double_cancel_archives_once(self, tmp_state_db, monkeypatch):
+        """Idempotent re-call: a second ``cancel_unit`` (sequential,
+        same process) must short-circuit on the ``already_cancelled``
+        check inside the lock and NOT re-invoke ``_archive_unit_sessions``.
+        Together with the dedupe-key test above this covers the
+        ``cancel_unit`` contract that the deleted threading test was
+        proving — a per-unit archive call lands exactly once."""
+        _seed_coded_unit()
+        archive_calls: list[str] = []
+
+        def factory(role: str):
+            class _W:
+                def archive(self, sid: str) -> None:
+                    archive_calls.append(f"{role}:{sid}")
+
+            return _W()
+
+        monkeypatch.setattr("orchestrator.tools.execution.make_worker", factory)
+        first = execution.cancel_unit("F-001-U-1")
+        second = execution.cancel_unit("F-001-U-1")
+        assert json.loads(first)["outcome"] == "cancelled"
+        assert json.loads(second)["outcome"] == "already_cancelled"
+        assert archive_calls == ["coder:sesn-c"], (
+            f"archive must land exactly once across the two calls; got {archive_calls}"
+        )

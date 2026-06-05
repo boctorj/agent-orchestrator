@@ -212,3 +212,120 @@ def approve_plan(feature_id: str) -> str:
     except ValueError as e:
         return f"ERROR: {e}"
     return f"Plan for {feature_id} APPROVED at {ts}."
+
+
+# --------------------------- F-016 Phase 2.5: graph mutation ----------------
+
+
+def _has_cycle(units: list[WorkUnit]) -> str | None:
+    """Iterative DFS cycle detector. Returns a participating unit_id or None.
+
+    Sized for ~2-8 work units per feature; no need for Tarjan's. Returns
+    the first unit found on a back-edge so the caller can surface a
+    pointer into the offending cycle rather than a vague "cycle exists".
+    """
+    graph: dict[str, list[str]] = {u.id: list(u.depends_on) for u in units}
+    UNVISITED, VISITING, VISITED = 0, 1, 2
+    state_by_node: dict[str, int] = dict.fromkeys(graph, UNVISITED)
+
+    for root in graph:
+        if state_by_node[root] != UNVISITED:
+            continue
+        stack: list[tuple[str, int]] = [(root, 0)]
+        while stack:
+            node, child_idx = stack[-1]
+            if child_idx == 0:
+                state_by_node[node] = VISITING
+            children = graph.get(node, [])
+            if child_idx < len(children):
+                stack[-1] = (node, child_idx + 1)
+                child = children[child_idx]
+                child_state = state_by_node.get(child, UNVISITED)
+                if child_state == VISITING:
+                    return child  # back-edge — child is on the current DFS path
+                if child_state == UNVISITED:
+                    stack.append((child, 0))
+            else:
+                state_by_node[node] = VISITED
+                stack.pop()
+    return None
+
+
+@mcp.tool()
+def update_unit_deps(feature_id: str, unit_id: str, depends_on: list[str]) -> str:
+    """Re-shape the DAG: replace ``unit_id``'s ``depends_on`` list.
+
+    F-016 Phase 2.5 graph-mutation primitive. Use when the user says
+    "U-3 also depends on U-2 now" — re-orders future scheduling without
+    touching any in-flight worker session. Orthogonal to runtime state:
+    a unit currently in ``coding`` keeps coding regardless of the new
+    edge.
+
+    Validates:
+      * the plan exists,
+      * every dep references a unit in the same plan,
+      * the resulting graph is still acyclic.
+
+    Self-deps are rejected as a degenerate cycle.
+
+    On success, returns the rewritten unit's row. On any validation
+    failure, returns an ``ERROR:`` string and the plan is unchanged.
+
+    Note: ``update_unit_deps`` deliberately does NOT call
+    :func:`approve_plan` again. The plan stays at its current approval
+    state — a graph mutation is a "the scheduler should consider these
+    edges next time it picks ready units", not a material rewrite that
+    needs human re-sign-off. If the user wants the units list rewritten
+    (add/remove units, retitle), they go through ``save_plan`` +
+    ``approve_plan`` as usual.
+    """
+    if unit_id in depends_on:
+        return f"ERROR: unit {unit_id} cannot depend on itself"
+
+    plan = state.get_plan(feature_id)
+    if plan is None:
+        return f"ERROR: no plan for {feature_id}"
+
+    unit_ids = {u.id for u in plan.units}
+    if unit_id not in unit_ids:
+        return f"ERROR: unit {unit_id} not in plan for {feature_id}"
+    for dep in depends_on:
+        if dep not in unit_ids:
+            return f"ERROR: unit {unit_id} cannot depend on unknown unit {dep}"
+
+    # Apply the change against a copy and cycle-check before persisting —
+    # rolling back via state.update_unit_deps would require a second
+    # write. Cheaper to validate in-memory first.
+    candidate_units = [
+        WorkUnit(
+            id=u.id,
+            feature_id=u.feature_id,
+            title=u.title,
+            description=u.description,
+            depends_on=(list(depends_on) if u.id == unit_id else list(u.depends_on)),
+        )
+        for u in plan.units
+    ]
+    if (cycle_node := _has_cycle(candidate_units)) is not None:
+        return (
+            f"ERROR: updating {unit_id}.depends_on to {depends_on} would create a cycle "
+            f"through {cycle_node}"
+        )
+
+    try:
+        state.update_unit_deps(feature_id, unit_id, depends_on)
+    except ValueError as e:
+        # state-layer validation (plan-row went missing between checks,
+        # or a dep referenced an id only present in the in-memory copy
+        # not the JSON row). Surface as ERROR rather than raising.
+        return f"ERROR: {e}"
+
+    return json.dumps(
+        {
+            "feature_id": feature_id,
+            "unit_id": unit_id,
+            "depends_on": list(depends_on),
+            "outcome": "updated",
+        },
+        indent=2,
+    )
