@@ -63,14 +63,14 @@ When both units merge:
   `### Decisions worth knowing`). If absent, the section is emitted
   with the three sub-headings empty plus a `_TBD — coder did not fill
   in TL;DR; full body below._` placeholder under each.
-- Update [`orchestrator/prompts/coder.md`](orchestrator/prompts/coder.md)
+- Update [`orchestrator/prompts/coder.md`](../../orchestrator/prompts/coder.md)
   to instruct coders to fill in the three sub-sections in their PR
   body (additive to the existing "Spec satisfaction" + "Decisions /
   deviations" template).
 
 **Extractor side (U-1):**
 - New function `cycle_log_summary(unit_id) -> str` in
-  [`orchestrator/cycle_log.py`](orchestrator/cycle_log.py).
+  [`orchestrator/cycle_log.py`](../../orchestrator/cycle_log.py).
 - Implementation: read the full file, find the `## TL;DR` heading,
   return everything from that heading down to (but not including)
   the next `## ` heading. Strip the wrapping heading itself.
