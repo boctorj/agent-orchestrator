@@ -50,6 +50,7 @@ from typing import Any, Protocol, runtime_checkable
 from orchestrator.ci_wait import FAILURE_CONCLUSIONS, PASSING_CONCLUSIONS
 from orchestrator.models import (
     ACTIVE_UNIT_STATUSES,
+    CANCELLED_UNIT_STATUSES,
     TERMINAL_UNIT_STATUSES,
     WorkUnitState,
 )
@@ -821,13 +822,18 @@ def _ci_drift_event(local_state: WorkUnitState, report: HealthReport) -> Action 
     Quiet when status is one of the active-fix statuses (coding /
     fixing / testing) — a red run on those is the *reason* the agent is
     running, not drift. Quiet on terminal statuses too (done /
-    escalated already capture the resolution).
+    escalated already capture the resolution) and on the F-016 Phase 2.5
+    sticky-cancel terminal (cancelled): the user explicitly halted the
+    unit, so a cancelled-mid-CI red is the user's choice — not drift
+    the orchestrator should re-surface.
     """
     if not _ci_has_failure(report.ci):
         return None
     if local_state.status in _STATUSES_WHERE_RED_CI_IS_EXPECTED:
         return None
     if local_state.status in TERMINAL_UNIT_STATUSES:
+        return None
+    if local_state.status in CANCELLED_UNIT_STATUSES:
         return None
     failing = report.ci.failing
     return Action.event(

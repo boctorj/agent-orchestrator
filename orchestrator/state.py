@@ -572,33 +572,34 @@ def _get_unit_advance_lock(unit_id: str) -> threading.RLock:
         return lock
 
 
-def _set_owner_best_effort(unit_id: str, owner: str) -> None:
-    """Write ``owner`` for ``unit_id`` without failing if the row is gone.
-
-    The Phase 2.5 lock window is so short that the unit row should always
-    exist when this runs; the best-effort write is defensive against
-    test fixtures that delete rows mid-flow and against the daemon
-    racing to drop a row we just unlocked.
-    """
-    with _connect() as conn:
-        conn.execute(
-            "UPDATE work_units SET owner = ? WHERE unit_id = ?",
-            (owner, unit_id),
-        )
-
-
 @contextmanager
 def lead_advance_lock(unit_id: str) -> Iterator[None]:
     """Hold the lead's ~1s advance window for ``unit_id``.
 
-    Serializes concurrent leads (same MCP server) on a per-unit
-    :class:`threading.RLock` and stamps ``owner='lead'`` on the row so
-    the Phase 3 daemon (separate process) sees the claim via
+    Serializes concurrent leads in the same MCP server via a per-unit
+    :class:`threading.RLock`, and — when the ``owner`` column is
+    currently free — CAS-claims ``owner='lead'`` so the Phase 3 daemon
+    (separate process) sees the claim via
     :func:`has_active_advance_lock` and skips its
-    ``advance_state_machine`` tick for the unit. On exit, ``owner`` is
-    reset to ``''`` whether the body raised or returned normally — the
-    daemon must never observe a stuck ``lead`` claim because a send
-    raised.
+    ``advance_state_machine`` tick for the unit.
+
+    **CAS, not a blind write.** If the row's ``owner`` is already held
+    by something else (a Phase 3 daemon that grabbed the slot via
+    :func:`claim_unit_owner`), the lead does NOT overwrite it — the
+    in-process RLock still serializes concurrent leads, but the DB-side
+    claim stays with whoever owned it on entry. The exit step is
+    symmetric: ``owner`` is cleared *only if* the lead's CAS claim
+    landed on entry. This preserves the spec's CAS contract for the
+    ``owner`` column (spec § "State.db additions": ``owner`` is the CAS
+    target preventing lead/daemon double-write) instead of silently
+    revoking concurrent claims.
+
+    **Nested cleanup.** The ``release_unit_owner`` call can raise on a
+    SQLite hiccup (locked DB, disk full, transient backend blip). Nest
+    the DB cleanup inside ``lock.release()``'s ``finally`` so the
+    in-process RLock is released even when the DB write fails — a
+    raised exception during cleanup must not strand every subsequent
+    ``send_to_unit_async`` on a held RLock waiting forever.
 
     Per-unit (not per-role) per the spec: a same-tick daemon must not
     advance the reviewer while a coder is mid-receive. With the lock
@@ -607,10 +608,23 @@ def lead_advance_lock(unit_id: str) -> Iterator[None]:
     lock = _get_unit_advance_lock(unit_id)
     lock.acquire()
     try:
-        _set_owner_best_effort(unit_id, LEAD_OWNER)
-        yield
+        # CAS: swap ''→'lead' only when the slot is free. If a daemon
+        # holds it (owner='daemon'), the lead's in-process RLock still
+        # serializes concurrent leads, but the DB-side claim is left
+        # untouched — preserving the daemon's CAS section.
+        cas_claimed = claim_unit_owner(unit_id, LEAD_OWNER, expected_owner="")
+        try:
+            yield
+        finally:
+            if cas_claimed:
+                # Release the claim we placed. Use the CAS-helper so a
+                # daemon that interleaved an overwrite (it shouldn't
+                # under normal flow, but the helper is defensive) is
+                # left alone. The release can fail (DB locked, disk
+                # full) — the outer ``finally`` below still runs and
+                # releases the in-process RLock.
+                release_unit_owner(unit_id, expected_owner=LEAD_OWNER)
     finally:
-        _set_owner_best_effort(unit_id, "")
         lock.release()
 
 
@@ -678,7 +692,19 @@ def cancel_unit(unit_id: str) -> bool:
 
 
 def is_cancelled(unit_id: str) -> bool:
-    """True iff the unit has been ``cancel_unit``'d."""
+    """True iff the unit has been ``cancel_unit``'d.
+
+    Reads ``cancelled_at`` rather than ``status == 'cancelled'``
+    because ``cancelled_at`` is the *durable* source of truth: it is
+    only ever set by :func:`cancel_unit`, never cleared by
+    :func:`touch_unit`, and the SQL ``COALESCE`` clause in cancel_unit
+    preserves the original timestamp across re-calls. ``status`` is the
+    same signal in the happy path (cancel_unit sets both atomically
+    in one UPDATE), but a future code path that flips ``status`` via
+    :func:`touch_unit` without going through :func:`cancel_unit` would
+    diverge from the sticky-cancel guarantee — ``cancelled_at`` stays
+    pinned regardless.
+    """
     s = get_unit_state(unit_id)
     return s is not None and s.cancelled_at is not None
 

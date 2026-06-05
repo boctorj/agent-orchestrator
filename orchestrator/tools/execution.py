@@ -17,7 +17,15 @@ from orchestrator import ci_wait, cycle_log, feature_spec, github, ntfy, state, 
 from orchestrator import markers as markers_module
 from orchestrator.agents import ManagedAgentWorker
 from orchestrator.blocked_reasons import parse_blocked_marker
-from orchestrator.models import ACTIVE_UNIT_STATUSES, Feature, WorkUnit, WorkUnitState
+from orchestrator.models import (
+    ACTIVE_UNIT_STATUSES,
+    CANCELLED_UNIT_STATUSES,
+    READY_TO_MERGE_STATUSES,
+    TERMINAL_UNIT_STATUSES,
+    Feature,
+    WorkUnit,
+    WorkUnitState,
+)
 from orchestrator.tools import (
     CAP_3,
     PR_URL_RE,
@@ -2954,6 +2962,7 @@ def send_to_unit(unit_id: str, role: str, message: str) -> str:
 # error rather than picking a wrong role.
 _DEFAULT_ROLE_BY_STATUS: dict[str, str | None] = {
     "coding": "coder",
+    "opening_pr": "coder",
     "in_ci": "coder",
     "fixing": "coder",
     "testing": "tester",
@@ -2969,17 +2978,28 @@ def _role_session_status(unit_state: WorkUnitState, role: str) -> dict[str, Any]
     """Per-role actionability digest for :func:`send_to_unit_async`.
 
     Returns ``{"status": str, "actionable": bool}`` per the spec's
-    "Not-actionable delivery responses" section. ``actionable`` is True
-    only when ``session_id`` is non-empty and the worker session is in a
-    state that can receive a follow-up message (Phase 2.5 ships a
-    coarse signal — non-empty session_id — and leaves the
-    ``terminated``/``archived`` distinction to the F-014 unit-health
-    surface a caller can consult separately).
+    "Not-actionable delivery responses" section. Phase 2.5 ships a
+    *coarse* signal — non-empty ``session_id`` resolves to
+    ``actionable: True`` regardless of whether the worker session is
+    actually idle, terminated, or archived. The F-016-U-5 daemon will
+    refine this via the F-014 unit-health probe; this deferral is
+    documented in the PR description's ``## Spec satisfaction →
+    Deviations`` so a caller relying on the spec's four-case shape
+    knows the gap.
+
+    The return shape stays narrow on purpose: ``{status, actionable}``
+    only — no ``session_id`` field, because the diagnostics payload is
+    surfaced to the lead and leaking the worker session identifier
+    through an error-response surface is more than the docstring
+    contract promises.
     """
     sid = _resolve_session_id(unit_state, role)
     if not sid:
         return {"status": "no_session", "actionable": False}
-    return {"status": "idle", "actionable": True, "session_id": sid}
+    # Phase 2.5 deferral: terminated / archived collapse to "idle" with
+    # actionable=True. The spec's four-case shape requires probing the
+    # backend's session-status surface; that lands in F-016-U-5.
+    return {"status": "idle", "actionable": True}
 
 
 def _role_diagnostics_payload(unit_state: WorkUnitState) -> dict[str, dict[str, Any]]:
@@ -3160,6 +3180,18 @@ def send_to_unit_async(unit_id: str, message: str, role: str = "") -> str:
     )
 
 
+# Statuses ``cancel_unit`` refuses to mutate. A merged (``done``) /
+# endorsed (``approved_awaiting_merge``) / escalated unit has a
+# meaningful terminal record the user does NOT want silently rewritten
+# to ``cancelled`` — flipping ``done → cancelled`` erases the merge
+# evidence the scheduler reads to satisfy downstream deps, flipping
+# ``approved_awaiting_merge → cancelled`` removes the pending-merge
+# indicator the user is waiting on, and flipping ``escalated``
+# overwrites the ``last_error`` triage anchor. The ``CANCELLED_UNIT_STATUSES``
+# member is the idempotent re-call path handled separately below.
+_CANCEL_REFUSED_STATUSES: frozenset[str] = TERMINAL_UNIT_STATUSES | READY_TO_MERGE_STATUSES
+
+
 def _archive_unit_sessions(unit_state: WorkUnitState) -> dict[str, str]:
     """Best-effort archive every worker session associated with the unit.
 
@@ -3194,8 +3226,26 @@ def cancel_unit(unit_id: str) -> str:
     driving the unit. Every role's worker session is best-effort
     archived (a backend error does not block the cancel).
 
+    **Refuses terminal statuses** (PR #59 C1). A merged (``done``) /
+    endorsed (``approved_awaiting_merge``) / escalated unit is not
+    cancellable — ``cancel_unit`` is for halting *in-flight* work, and
+    silently rewriting a terminal status would erase the merge record
+    that downstream dep evaluation depends on, drop the
+    pending-merge indicator the user is waiting on, or overwrite the
+    ``last_error`` triage anchor on an escalation. Returns
+    ``outcome: refused`` without touching the unit or archiving
+    sessions; the caller surfaces this to the user.
+
     Idempotent: re-calling on an already-cancelled unit returns
     ``outcome: already_cancelled`` without re-archiving sessions.
+
+    **Serialized via** :func:`state.lead_advance_lock` (PR #59 M3).
+    The lock window covers the archive + status flip + audit row so
+    two concurrent ``cancel_unit`` calls double-archive only their
+    in-process serialization paths, and a Phase 3 daemon tick during
+    the window sees ``owner='lead'`` and defers. The audit event row
+    is dedupe-keyed per unit so an MCP retry that bypasses the lock
+    (different process) still writes one ``unit_cancelled`` row.
 
     Downstream dep-evaluation treats a ``cancelled`` unit as not-done —
     units depending on it stay blocked until the lead reshapes the
@@ -3207,11 +3257,30 @@ def cancel_unit(unit_id: str) -> str:
     if err := ensure_verified_for_unit(unit_id):
         return err
 
+    # First-pass read for the early-refusal short-circuits. We re-read
+    # inside the lock below to close the TOCTOU on the status check —
+    # but the read outside is cheap and lets us skip locking entirely
+    # when the unit is already terminal / cancelled.
     unit_state = state.get_unit_state(unit_id)
     if not unit_state:
         return f"ERROR: no state for unit {unit_id}"
 
-    if unit_state.status == "cancelled":
+    if unit_state.status in _CANCEL_REFUSED_STATUSES:
+        return json.dumps(
+            {
+                "unit_id": unit_id,
+                "outcome": "refused",
+                "status": unit_state.status,
+                "reason": (
+                    f"unit is {unit_state.status!r}; cancel_unit refuses terminal "
+                    "statuses (merge record / endorsement / escalation must not "
+                    "be silently rewritten)"
+                ),
+            },
+            indent=2,
+        )
+
+    if unit_state.status in CANCELLED_UNIT_STATUSES:
         return json.dumps(
             {
                 "unit_id": unit_id,
@@ -3221,22 +3290,56 @@ def cancel_unit(unit_id: str) -> str:
             indent=2,
         )
 
-    archive_outcomes = _archive_unit_sessions(unit_state)
+    # Serialize against concurrent cancels + send_to_unit_async + the
+    # future Phase 3 daemon tick. Re-read the row inside the lock so
+    # the terminal-refuse + already-cancelled checks see whatever
+    # landed while we were waiting on the lock.
+    with state.lead_advance_lock(unit_id):
+        unit_state = state.get_unit_state(unit_id)
+        if not unit_state:
+            return f"ERROR: no state for unit {unit_id} (row vanished under lock)"
+        if unit_state.status in _CANCEL_REFUSED_STATUSES:
+            return json.dumps(
+                {
+                    "unit_id": unit_id,
+                    "outcome": "refused",
+                    "status": unit_state.status,
+                    "reason": (
+                        f"unit is {unit_state.status!r}; cancel_unit refuses terminal statuses"
+                    ),
+                },
+                indent=2,
+            )
+        if unit_state.status in CANCELLED_UNIT_STATUSES:
+            return json.dumps(
+                {
+                    "unit_id": unit_id,
+                    "outcome": "already_cancelled",
+                    "cancelled_at": unit_state.cancelled_at,
+                },
+                indent=2,
+            )
 
-    if not state.cancel_unit(unit_id):
-        # Row vanished between the get and the cancel — surface as an
-        # error rather than claiming a successful cancel.
-        return f"ERROR: cancel_unit failed for {unit_id} (row missing)"
+        archive_outcomes = _archive_unit_sessions(unit_state)
 
-    state.record_event(
-        unit_id,
-        unit_state.feature_id,
-        "unit_cancelled",
-        source="human",
-        cycle_number=unit_state.review_round,
-        summary="Unit cancelled via cancel_unit",
-        details=json.dumps({"archive_outcomes": archive_outcomes}),
-    )
+        if not state.cancel_unit(unit_id):
+            return f"ERROR: cancel_unit failed for {unit_id} (row missing)"
+
+        state.record_event(
+            unit_id,
+            unit_state.feature_id,
+            "unit_cancelled",
+            source="human",
+            cycle_number=unit_state.review_round,
+            summary="Unit cancelled via cancel_unit",
+            details=json.dumps({"archive_outcomes": archive_outcomes}),
+            # Dedupe per unit — a same-process retry that re-enters
+            # under the same lock would already short-circuit on
+            # ``status == cancelled``; this key catches the
+            # cross-process race (two MCP servers, MCP retry storm)
+            # where the lock can't serialize.
+            dedupe_key=f"{unit_id}|unit_cancelled",
+        )
 
     refreshed = state.get_unit_state(unit_id)
     return json.dumps(

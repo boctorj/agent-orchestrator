@@ -3523,3 +3523,179 @@ class TestCancelUnitTool:
         out2 = execution.cancel_unit("F-001-U-1")
         parsed = json.loads(out2)
         assert parsed["outcome"] == "already_cancelled"
+
+
+# --------------------------- F-016 Phase 2.5: cancel terminal-refuse + lock ---
+
+
+class TestCancelUnitRefusesTerminalStatuses:
+    """Reviewer PR #59 C1: ``cancel_unit`` MUST NOT silently rewrite a
+    terminal status. A merged ``done`` unit's status is the scheduler's
+    dep-satisfaction anchor; an ``approved_awaiting_merge`` row is the
+    user's ready-to-merge indicator; an ``escalated`` row holds the
+    triage error. Cancelling any of them silently breaks invariants and
+    permanently strands downstream units.
+    """
+
+    def _setup(self, status: str, monkeypatch) -> None:
+        _seed_coded_unit()
+        # The seed leaves status="in_ci"; flip to the terminal we want.
+        state.touch_unit("F-001-U-1", status=status)
+        # No archive calls expected — assert via a counter-recording worker.
+        self.archive_calls: list[tuple[str, str]] = []
+
+        def factory(role: str):
+            self_ref = self
+
+            class _W:
+                def archive(self, sid):
+                    self_ref.archive_calls.append((role, sid))
+
+            return _W()
+
+        monkeypatch.setattr("orchestrator.tools.execution.make_worker", factory)
+
+    def test_done_status_refused(self, tmp_state_db, monkeypatch):
+        self._setup("done", monkeypatch)
+        out = execution.cancel_unit("F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "refused"
+        assert parsed["status"] == "done"
+        # Row unchanged.
+        s = state.get_unit_state("F-001-U-1")
+        assert s is not None
+        assert s.status == "done"
+        assert s.cancelled_at is None
+        # No sessions archived (no API burn).
+        assert self.archive_calls == []
+
+    def test_approved_awaiting_merge_refused(self, tmp_state_db, monkeypatch):
+        self._setup("approved_awaiting_merge", monkeypatch)
+        out = execution.cancel_unit("F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "refused"
+        s = state.get_unit_state("F-001-U-1")
+        assert s is not None and s.status == "approved_awaiting_merge"
+        assert self.archive_calls == []
+
+    def test_escalated_refused(self, tmp_state_db, monkeypatch):
+        self._setup("escalated", monkeypatch)
+        # Preserve a last_error so we can prove it's untouched.
+        state.touch_unit("F-001-U-1", error="cap-3 hit on reviewer changes")
+        out = execution.cancel_unit("F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "refused"
+        s = state.get_unit_state("F-001-U-1")
+        assert s is not None
+        assert s.status == "escalated"
+        assert s.last_error == "cap-3 hit on reviewer changes"
+        assert self.archive_calls == []
+
+    def test_downstream_dep_not_blocked_by_refused_cancel(self, tmp_state_db, monkeypatch):
+        """The C1 reproducer: a ``done`` unit must remain the scheduler's
+        dep-satisfaction anchor even after a fat-fingered ``cancel_unit``."""
+        from orchestrator.tools import scheduling
+
+        state.save_feature(
+            Feature(
+                id="F-DEP",
+                title="t",
+                description="d",
+                repo_path="https://github.com/o/r",
+                status="approved",
+            )
+        )
+        state.save_plan(
+            "F-DEP",
+            [
+                WorkUnit(id="F-DEP-U-1", feature_id="F-DEP", title="u1", description=""),
+                WorkUnit(
+                    id="F-DEP-U-2",
+                    feature_id="F-DEP",
+                    title="u2",
+                    description="",
+                    depends_on=["F-DEP-U-1"],
+                ),
+            ],
+        )
+        state.approve_plan("F-DEP")
+        state.upsert_unit_state(
+            WorkUnitState(unit_id="F-DEP-U-1", feature_id="F-DEP", status="done")
+        )
+        # Before: U-2 is ready (U-1 is done).
+        ready_before = json.loads(scheduling.next_ready_units("F-DEP"))
+        assert {u["unit_id"] for u in ready_before["ready_to_spawn"]} == {"F-DEP-U-2"}
+        # Cancel U-1 (which is done).
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.make_worker",
+            lambda role: type("W", (), {"archive": lambda self, sid: None})(),
+        )
+        execution.cancel_unit("F-DEP-U-1")
+        # After: U-2 is STILL ready (the refused cancel left U-1 as done).
+        ready_after = json.loads(scheduling.next_ready_units("F-DEP"))
+        assert {u["unit_id"] for u in ready_after["ready_to_spawn"]} == {"F-DEP-U-2"}, (
+            f"refused cancel must leave the done-anchor intact; got {ready_after}"
+        )
+
+
+class TestCancelUnitTakesAdvanceLock:
+    """Reviewer PR #59 M3: ``cancel_unit`` must hold ``lead_advance_lock``
+    around the side-effecting block so a concurrent Phase 3 daemon tick
+    and concurrent cancels can't race the archive + audit-event writes.
+    """
+
+    def test_concurrent_cancel_archives_once(self, tmp_state_db, monkeypatch):
+        """Two threads racing ``cancel_unit`` on the same unit must
+        archive each session exactly once (the lock serializes; the
+        second pass falls through the ``already_cancelled`` short-circuit).
+        """
+        import threading
+
+        _seed_coded_unit()
+        archive_calls: list[str] = []
+        lock_obs: list[str] = []
+
+        def factory(role: str):
+            class _W:
+                def archive(self, sid):
+                    archive_calls.append(f"{role}:{sid}")
+
+            return _W()
+
+        monkeypatch.setattr("orchestrator.tools.execution.make_worker", factory)
+
+        barrier = threading.Barrier(2)
+
+        def go():
+            barrier.wait()
+            out = execution.cancel_unit("F-001-U-1")
+            lock_obs.append(out)
+
+        t1 = threading.Thread(target=go)
+        t2 = threading.Thread(target=go)
+        t1.start()
+        t2.start()
+        t1.join(5)
+        t2.join(5)
+        # Exactly one archive call per role (the unit only has a coder
+        # session in _seed_coded_unit).
+        assert archive_calls.count("coder:sesn-c") == 1, (
+            f"expected exactly one coder archive call; got {archive_calls}"
+        )
+        # Exactly one unit_cancelled row.
+        rows = [e for e in state.list_events("F-001-U-1") if e["event_type"] == "unit_cancelled"]
+        assert len(rows) == 1, f"expected one unit_cancelled row; got {len(rows)}"
+
+    def test_unit_cancelled_event_is_dedupe_keyed(self, tmp_state_db, monkeypatch):
+        """The ``unit_cancelled`` audit row must carry a dedupe_key so
+        a cross-process MCP retry that bypasses the in-process lock
+        still produces one row."""
+        _seed_coded_unit()
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.make_worker",
+            lambda role: type("W", (), {"archive": lambda self, sid: None})(),
+        )
+        execution.cancel_unit("F-001-U-1")
+        rows = [e for e in state.list_events("F-001-U-1") if e["event_type"] == "unit_cancelled"]
+        assert len(rows) == 1
+        assert rows[0]["dedupe_key"], "unit_cancelled event row must carry a dedupe_key"

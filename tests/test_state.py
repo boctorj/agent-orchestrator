@@ -832,6 +832,54 @@ class TestLeadAdvanceLock:
         s = state.get_unit_state("U1")
         assert s is not None and s.owner == ""
 
+    def test_lock_uses_cas_does_not_clobber_daemon_claim(self, tmp_state_db):
+        """Reviewer PR #59 M2: ``lead_advance_lock`` MUST use the
+        ``claim_unit_owner`` CAS path so a daemon's prior
+        ``owner='daemon'`` claim is preserved across the lead's lock
+        window — not silently overwritten by a blind UPDATE. The
+        in-process RLock still serializes concurrent leads, but the
+        DB-side ``owner`` column remains the daemon's CAS slot."""
+        _seed_phase25_unit()
+        assert state.claim_unit_owner("U1", "daemon") is True
+        with state.lead_advance_lock("U1"):
+            s = state.get_unit_state("U1")
+            assert s is not None
+            # The lead's CAS swap should have FAILED (owner already
+            # held by the daemon), so the column still says 'daemon'.
+            assert s.owner == "daemon", f"lead must not overwrite daemon's owner; got {s.owner!r}"
+        # After the lead exits, the daemon's claim is still there.
+        s = state.get_unit_state("U1")
+        assert s is not None and s.owner == "daemon"
+
+    def test_lock_releases_rlock_even_if_db_write_fails(self, tmp_state_db, monkeypatch):
+        """Reviewer PR #59 M1: the per-unit ``threading.RLock`` MUST
+        be released even when the CAS cleanup raises (SQLite hiccup,
+        disk full, etc.). Otherwise the lock leaks and every
+        subsequent ``send_to_unit_async`` on the unit blocks forever."""
+        _seed_phase25_unit()
+        # Patch ``release_unit_owner`` to raise on the cleanup path —
+        # mimicking a transient SQLite OperationalError.
+        original_release = state.release_unit_owner
+
+        def boom(unit_id, *, expected_owner):
+            raise sqlite3.OperationalError("simulated db hiccup on release")
+
+        monkeypatch.setattr(state, "release_unit_owner", boom)
+        with pytest.raises(sqlite3.OperationalError), state.lead_advance_lock("U1"):
+            pass
+        # Restore so we can re-acquire — the test passes if this
+        # second acquire does NOT block.
+        monkeypatch.setattr(state, "release_unit_owner", original_release)
+        # Direct acquire of the underlying RLock with a short timeout
+        # would fail if the previous lock leaked.
+        lock = state._get_unit_advance_lock("U1")
+        acquired = lock.acquire(timeout=1.0)
+        try:
+            assert acquired is True, "RLock leaked — lead_advance_lock did not release on raise"
+        finally:
+            if acquired:
+                lock.release()
+
 
 class TestUnitOwnerCAS:
     def test_claim_owner_succeeds_when_unowned(self, tmp_state_db):

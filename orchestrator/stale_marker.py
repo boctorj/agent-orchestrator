@@ -108,26 +108,39 @@ def _latest_event_of_types(
 def detect_stale_reviewer_marker(unit_id: str) -> dict:
     """Classify the unit's most-recent reviewer marker against later coder pushes.
 
-    Composes two signals:
+    **Timestamp-ordering signal only in Phase 2.5.** The function
+    inspects ``unit_events`` for any ``CODER_PUSH_EVENT_TYPES`` row
+    whose ``ts`` is strictly later than the latest reviewer marker's
+    ``ts``. A later coder push implies the PR head moved since the
+    reviewer reviewed, so the marker is stale.
 
-      * **SHA comparison** (preferred): when the reviewer marker carried
-        the head_sha it saw, and the unit's current PR head_sha is
-        known, compare via :func:`classify_marker_freshness`.
-      * **Timestamp ordering** (fallback): when the SHAs aren't recorded,
-        the helper inspects ``unit_events`` for any
-        ``CODER_PUSH_EVENT_TYPES`` row whose ``ts`` is later than the
-        reviewer marker's ``ts``. A later coder push implies the PR
-        head moved, so the marker is stale.
+    The pure :func:`classify_marker_freshness` helper (which compares
+    actual head_sha values) is shipped uncomposed in Phase 2.5 because
+    no caller persists the head_sha on reviewer-marker events yet —
+    that capture lands in F-016-U-5 alongside the daemon's reconcile
+    loop. Once SHAs are recorded on each ``reviewer_recommend_merge``
+    / ``reviewer_comment`` row, the daemon will compose the SHA path
+    here and fall back to the timestamp signal only when a SHA is
+    missing.
 
     Returns a dict shape::
 
         {
             "case": "valid" | "stale" | "not_emitted",
             "reviewer_marker_event_type": str | None,
-            "reviewer_marker_ts": str | None,
-            "later_coder_push_ts": str | None,
+            "reviewer_marker_id":         int  | None,  # unit_events PK
+            "reviewer_marker_ts":         str  | None,
+            "later_coder_push_id":        int  | None,  # unit_events PK
+            "later_coder_push_ts":        str  | None,
             "later_coder_push_event_type": str | None,
         }
+
+    The ``*_id`` fields are the ``unit_events.id`` PRIMARY KEY values
+    so a caller (Phase 3 daemon) can pass them through to
+    :func:`record_stale_marker_pending_delta` and get a dedupe key that
+    is unique per *staleness window* — not unique per *event-type pair
+    on a unit's lifetime*. See the dedupe-key docstring on that helper
+    for the multi-round-staleness regression that motivates this.
 
     Phase 2.5 ships this as the daemon's discoverability surface; the
     Phase 3 daemon's reconcile loop calls this once per poll on units in
@@ -139,7 +152,9 @@ def detect_stale_reviewer_marker(unit_id: str) -> dict:
         return {
             "case": "not_emitted",
             "reviewer_marker_event_type": None,
+            "reviewer_marker_id": None,
             "reviewer_marker_ts": None,
+            "later_coder_push_id": None,
             "later_coder_push_ts": None,
             "later_coder_push_event_type": None,
         }
@@ -156,7 +171,9 @@ def detect_stale_reviewer_marker(unit_id: str) -> dict:
     return {
         "case": case,
         "reviewer_marker_event_type": reviewer_event.get("event_type"),
+        "reviewer_marker_id": reviewer_event.get("id"),
         "reviewer_marker_ts": reviewer_ts,
+        "later_coder_push_id": later_push.get("id") if later_push else None,
         "later_coder_push_ts": later_push.get("ts") if later_push else None,
         "later_coder_push_event_type": later_push.get("event_type") if later_push else None,
     }
@@ -166,6 +183,8 @@ def record_stale_marker_pending_delta(
     unit_id: str,
     feature_id: str,
     *,
+    reviewer_event_id: int,
+    later_push_event_id: int,
     reviewer_event_type: str,
     later_push_event_type: str,
 ) -> bool:
@@ -175,14 +194,27 @@ def record_stale_marker_pending_delta(
     returns ``case == "stale"``, *before* it submits the delta-review
     prompt to the reviewer session. The event row is the audit anchor
     the lead and the dashboard can surface ("daemon detected stale
-    marker, requested delta re-review") and the Phase 0 dedupe contract
-    keys it per ``(unit, reviewer marker, later push)`` so a poll loop
-    that hits the same staleness twice writes one row.
+    marker, requested delta re-review").
+
+    **Dedupe key is per-staleness-window, not per-event-type-pair.**
+    The key is composed of the two ``unit_events.id`` PRIMARY KEY
+    values that anchor the staleness — the *specific* reviewer-marker
+    row and the *specific* later-push row that triggered detection.
+    Each genuinely-new staleness window (reviewer endorses sha=A →
+    coder pushes sha=B → daemon detects → reviewer re-endorses sha=B
+    → coder pushes sha=C → daemon detects round 2) has fresh row IDs
+    on both sides, so its dedupe key is fresh and a new audit row
+    lands. A repeated tick within the same window (same two rows)
+    dedupes to one row, matching the daemon's
+    Kubernetes-controller-pattern at-most-once contract.
 
     Returns the boolean :func:`state.record_event` returns — ``True``
     if a row landed, ``False`` if the dedupe-keyed row already existed.
     """
-    dedupe_key = f"{unit_id}|{reviewer_event_type}|{later_push_event_type}|pending_delta"
+    dedupe_key = (
+        f"{unit_id}|{reviewer_event_id}|{later_push_event_id}|"
+        f"{reviewer_event_type}|{later_push_event_type}|pending_delta"
+    )
     return state.record_event(
         unit_id,
         feature_id,

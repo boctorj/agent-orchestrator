@@ -261,8 +261,9 @@ sticky. Graph edits are orthogonal."
   Holds a per-unit advance-lock during the ~1s submit window so a
   Phase-3 daemon doesn't race the state machine on the same tick.
   Default role is picked from the unit's current status when `role=""`
-  (coding/in_ci/fixing → coder, testing → tester, reviewing →
-  reviewer; terminal statuses return a structured error). Returns JSON
+  (coding/opening_pr/in_ci/fixing/escalated → coder, testing → tester,
+  reviewing → reviewer; approved_awaiting_merge/done/cancelled return
+  a structured error). Returns JSON
   with `{delivered, role, session_id}` on success or `{delivered:
   false, reason, role_diagnostics, next_steps}` on a not-actionable
   delivery.

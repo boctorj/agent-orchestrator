@@ -674,8 +674,15 @@ class TestDetectStaleReviewerMarker:
         assert result["reviewer_marker_event_type"] == "reviewer_recommend_merge"
         assert result["later_coder_push_ts"] is None
 
-    def test_stale_when_coder_pushed_after_reviewer(self, tmp_state_db):
+    def test_stale_when_coder_pushed_after_reviewer(self, tmp_state_db, monkeypatch):
         unit_state = _seed_feature_and_unit()
+        # Monkey-patch ``state._now`` to deliver two strictly-monotonic
+        # ISO timestamps rather than relying on a real ``time.sleep`` —
+        # Windows clock resolution can collide on back-to-back
+        # ``datetime.now`` calls and the flake would only show up in CI.
+        # Sequential return values give us deterministic ts ordering.
+        timestamps = iter(["2026-06-04T20:00:00+00:00", "2026-06-04T20:00:01+00:00"])
+        monkeypatch.setattr("orchestrator.state._now", lambda: next(timestamps))
         state.record_event(
             unit_state.unit_id,
             unit_state.feature_id,
@@ -683,10 +690,6 @@ class TestDetectStaleReviewerMarker:
             source="reviewer",
             summary="endorsed",
         )
-        # Force a strictly-later timestamp by sleeping a microsecond's
-        # worth; on Windows clock resolution can collide so we also
-        # insert via a second call where ts is monotonically newer.
-        time.sleep(0.01)
         state.record_event(
             unit_state.unit_id,
             unit_state.feature_id,
@@ -700,31 +703,107 @@ class TestDetectStaleReviewerMarker:
         )
         assert result["later_coder_push_event_type"] == "fix_pushed"
 
-    def test_record_stale_marker_pending_delta_dedupes(self, tmp_state_db):
-        """Two calls with the same anchors must produce ONE audit row —
+    def test_record_stale_marker_pending_delta_dedupes_within_window(self, tmp_state_db):
+        """Two calls with the same row-id anchors must produce ONE audit row —
         the daemon's reconcile loop will tick the same staleness on
-        every poll until the delta resume completes."""
+        every poll until the delta resume completes. Dedupe key is
+        per-staleness-window (per pair of unit_events row IDs), not
+        per-event-type-pair (which would silently swallow round-2+
+        staleness on the same unit; see reviewer PR #59 thread H1)."""
         unit_state = _seed_feature_and_unit()
         first = stale_marker.record_stale_marker_pending_delta(
             unit_state.unit_id,
             unit_state.feature_id,
+            reviewer_event_id=101,
+            later_push_event_id=102,
             reviewer_event_type="reviewer_recommend_merge",
             later_push_event_type="fix_pushed",
         )
         second = stale_marker.record_stale_marker_pending_delta(
             unit_state.unit_id,
             unit_state.feature_id,
+            reviewer_event_id=101,
+            later_push_event_id=102,
             reviewer_event_type="reviewer_recommend_merge",
             later_push_event_type="fix_pushed",
         )
         assert first is True
-        assert second is False, "dedupe-keyed record must be a no-op on second call"
+        assert second is False, "same row-id pair must dedupe to one row"
         rows = [
             e
             for e in state.list_events(unit_state.unit_id)
             if e["event_type"] == "reviewer_stale_marker_pending_delta"
         ]
         assert len(rows) == 1
+
+    def test_multi_round_staleness_records_distinct_rows(self, tmp_state_db):
+        """Two genuinely-distinct staleness rounds on the same unit
+        (different reviewer-marker and coder-push rows) must produce
+        TWO audit rows — the spec § "Stale-marker handling" envisions
+        the daemon detecting re-staleness after the reviewer re-emits
+        and the coder pushes again. A type-only dedupe key (the bug
+        reviewer PR #59 H1 flagged) would silently swallow round 2."""
+        unit_state = _seed_feature_and_unit()
+        # Round 1: reviewer row #11, coder-push row #12.
+        landed_1 = stale_marker.record_stale_marker_pending_delta(
+            unit_state.unit_id,
+            unit_state.feature_id,
+            reviewer_event_id=11,
+            later_push_event_id=12,
+            reviewer_event_type="reviewer_recommend_merge",
+            later_push_event_type="fix_pushed",
+        )
+        # Round 2: reviewer re-emitted (row #21), coder pushed (row #22).
+        # Same event-type pair, fresh row IDs.
+        landed_2 = stale_marker.record_stale_marker_pending_delta(
+            unit_state.unit_id,
+            unit_state.feature_id,
+            reviewer_event_id=21,
+            later_push_event_id=22,
+            reviewer_event_type="reviewer_recommend_merge",
+            later_push_event_type="fix_pushed",
+        )
+        assert landed_1 is True
+        assert landed_2 is True, (
+            "different row-id pair must land a fresh row even with identical type pair"
+        )
+        rows = [
+            e
+            for e in state.list_events(unit_state.unit_id)
+            if e["event_type"] == "reviewer_stale_marker_pending_delta"
+        ]
+        assert len(rows) == 2
+
+    def test_detect_returns_event_row_ids_for_dedupe_key(self, tmp_state_db, monkeypatch):
+        """``detect_stale_reviewer_marker`` must surface the row IDs of
+        BOTH the reviewer marker and the later coder push so a daemon
+        can compose a per-window dedupe key. Without these, the
+        per-window guarantee on :func:`record_stale_marker_pending_delta`
+        is unreachable from the daemon's discovery path."""
+        unit_state = _seed_feature_and_unit()
+        # Monkey-patched timestamps for Windows-CI determinism (matches
+        # ``test_stale_when_coder_pushed_after_reviewer``).
+        timestamps = iter(["2026-06-04T20:01:00+00:00", "2026-06-04T20:01:01+00:00"])
+        monkeypatch.setattr("orchestrator.state._now", lambda: next(timestamps))
+        state.record_event(
+            unit_state.unit_id,
+            unit_state.feature_id,
+            "reviewer_recommend_merge",
+            source="reviewer",
+            summary="endorsed",
+        )
+        state.record_event(
+            unit_state.unit_id,
+            unit_state.feature_id,
+            "fix_pushed",
+            source="coder",
+            summary="fix",
+        )
+        result = stale_marker.detect_stale_reviewer_marker(unit_state.unit_id)
+        assert result["case"] == "stale"
+        assert isinstance(result["reviewer_marker_id"], int)
+        assert isinstance(result["later_coder_push_id"], int)
+        assert result["reviewer_marker_id"] != result["later_coder_push_id"]
 
 
 # --------------------------- MCP registration ---------------------------

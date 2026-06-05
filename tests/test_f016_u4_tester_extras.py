@@ -598,12 +598,16 @@ class TestStaleMarkerEventTypeSet:
         first = stale_marker.record_stale_marker_pending_delta(
             a.unit_id,
             a.feature_id,
+            reviewer_event_id=1,
+            later_push_event_id=2,
             reviewer_event_type="reviewer_recommend_merge",
             later_push_event_type="fix_pushed",
         )
         second = stale_marker.record_stale_marker_pending_delta(
             b.unit_id,
             b.feature_id,
+            reviewer_event_id=1,
+            later_push_event_id=2,
             reviewer_event_type="reviewer_recommend_merge",
             later_push_event_type="fix_pushed",
         )
