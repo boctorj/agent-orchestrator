@@ -326,16 +326,32 @@ class TestSendToUnitAsyncContract:
 
     def test_terminal_status_returns_structured_error(self, tmp_state_db, recording_workers):
         """approved_awaiting_merge / done — no role is actionable, the
-        spec requires a structured error (NOT a silent send)."""
+        spec requires a structured error (NOT a silent send). The
+        terminal-status check fires BEFORE role resolution, so an
+        explicit ``role="coder"`` cannot bypass it (PR #59 Copilot
+        finding 1: previously the check only ran when role==''')."""
         for terminal_status in ("approved_awaiting_merge", "done"):
             unit_id = f"F-016-U4T-U-term-{terminal_status}"
             _seed_feature_and_unit(unit_id=unit_id, status=terminal_status)
+            # Implicit role.
             out = execution.send_to_unit_async(unit_id, "ping")
             parsed = json.loads(out)
             assert parsed["delivered"] is False
-            assert parsed["reason"] == "no_default_role"
+            assert parsed["reason"] == "unit_terminal", (
+                f"{terminal_status}: expected unit_terminal, got {parsed}"
+            )
             assert "role_diagnostics" in parsed
-            # No resume_async should have been called.
+            assert parsed["status"] == terminal_status
+            # Explicit role must NOT bypass the terminal-status gate
+            # (the regression Copilot flagged: role-resolution only
+            # short-circuited on ``role=""``).
+            out_explicit = execution.send_to_unit_async(unit_id, "ping", role="coder")
+            parsed_explicit = json.loads(out_explicit)
+            assert parsed_explicit["delivered"] is False
+            assert parsed_explicit["reason"] == "unit_terminal", (
+                f"explicit role on {terminal_status}: expected unit_terminal, got {parsed_explicit}"
+            )
+            # No resume_async should have been called for either path.
             assert recording_workers.get("coder") is None or (
                 (unit_id, "ping")
                 not in [(sid, m) for sid, m in recording_workers["coder"].resume_async_calls]
@@ -344,13 +360,20 @@ class TestSendToUnitAsyncContract:
     def test_cancelled_unit_rejected(self, tmp_state_db, recording_workers):
         """The submit window must never open on a cancelled unit —
         silent delivery would burn API calls on output the user
-        explicitly halted."""
+        explicitly halted. Response shape mirrors the other
+        not-actionable cases (PR #59 Copilot finding 2): every
+        not-actionable response carries ``role_diagnostics`` +
+        ``next_steps`` for uniformity."""
         _seed_feature_and_unit()
         state.cancel_unit("F-016-U4T-U-1")
         out = execution.send_to_unit_async("F-016-U4T-U-1", "ping")
         parsed = json.loads(out)
         assert parsed["delivered"] is False
         assert parsed["reason"] == "unit_cancelled"
+        # Shape consistency: role_diagnostics + next_steps land here
+        # too (every other not-actionable branch surfaces them).
+        assert "role_diagnostics" in parsed
+        assert "next_steps" in parsed
         # No resume_async call landed on any worker.
         for w in recording_workers.values():
             assert w.resume_async_calls == []

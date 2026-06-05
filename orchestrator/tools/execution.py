@@ -3077,18 +3077,41 @@ def send_to_unit_async(unit_id: str, message: str, role: str = "") -> str:
     if not unit_state:
         return f"ERROR: no state for unit {unit_id}"
 
-    # Terminal-cancel is sticky per F-016 Phase 2.5: a cancelled unit
-    # can never receive new messages. Surface a structured error so the
-    # lead can offer the user `update_unit_deps` (graph repair) or a
-    # fresh spawn rather than silently sending into the void.
+    # Terminal-status refusal (PR #59 Copilot finding 1). A unit in
+    # ``done`` / ``approved_awaiting_merge`` / ``cancelled`` must NOT
+    # receive new messages regardless of whether the caller passed an
+    # explicit ``role`` — burning an API call on a terminal unit is
+    # the exact failure mode the spec's routing table ("done | cancelled
+    # → error — unit is terminal", "approved_awaiting_merge → error —
+    # PR is done") guards against. The role-resolution short-circuit
+    # below only fires when ``role==""``, so without this gate an
+    # explicit ``role="coder"`` would slip past. ``escalated`` is
+    # intentionally NOT in this set — the spec routes escalated → coder
+    # so the lead can hand-hold the coder through triage.
     if state.is_cancelled(unit_id):
         return json.dumps(
             {
                 "delivered": False,
                 "reason": "unit_cancelled",
                 "unit_id": unit_id,
+                "role_diagnostics": _role_diagnostics_payload(unit_state),
                 "next_steps": [
                     "unit was cancelled via cancel_unit; spawn fresh or pick a different unit",
+                ],
+            },
+            indent=2,
+        )
+
+    if unit_state.status in ("done", "approved_awaiting_merge"):
+        return json.dumps(
+            {
+                "delivered": False,
+                "reason": "unit_terminal",
+                "unit_id": unit_id,
+                "status": unit_state.status,
+                "role_diagnostics": _role_diagnostics_payload(unit_state),
+                "next_steps": [
+                    f"unit is {unit_state.status!r}; no role can receive a message",
                 ],
             },
             indent=2,
@@ -3152,6 +3175,11 @@ def send_to_unit_async(unit_id: str, message: str, role: str = "") -> str:
                     "role": role,
                     "session_id": session_id,
                     "error": str(e),
+                    "role_diagnostics": _role_diagnostics_payload(unit_state),
+                    "next_steps": [
+                        f"{role} session rejected the resume — check unit_history "
+                        f"for the worker's last messages, then retry or escalate",
+                    ],
                 },
                 indent=2,
             )

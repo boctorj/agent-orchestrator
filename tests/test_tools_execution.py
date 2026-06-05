@@ -3481,6 +3481,13 @@ class TestSendToUnitAsync:
         assert parsed["delivered"] is False
         assert parsed["reason"] == "coder_resume_async_error"
         assert "network down" in parsed["error"]
+        # PR #59 Copilot finding 3: the resume_async error response must
+        # carry role_diagnostics + next_steps so the shape matches every
+        # other not-actionable branch — a lead surfacing this to the
+        # user shouldn't have to special-case the network-error
+        # branch's structured payload.
+        assert "role_diagnostics" in parsed
+        assert "next_steps" in parsed
         # The error must still release the advance lock (the
         # ``with state.lead_advance_lock`` block guarantees this).
         assert state.has_active_advance_lock("F-001-U-1") is False

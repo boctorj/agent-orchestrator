@@ -677,7 +677,14 @@ def cancel_unit(unit_id: str) -> bool:
     side-effects ``cancel_unit`` MCP tool layers on top — archiving
     worker sessions, recording the audit event — live in
     ``orchestrator/tools/execution.py`` so this helper stays pure-state.
+
+    ``cancelled_at`` and ``last_activity`` share one captured timestamp
+    so the cancellation row is internally consistent — two ``_now()``
+    calls in one UPDATE statement can drift by microseconds on a slow
+    interpreter or under GC pressure, which would make the row's two
+    timestamps disagree about *when* the cancel happened.
     """
+    now = _now()
     with _connect() as conn:
         cur = conn.execute(
             "UPDATE work_units "
@@ -686,7 +693,7 @@ def cancel_unit(unit_id: str) -> bool:
             "    last_activity = ?, "
             "    owner = '' "
             "WHERE unit_id = ?",
-            (_now(), _now(), unit_id),
+            (now, now, unit_id),
         )
         return cur.rowcount > 0
 
