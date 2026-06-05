@@ -186,9 +186,7 @@ class TestStaleMarkerNoBackflip:
         )
         assert state.get_unit_state(unit.unit_id).status == "reviewing"
 
-    def test_reconcile_unit_does_not_backflip_reviewing_to_in_ci(
-        self, tmp_state_db, monkeypatch
-    ):
+    def test_reconcile_unit_does_not_backflip_reviewing_to_in_ci(self, tmp_state_db, monkeypatch):
         """End-to-end: a unit mid-``reviewing`` with PR_URL still in the
         coder tail and TESTS_PASS still in the tester tail must stay at
         ``reviewing`` across reconcile ticks. This is the realistic
@@ -208,9 +206,7 @@ class TestStaleMarkerNoBackflip:
                     }
                 ]
             ),
-            "tester": _TailResult(
-                messages=[{"ts": "t", "role": "agent", "text": "TESTS_PASS"}]
-            ),
+            "tester": _TailResult(messages=[{"ts": "t", "role": "agent", "text": "TESTS_PASS"}]),
             # reviewer mid-review; no terminal marker yet.
             "reviewer": _TailResult(messages=[]),
         }
@@ -222,9 +218,7 @@ class TestStaleMarkerNoBackflip:
             def tail_messages(self, _sid: str, *, limit: int = 50):  # noqa: ARG002
                 return canned[self.role]
 
-        monkeypatch.setattr(
-            "orchestrator.daemon.make_worker", lambda role: _PerRoleWorker(role)
-        )
+        monkeypatch.setattr("orchestrator.daemon.make_worker", lambda role: _PerRoleWorker(role))
         _stub_no_probe(monkeypatch)
         # Two ticks — the second should still find the unit at "reviewing".
         daemon.reconcile_unit(unit.unit_id)
@@ -247,9 +241,7 @@ class TestStaleMarkerNoBackflip:
         as a contract on the source-status restriction the fix needs to
         respect symmetrically across the three roles."""
         unit = _seed_unit(status="in_ci", sessions={"reviewer": "sess_r"})
-        spec = markers.scan_response(
-            "reviewer", "REVIEW_RECOMMEND_MERGE: clean"
-        )
+        spec = markers.scan_response("reviewer", "REVIEW_RECOMMEND_MERGE: clean")
         assert spec is not None
         assert spec.target_status == "approved_awaiting_merge"
         # Reviewer markers should only flip from "reviewing", not from
@@ -371,9 +363,7 @@ class TestNoTargetMarkerSkipsCAS:
             "advance-lock isn't briefly clobbered."
         )
 
-    def test_review_request_changes_does_not_claim_owner(
-        self, tmp_state_db, monkeypatch
-    ):
+    def test_review_request_changes_does_not_claim_owner(self, tmp_state_db, monkeypatch):
         unit = _seed_unit(status="reviewing")
         spec = markers.scan_response("reviewer", "REVIEW_REQUEST_CHANGES: nits")
         assert spec is not None and spec.target_status is None
@@ -422,9 +412,7 @@ class TestRecheckBetweenRoles:
     inter-role loop would let a cancelled unit hit the F-014 probe
     phase anyway."""
 
-    def test_cancel_observed_after_coder_scan_stops_probe(
-        self, tmp_state_db, monkeypatch
-    ):
+    def test_cancel_observed_after_coder_scan_stops_probe(self, tmp_state_db, monkeypatch):
         """Coder scan runs first; if the user's cancel lands between
         coder and tester scans (modeled here by stubbing the coder
         worker to ``state.cancel_unit`` mid-tail), the tester scan AND
@@ -467,8 +455,7 @@ class TestRecheckBetweenRoles:
             f"reviewer scanned after cancel landed; seen_roles={seen_roles}"
         )
         assert probe_calls["n"] == 0, (
-            "F-014 probe ran on a cancelled unit; "
-            "spec § Phase 2.5 sticky cancel violated."
+            "F-014 probe ran on a cancelled unit; spec § Phase 2.5 sticky cancel violated."
         )
 
 
@@ -501,9 +488,7 @@ class TestF014EngineNotDuplicated:
             "_apply_action",
             lambda u, a: called.append((u.unit_id, a.kind, a.target_status)),
         )
-        result = daemon._apply_health_action(
-            unit, Action.transition("done", "merged sentinel")
-        )
+        result = daemon._apply_health_action(unit, Action.transition("done", "merged sentinel"))
         assert result is True
         assert called == [(unit.unit_id, "transition", "done")], (
             "daemon._apply_health_action did NOT route through "
