@@ -110,11 +110,51 @@ forces an explicit edit (the marker grammar in :mod:`orchestrator.markers`
 is per-role and must grow with it)."""
 
 
-# Active statuses that a marker's ``target_status`` should flip the unit
-# *from*. Pre-flight check (``status`` re-read inside the CAS makes the
-# guard a race-safe fence) so an already-flipped unit isn't bounced
-# backwards by a stale tail.
-_FLIPPABLE_STATUSES: frozenset[str] = ACTIVE_UNIT_STATUSES
+# Per-marker source-status table — the central guard against the
+# stale-marker backflip class of regression. Each ``(role, marker)``
+# entry lists the ``WorkUnitState.status`` values the marker is
+# legitimately *fired from*. A marker observed on a tail whose unit is
+# already past those statuses is silently no-op'd: role sessions are
+# never archived between phases on the success path, so the coder's
+# ``PR_URL`` and the tester's ``TESTS_PASS`` stay in their tails for the
+# unit's whole lifetime — a daemon that backflipped ``reviewing → in_ci``
+# on each re-scan of those persistent markers would break the spec's
+# "Idempotent transitions are load-bearing" acceptance.
+#
+# Statuses (matching :data:`~orchestrator.models.ACTIVE_UNIT_STATUSES`):
+#   * ``coding`` / ``opening_pr`` — coder's PR-opening window.
+#   * ``fixing`` — coder's address-review / address-CI window.
+#   * ``in_ci`` — waiting on CI / between phases.
+#   * ``testing`` — tester is running.
+#   * ``reviewing`` — reviewer is reading.
+#
+# Rationale per entry:
+#   * ``PR_URL`` — only fires from a coder mid-spawn (``coding`` /
+#     ``opening_pr``). A coder mid-fix that emits PR_URL is a worker
+#     bug, not a state transition.
+#   * ``FIX_PUSHED`` — primarily fires from ``fixing``; ``coding`` /
+#     ``opening_pr`` covered defensively for the edge case where a
+#     spawn-time coder pushes a "fix" before opening the PR.
+#   * ``TESTS_PASS`` — only ``testing``; the tester session exits idle
+#     at that point and the daemon's re-tick on the same persistent
+#     marker must not bounce a downstream unit.
+#   * ``REVIEW_RECOMMEND_MERGE`` / ``REVIEW_COMMENT`` — only
+#     ``reviewing``; applying a stale endorsement to a unit that's now
+#     in CI re-run would land ``approved_awaiting_merge`` without the
+#     reviewer ever seeing the new SHA.
+#   * ``BLOCKED`` — universal across roles; can escalate from any
+#     active status, so the source set is the full
+#     ``ACTIVE_UNIT_STATUSES``.
+_MARKER_SOURCE_STATUSES: dict[tuple[str, str], frozenset[str]] = {
+    ("coder", "PR_URL"): frozenset({"coding", "opening_pr"}),
+    ("coder", "FIX_PUSHED"): frozenset({"coding", "opening_pr", "fixing"}),
+    ("tester", "TESTS_PASS"): frozenset({"testing"}),
+    ("reviewer", "REVIEW_RECOMMEND_MERGE"): frozenset({"reviewing"}),
+    ("reviewer", "REVIEW_COMMENT"): frozenset({"reviewing"}),
+    ("coder", "BLOCKED"): ACTIVE_UNIT_STATUSES,
+    ("tester", "BLOCKED"): ACTIVE_UNIT_STATUSES,
+    ("reviewer", "BLOCKED"): ACTIVE_UNIT_STATUSES,
+}
 
 
 # --------------------------- env helpers ---------------------------
@@ -222,18 +262,27 @@ def _record_marker(unit: WorkUnitState, spec: MarkerSpec, session_id: str) -> bo
 def _apply_marker_transition(unit_id: str, spec: MarkerSpec) -> bool:
     """Flip ``work_units.status`` per ``spec.target_status`` under an ``owner`` CAS.
 
-    Returns ``True`` when the flip landed. The five short-circuits — in
+    Returns ``True`` when the flip landed. The short-circuits — in
     decreasing locality — together fence every race:
 
       * ``spec.target_status`` is ``None`` → marker has no status flip
         (BUG_FOUND / REVIEW_REQUEST_CHANGES leave status to the
-        fix-loop).
+        fix-loop). Skip BEFORE the CAS so a non-flipping marker doesn't
+        briefly clobber a lead's pending advance-lock attempt.
       * :func:`~orchestrator.state.claim_unit_owner` returns False →
         lead holds the advance lock (``owner='lead'``) OR another daemon
         instance is mid-tick on the same unit. Skip; next poll retries.
-      * Re-read inside the CAS: ``cancelled_at`` set OR status not in
-        :data:`_FLIPPABLE_STATUSES` → user cancelled or another writer
-        already flipped. Skip and release.
+      * Re-read inside the CAS: ``cancelled_at`` set → user cancelled
+        between CAS-claim and the body. Skip and release.
+      * **Per-marker source-status check** (the stale-marker backflip
+        fence): the marker is only applied when ``latest.status`` is in
+        the marker's :data:`_MARKER_SOURCE_STATUSES` entry. Role
+        sessions are never archived on the success path, so the coder's
+        ``PR_URL`` and the tester's ``TESTS_PASS`` stay in their tails
+        for the unit's whole lifetime; a daemon re-scan that re-fired
+        those persistent markers as ``reviewing → in_ci`` flips would
+        break the spec's "Idempotent transitions are load-bearing"
+        acceptance.
       * BLOCKED markers populate ``last_error`` alongside the status
         flip in one :func:`~orchestrator.state.touch_unit` call so the
         ``(status='escalated', last_error=…)`` pair lands atomically.
@@ -248,12 +297,18 @@ def _apply_marker_transition(unit_id: str, spec: MarkerSpec) -> bool:
             return False
         if latest.cancelled_at is not None:
             return False
-        if latest.status not in _FLIPPABLE_STATUSES:
-            return False
-        if latest.status == spec.target_status:
-            # Already at target — a re-tick on the same marker after the
-            # flip is a no-op rather than a wasted UPDATE. Keeps the
-            # idempotence guarantee explicit at the call site.
+        # Per-marker source-status fence — the stale-marker backflip
+        # guard. A persistent ``TESTS_PASS`` on the tester's tail must
+        # NOT bounce a unit that has moved on to ``reviewing`` back to
+        # ``in_ci``; the source-status set restricts each marker to the
+        # state it's legitimately emitted from. Unknown ``(role, marker)``
+        # pairs (a future grammar addition the daemon hasn't been
+        # taught about yet) default to *no* sources — a conservative
+        # "refuse unfamiliar markers" so a daemon ahead of the grammar
+        # can't silently drive transitions whose semantics weren't
+        # reviewed.
+        allowed_sources = _MARKER_SOURCE_STATUSES.get((spec.role, spec.marker), frozenset())
+        if latest.status not in allowed_sources:
             return False
         if spec.last_error:
             state.touch_unit(unit_id, status=spec.target_status, error=spec.last_error)
@@ -353,15 +408,19 @@ def reconcile_unit(unit_id: str) -> None:
     # Stage 1: observe — scan worker sessions, record new markers,
     # apply any status flips the marker implies.
     for role in ROLES:
+        # Re-check actionability at the TOP of every iteration so the
+        # no-marker path (a role whose ``_scan_role`` returns ``(None,
+        # sid)``) also bails on a cancel landed mid-tick — the docstring's
+        # promise of "completing the F-014 probe on a unit the user just
+        # stopped" must hold whether or not a marker was observed on the
+        # previous role.
+        unit = state.get_unit_state(unit_id) or unit
+        if not _is_actionable(unit):
+            return
         spec, sid = _scan_role(unit, role)
         if spec is None or not sid:
             continue
         _record_marker(unit, spec, sid)
-        # Re-check guards between markers — a cancel observed on the
-        # tester role must stop the reviewer flip on the same tick.
-        unit = state.get_unit_state(unit_id) or unit
-        if not _is_actionable(unit):
-            return
         if _apply_marker_transition(unit_id, spec):
             unit = state.get_unit_state(unit_id) or unit
             if not _is_actionable(unit):
