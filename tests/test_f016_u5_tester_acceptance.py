@@ -563,10 +563,16 @@ class TestRunDaemonEntrypoint:
     ``DaemonLoop``, return its ``run()`` count. No bespoke lock-claim or
     signal-handling logic in the entry point."""
 
-    def test_run_daemon_returns_zero_when_drive_disabled(self, tmp_state_db, monkeypatch):
+    def test_run_daemon_returns_drive_disabled_sentinel(self, tmp_state_db, monkeypatch):
+        """Drive-disabled returns :data:`~orchestrator.daemon.EXIT_DRIVE_DISABLED`
+        (PR #61 reviewer M2 — was 0 before; the non-zero sentinel lets
+        a systemd / launchd / shell-script supervisor distinguish
+        "operator forgot the opt-in" from a clean-shutdown ``0``).
+        """
         monkeypatch.delenv(daemon.DAEMON_DRIVE_ENV, raising=False)
-        # Drive disabled → DaemonLoop.run is a no-op → run_daemon returns 0.
-        assert daemon.run_daemon() == 0
+        # Drive disabled → DaemonLoop.run is a no-op → run_daemon returns
+        # EXIT_DRIVE_DISABLED.
+        assert daemon.run_daemon() == daemon.EXIT_DRIVE_DISABLED
 
     def test_run_daemon_delegates_to_daemon_loop(self, tmp_state_db, monkeypatch):
         """Patch ``DaemonLoop.run`` to a sentinel; ``run_daemon`` must
@@ -645,20 +651,42 @@ class TestCliDaemonStatusCommand:
 
 
 class TestCliDaemonStartCommand:
-    """``orchestrator daemon start`` mirrors the module guard: a no-op
-    exit when ``ORCH_DAEMON_DRIVE`` is unset."""
+    """``orchestrator daemon start`` mirrors the module guard: a non-zero
+    exit code when ``ORCH_DAEMON_DRIVE`` is unset so a supervisor can
+    branch on ``$?`` between "operator forgot the opt-in" (exit 2),
+    "another daemon owns the workspace" (exit 3), and a clean shutdown
+    (exit 0). PR #61 reviewer M2."""
 
-    def test_start_noop_exits_zero_when_drive_disabled(self, tmp_state_db, monkeypatch):
+    def test_start_exits_drive_disabled_code_when_drive_disabled(self, tmp_state_db, monkeypatch):
+        """Without ``ORCH_DAEMON_DRIVE`` the CLI exits 2 (drive-disabled),
+        not 0. The non-zero sentinel is the contract operators rely on
+        via systemd ``Restart=on-failure`` / shell ``$?``.
+        """
         monkeypatch.delenv(daemon.DAEMON_DRIVE_ENV, raising=False)
         result = CliRunner().invoke(cli, ["daemon", "start"])
-        # SystemExit code surfaces via result.exit_code; 0 = clean.
-        assert result.exit_code == 0, (
-            f"`daemon start` exited non-zero without drive set; "
+        assert result.exit_code == 2, (
+            f"`daemon start` did not exit with EXIT_DRIVE_DISABLED code (2); "
             f"output:\n{result.output}\nexc: {result.exception}"
         )
         # No lock written.
         path = str(state.STATE_DB.resolve())
         assert state.get_daemon_lock(path) is None
+
+    def test_start_exits_lock_held_code_when_lock_held(self, tmp_state_db, monkeypatch):
+        """Another daemon owns the workspace → CLI exits 3 (lock-held).
+        Same-workspace contention is a configuration error, not a
+        transient — supervisors should stop retrying rather than busy-loop.
+        """
+        monkeypatch.setenv(daemon.DAEMON_DRIVE_ENV, "true")
+        path = str(state.STATE_DB.resolve())
+        state.claim_daemon_lock(path, "incumbent")
+        result = CliRunner().invoke(cli, ["daemon", "start"])
+        assert result.exit_code == 3, (
+            f"`daemon start` did not exit with EXIT_LOCK_HELD code (3); "
+            f"output:\n{result.output}\nexc: {result.exception}"
+        )
+        # Incumbent still owns.
+        assert state.get_daemon_lock(path)["holder_id"] == "incumbent"
 
 
 # --------------------------- F-014 reuse: shared executor ---------------------------

@@ -130,6 +130,17 @@ def daemon_start() -> None:
     Loads the workspace's ``.env`` so ``GITHUB_TOKEN`` / ``ANTHROPIC_API_KEY``
     / ``ORCH_DAEMON_DRIVE`` reach the loop. Without ``ORCH_DAEMON_DRIVE=true``
     the loop is a no-op (the daemon refuses to claim the lock).
+
+    Exit codes (operator-facing — branch on ``$?`` from a systemd /
+    launchd / shell-script supervisor):
+
+      * ``0`` — clean shutdown (SIGINT / SIGTERM after some number of
+        ticks, or a no-op exit because nothing was actionable).
+      * ``2`` — ``ORCH_DAEMON_DRIVE`` is unset / falsy. Treat as a
+        config nudge; do NOT retry without operator intervention.
+      * ``3`` — another daemon already owns this workspace's
+        ``state.db`` lock. Same-workspace contention is a
+        configuration error, not a transient.
     """
     from dotenv import load_dotenv
 
@@ -138,7 +149,7 @@ def daemon_start() -> None:
 
     load_dotenv(dotenv_path=Path(".env"))
     state.init_db()
-    raise SystemExit(0 if daemon_module.run_daemon() >= 0 else 1)
+    raise SystemExit(daemon_module.exit_code_for_run(daemon_module.run_daemon()))
 
 
 @daemon.command("status", help="Show the current daemon lock holder (if any).")

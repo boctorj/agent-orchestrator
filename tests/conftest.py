@@ -26,6 +26,26 @@ import pytest
 from orchestrator.workers.docker_claude_code import DockerClaudeCodeWorker
 
 
+@pytest.fixture(autouse=True)
+def _reset_daemon_worker_cache():
+    """Drop the daemon's per-role worker cache before each test.
+
+    :func:`orchestrator.daemon._cached_worker` memoizes one Worker per
+    role for the daemon process's lifetime — production wants that to
+    avoid per-tick ``Anthropic()`` SDK churn (PR #61 review 🔵). Tests
+    that ``monkeypatch.setattr("orchestrator.daemon.make_worker", ...)``
+    to inject a fake would otherwise get the previous test's cached
+    Worker because the cache outlives the monkeypatch. Auto-clearing
+    before every test keeps the patch-and-call pattern working without
+    each test having to know about the cache.
+    """
+    from orchestrator import daemon as _daemon
+
+    _daemon.reset_worker_cache()
+    yield
+    _daemon.reset_worker_cache()
+
+
 @pytest.fixture
 def tmp_state_db(monkeypatch, tmp_path: Path):
     """Redirect state.STATE_DB to a temporary file and initialize the schema.

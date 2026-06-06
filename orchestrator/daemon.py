@@ -73,7 +73,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from orchestrator import markers, state
-from orchestrator.health import Action
+from orchestrator.health import Action, Decision, HealthReport, ShadowDecision
 from orchestrator.markers import MarkerSpec
 from orchestrator.models import (
     ACTIVE_UNIT_STATUSES,
@@ -81,6 +81,7 @@ from orchestrator.models import (
     WorkUnitState,
 )
 from orchestrator.workers import make_worker
+from orchestrator.workers.base import Worker
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +109,75 @@ ROLES: tuple[str, ...] = ("coder", "tester", "reviewer")
 rather than reading from ``WorkUnitState`` so adding a future role
 forces an explicit edit (the marker grammar in :mod:`orchestrator.markers`
 is per-role and must grow with it)."""
+
+
+# --------------------------- exit code sentinels ---------------------------
+#
+# ``DaemonLoop.run`` / ``run_daemon`` return ``int`` tick counts on the
+# happy paths; the two no-op paths return distinct sentinels so the CLI
+# (and a systemd ``ExecStart`` / shell script) can branch on intent via
+# ``$?`` rather than collapsing every outcome to exit code 0.
+#
+# Sentinels are negative so ``ticks >= 0`` still discriminates "ran the
+# loop" from "noped out" without per-callsite branching. The CLI surface
+# maps them: drive-disabled → exit 2 (config / nudge), lock-held →
+# exit 3 (another daemon owns the workspace).
+
+EXIT_DRIVE_DISABLED = -2
+"""Returned by :func:`DaemonLoop.run` when ``ORCH_DAEMON_DRIVE`` is unset
+or falsy. CLI maps to exit-2 so a systemd ``ExecStart`` retry policy can
+distinguish "operator forgot the env var" from "lock contention"."""
+
+EXIT_LOCK_HELD = -3
+"""Returned by :func:`DaemonLoop.run` when :func:`claim_singleton`
+returns ``None`` — another daemon owns the workspace. CLI maps to
+exit-3 so an operator running ``orchestrator daemon start`` from a
+second terminal sees the failure code without parsing logs."""
+
+
+# --------------------------- per-role worker cache ---------------------------
+#
+# ``make_worker`` constructs a fresh :class:`ManagedAgentWorker` (and
+# Anthropic SDK client) per call. At the 5s default tick with N active
+# units, the unmemoized call site was 3·N client constructions per tick
+# (one per role per unit). The SDK client is lightweight today, but a
+# future release that opens an ``httpx`` keepalive pool on construction
+# would turn this into per-tick connection churn.
+#
+# Memoize per role for the daemon process's lifetime. The cache is keyed
+# on role name and protected by a lock so two concurrent test ticks
+# can't double-construct. The same pattern lives in
+# ``tools.health._ProductionAnthropicClient._worker``; sharing the
+# pattern keeps the engine's two surfaces drift-free.
+
+_WORKER_CACHE: dict[str, Worker] = {}
+_WORKER_CACHE_LOCK = threading.Lock()
+
+
+def _cached_worker(role: str) -> Worker:
+    """Return a process-wide :class:`~orchestrator.workers.base.Worker` for ``role``.
+
+    Lazy-constructed and cached for the daemon process's lifetime.
+    Tests that want a fresh worker per call (e.g. to spy on
+    construction) call :func:`reset_worker_cache` first.
+    """
+    with _WORKER_CACHE_LOCK:
+        worker = _WORKER_CACHE.get(role)
+        if worker is None:
+            worker = make_worker(role)
+            _WORKER_CACHE[role] = worker
+        return worker
+
+
+def reset_worker_cache() -> None:
+    """Drop every cached worker. Test-only — production never re-roles.
+
+    Useful in unit tests that patch ``make_worker`` between calls; the
+    cache would otherwise return the previous patch's worker after the
+    monkeypatch restores.
+    """
+    with _WORKER_CACHE_LOCK:
+        _WORKER_CACHE.clear()
 
 
 # Per-marker source-status table — the central guard against the
@@ -145,6 +215,40 @@ is per-role and must grow with it)."""
 #   * ``BLOCKED`` — universal across roles; can escalate from any
 #     active status, so the source set is the full
 #     ``ACTIVE_UNIT_STATUSES``.
+#
+# Load-bearing caller invariant (PR #61 reviewer M1):
+#
+#   The source-status fence above CORRECTLY blocks the
+#   "downstream-status re-scan" case (cycle 0's TESTS_PASS observed
+#   while the unit is now ``reviewing`` — ``reviewing`` ∉ {testing}
+#   → no-op).
+#
+#   It does NOT block the "cross-cycle re-entry with the same session
+#   id" case: a unit that has progressed past ``testing`` and then
+#   returns to ``testing`` in a later cycle with the **same**
+#   ``tester_session_id`` would re-fire the original ``TESTS_PASS`` on
+#   the next daemon scan (the source status is satisfied, the marker
+#   payload is still on the tail). That gap is currently unreachable
+#   in production because the lead's re-entry helpers
+#   (``orchestrator.tools.execution._tester_phase`` and friends) clear
+#   the role's ``<role>_session_id`` before re-spawning when the agent
+#   returns to an upstream status in a new cycle — so cycle N+1's
+#   tester runs in a fresh session with no prior ``TESTS_PASS`` in its
+#   tail.
+#
+#   **Caller contract:** when the orchestrator re-enters an upstream
+#   active status in a new cycle (e.g. ``reviewing → fixing → testing``
+#   on a tester-found bug), it MUST clear ``<role>_session_id`` before
+#   the role's worker is re-spawned. A future F-016-U-6 / F-016-U-7
+#   change that resumes an existing session instead of cold-starting
+#   on cycle re-entry MUST tighten this fence further (the proposed
+#   ``unit_events`` dedupe-key lookup in PR #61 review thread M1 is
+#   the natural follow-up) or the cross-cycle backflip becomes
+#   reachable. The
+#   ``tests/test_f016_u5_tester_extras.py::TestStaleMarkerNoBackflip``
+#   suite covers the downstream-status case; the new
+#   ``TestCallerSessionClearInvariant`` suite below pins the
+#   cross-cycle invariant on the production helpers.
 _MARKER_SOURCE_STATUSES: dict[tuple[str, str], frozenset[str]] = {
     ("coder", "PR_URL"): frozenset({"coding", "opening_pr"}),
     ("coder", "FIX_PUSHED"): frozenset({"coding", "opening_pr", "fixing"}),
@@ -213,12 +317,16 @@ def _scan_role(unit: WorkUnitState, role: str) -> tuple[MarkerSpec | None, str]:
     and lead see the same marker on the same response — Phase 0's
     determinism is what makes the dedupe key stable across both
     callers.
+
+    Workers are pulled from :func:`_cached_worker` so each role's
+    :class:`ManagedAgentWorker` (and its Anthropic SDK client) is
+    constructed once per process, not per ``(unit, role, tick)``.
     """
     sid = _role_session_id(unit, role)
     if not sid:
         return None, ""
     try:
-        worker = make_worker(role)
+        worker = _cached_worker(role)
         tail_result = worker.tail_messages(sid, limit=50)
     except Exception:  # noqa: BLE001 — defensive; observability matters more than a crash
         logger.exception("daemon: tail_messages failed for %s/%s", unit.unit_id, role)
@@ -348,29 +456,93 @@ def _apply_health_action(unit: WorkUnitState, action: Action) -> bool:
 
 
 def _probe_and_decide_unit(unit: WorkUnitState) -> list[Action]:
-    """Run F-014 probe + decide for ``unit``. Empty list on any non-success.
+    """Run F-014 probe + decide for ``unit``. Returns ``actions_to_apply``.
 
-    No-ops when the unit has no PR yet (F-014's probe needs one). The
-    GitHub-side ``need_github_token`` / fetch errors are returned as
-    strings by the shared helper; the daemon swallows them and logs —
-    a missing token shouldn't crash the tick loop.
+    Empty list on any non-success (no PR yet, missing feature row, GH
+    fetch error). The two F-014 side effects that always accompany the
+    ``actions_to_apply`` half — :func:`_persist_shadow_decisions` and
+    :func:`_maybe_persist_snapshot` — fire here so the daemon's tick
+    produces the same audit footprint
+    :func:`~orchestrator.tools.health.inspect_unit_health` does on the
+    same unit (spec § "F-015 absorption clause": F-014's shadow-
+    decision telemetry IS the validation harness for the daemon's
+    rollout; dropping it would silently shrink the operator-visible
+    surface).
+
+    Returning just the actions list keeps the public call-site stable
+    for the existing test surface; callers that want the
+    ``(report, decision)`` pair instead consume
+    :func:`_probe_unit_health` directly.
 
     Lazy import of ``orchestrator.tools.health`` for the same MCP-
     decorator reason as :func:`_apply_health_action`.
     """
-    if not unit.pr_number:
+    probe = _probe_unit_health(unit)
+    if probe is None:
         return []
+    report, decision = probe
+    _persist_shadow_decisions(unit, decision.shadow_decisions)
+    _maybe_persist_snapshot(unit, report)
+    return list(decision.actions_to_apply)
+
+
+def _probe_unit_health(unit: WorkUnitState) -> tuple[HealthReport, Decision] | None:
+    """Run F-014 probe + decide for ``unit``. ``None`` on any non-success.
+
+    Pure observer — no state writes, no side-effects beyond the
+    GitHub / Anthropic round-trips
+    :func:`~orchestrator.tools.health._probe_and_decide` does. The
+    caller decides what to do with the report + decision pair;
+    :func:`_probe_and_decide_unit` wraps this with the F-014 side-
+    effect persistence the daemon's tick path uses, while a future
+    debugging tool / dry-run path can call this directly.
+    """
+    if not unit.pr_number:
+        return None
     from orchestrator.tools.health import _probe_and_decide  # noqa: PLC0415
 
     feature = state.get_feature(unit.feature_id)
     if feature is None:
-        return []
+        return None
     result = _probe_and_decide(unit, feature.repo_path)
     if isinstance(result, str):
         logger.info("daemon: probe skipped for %s: %s", unit.unit_id, result)
-        return []
-    _report, decision = result
-    return list(decision.actions_to_apply)
+        return None
+    return result
+
+
+def _persist_shadow_decisions(unit: WorkUnitState, shadows: list[ShadowDecision]) -> None:
+    """Persist every fired shadow rule as a ``shadow_transition_proposed`` event.
+
+    Delegates to :func:`orchestrator.tools.health._record_shadow_event`
+    — same writer ``inspect_unit_health`` calls, so the daemon and the
+    blocking path produce identical audit rows. Spec § "F-015 absorption
+    clause" requires the daemon to mirror this side effect; dropping it
+    would silently shrink the operator-visible validation surface
+    during Phase 3 rollout (every daemon-driven tick would produce
+    strictly less audit data than an ``inspect_unit_health`` call on
+    the same unit).
+    """
+    if not shadows:
+        return
+    from orchestrator.tools.health import _record_shadow_event  # noqa: PLC0415
+
+    for shadow in shadows:
+        _record_shadow_event(unit, shadow)
+
+
+def _maybe_persist_snapshot(unit: WorkUnitState, report: HealthReport) -> bool:
+    """Best-effort F-014 ``health_report_snapshot`` write, ≤ once per interval.
+
+    Delegates to :func:`orchestrator.tools.health._maybe_record_snapshot`,
+    which is internally rate-limited by
+    ``ORCH_HEALTH_SNAPSHOT_INTERVAL_HOURS`` (default 24h per unit) — so
+    wiring it into the daemon's tick does NOT flood ``unit_events``.
+    Returns ``True`` if a snapshot was recorded this call.
+    """
+    from orchestrator.tools.health import _maybe_record_snapshot  # noqa: PLC0415
+
+    return _maybe_record_snapshot(unit, report)
 
 
 # --------------------------- reconciler ---------------------------
@@ -427,6 +599,12 @@ def reconcile_unit(unit_id: str) -> None:
                 return
 
     # Stage 2: F-014 probe + decide — PR / CI / merge reconciliation.
+    # ``_probe_and_decide_unit`` ALSO persists ``decision.shadow_decisions``
+    # and the rate-limited ``health_report_snapshot`` via the same
+    # ``tools.health`` helpers ``inspect_unit_health`` uses; the daemon's
+    # tick produces the same audit footprint as the blocking caller
+    # (spec § "F-015 absorption clause": F-014's shadow-decision
+    # telemetry is F-016's validation harness).
     if not _is_actionable(unit):
         return
     for action in _probe_and_decide_unit(unit):
@@ -579,22 +757,29 @@ class DaemonLoop:
         return reconcile_once()
 
     def run(self) -> int:
-        """Acquire the singleton, then loop until stopped. Returns total ticks.
+        """Acquire the singleton, then loop until stopped.
 
-        ``ORCH_DAEMON_DRIVE`` gate is checked first: an unintentional
-        ``python -m orchestrator.daemon`` on a workspace that hasn't
-        migrated returns 0 without touching the lock table. Same goes
-        for a workspace whose lock is already held by a fresh daemon —
-        :func:`claim_singleton` returns ``None`` and we bail. Both
-        outcomes log at INFO so an operator can tell the difference
-        between "I forgot the env var" and "another daemon is running".
+        Returns one of:
+
+          * the total tick count (``>= 0``) on a clean shutdown;
+          * :data:`EXIT_DRIVE_DISABLED` (``-2``) when ``ORCH_DAEMON_DRIVE``
+            isn't set to a truthy value — operator forgot the opt-in;
+          * :data:`EXIT_LOCK_HELD` (``-3``) when :func:`claim_singleton`
+            returned ``None`` — another daemon already owns the
+            workspace.
+
+        The two sentinels are negative so the CLI's ``daemon start``
+        wrapper can map them to exit codes 2 / 3 (vs. 0 for clean exit
+        and a tick count) without ambiguity, letting a systemd /
+        launchd / shell-script supervisor branch on ``$?`` to decide
+        between "nudge the operator", "retry later", and "stop trying".
         """
         if not is_drive_enabled():
             logger.info(
                 "daemon: %s not set to a truthy value — refusing to drive state",
                 DAEMON_DRIVE_ENV,
             )
-            return 0
+            return EXIT_DRIVE_DISABLED
         self.handle = claim_singleton(holder_id=self._holder_id_override)
         if self.handle is None:
             existing = state.get_daemon_lock(_state_db_path_str())
@@ -604,7 +789,7 @@ class DaemonLoop:
                 existing.get("holder_id") if existing else "?",
                 existing.get("heartbeat_at") if existing else "?",
             )
-            return 0
+            return EXIT_LOCK_HELD
 
         ticks = 0
         with self._install_signal_handlers():
@@ -665,6 +850,12 @@ def run_daemon() -> int:
     is fine. Configures a minimal stderr logger so an operator running
     the daemon in a terminal sees ``daemon: tick ...`` lines without
     plumbing log handlers themselves.
+
+    Return value semantics: see :meth:`DaemonLoop.run` — non-negative
+    is a clean shutdown tick count; :data:`EXIT_DRIVE_DISABLED` /
+    :data:`EXIT_LOCK_HELD` are the two non-zero exit paths. Pair with
+    :func:`exit_code_for_run` to turn the result into a process exit
+    code at the CLI / ``__main__`` boundary.
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -672,6 +863,33 @@ def run_daemon() -> int:
         datefmt="%H:%M:%S",
     )
     return DaemonLoop().run()
+
+
+def exit_code_for_run(ticks: int) -> int:
+    """Map :meth:`DaemonLoop.run`'s return value to a process exit code.
+
+    Three distinct outcomes downstream supervisors (systemd, launchd,
+    shell scripts) need to branch on:
+
+      * ``ticks >= 0`` → clean shutdown (whether we ticked or not).
+        Exit 0 — the canonical "service ran to completion" signal.
+      * ``ticks == EXIT_DRIVE_DISABLED`` (``-2``) → operator forgot the
+        opt-in env var. Exit 2 so a systemd ``Restart=on-failure``
+        retry policy nudges the operator without busy-looping.
+      * ``ticks == EXIT_LOCK_HELD`` (``-3``) → another daemon owns the
+        workspace. Exit 3 so a supervisor can stop trying immediately
+        (a same-workspace contention is a configuration error, not a
+        transient).
+
+    Centralised so the ``__main__`` block and the CLI's ``daemon start``
+    wrapper share one mapping — the comment block on the call site
+    stays accurate when the sentinel set grows.
+    """
+    if ticks == EXIT_LOCK_HELD:
+        return 3
+    if ticks == EXIT_DRIVE_DISABLED:
+        return 2
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover — exercised via ``orchestrator daemon start``
@@ -683,8 +901,4 @@ if __name__ == "__main__":  # pragma: no cover — exercised via ``orchestrator 
 
     load_dotenv()
     state.init_db()
-    ticks = run_daemon()
-    # Exit 0 on a clean shutdown (any positive tick count, or a no-op
-    # exit because the gate wasn't set); exit 1 if claim_singleton
-    # failed (another daemon owns the lock).
-    raise SystemExit(0 if ticks >= 0 else 1)
+    raise SystemExit(exit_code_for_run(run_daemon()))

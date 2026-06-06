@@ -171,7 +171,12 @@ class TestOptInGate:
             assert daemon.is_drive_enabled() is True
 
     def test_run_noop_when_drive_disabled(self, tmp_state_db, monkeypatch):
-        """A unit ripe for transition must NOT be touched when the env is off."""
+        """A unit ripe for transition must NOT be touched when the env is off.
+
+        Returns :data:`~orchestrator.daemon.EXIT_DRIVE_DISABLED` (PR #61
+        reviewer M2) so a supervisor can distinguish "operator forgot
+        the opt-in" from a clean-shutdown ``0``.
+        """
         monkeypatch.delenv(daemon.DAEMON_DRIVE_ENV, raising=False)
         unit = _seed_unit(status="coding", sessions={"coder": "sess_c"})
 
@@ -190,7 +195,7 @@ class TestOptInGate:
 
         monkeypatch.setattr("orchestrator.daemon.make_worker", lambda _r: _ReadyWorker())
         loop = daemon.DaemonLoop(holder_id="us")
-        assert loop.run() == 0
+        assert loop.run() == daemon.EXIT_DRIVE_DISABLED
         # Status untouched — daemon refused to drive.
         assert state.get_unit_state(unit.unit_id).status == "coding"
 
@@ -441,20 +446,65 @@ class TestF014EngineReuse:
 
     def test_probe_and_decide_delegates_to_tools_health(self, tmp_state_db, monkeypatch):
         """Patch ``tools.health._probe_and_decide`` and confirm the daemon
-        adapts its ``actions_to_apply`` list."""
-        unit = _seed_unit(status="in_ci", pr_number=42)
-        sentinel_action = Action.transition("done", "via probe")
-        from orchestrator.health import Decision
+        adapts its ``actions_to_apply`` list.
+
+        Uses a real :class:`~orchestrator.health.HealthReport` (not a
+        stub) because the daemon's ``_probe_and_decide_unit`` now also
+        persists ``decision.shadow_decisions`` + the rate-limited
+        ``health_report_snapshot`` (F-016 spec § "F-015 absorption
+        clause", PR #61 reviewer H1) — both reuse F-014's
+        :func:`~orchestrator.tools.health._maybe_record_snapshot`
+        which calls ``dataclasses.asdict(report)``. A bare class stub
+        wouldn't satisfy ``asdict``; we build a minimal real report
+        so the test exercises the delegation path end-to-end.
+        """
+        from orchestrator.health import (
+            CISnapshot,
+            Decision,
+            GitSnapshot,
+            HealthReport,
+            OrchestratorSnapshot,
+            ReviewSnapshot,
+        )
         from orchestrator.tools import health as tools_health
 
-        class _FakeReport:
-            pass
-
+        unit = _seed_unit(status="in_ci", pr_number=42)
+        sentinel_action = Action.transition("done", "via probe")
+        fake_report = HealthReport(
+            unit_id=unit.unit_id,
+            pr=None,
+            git=GitSnapshot(
+                ahead_by=None,
+                behind_by=None,
+                head_sha=None,
+                head_age_seconds=None,
+                last_force_push_at=None,
+            ),
+            ci=CISnapshot(runs=[], pending=[], failing=[], required=[], missing_required=[]),
+            reviews=ReviewSnapshot(
+                approvals=0,
+                changes_requested=0,
+                dismissed=0,
+                unresolved_threads=0,
+                codeowner_requested=[],
+                copilot_present=False,
+                copilot_state=None,
+            ),
+            workers=[],
+            orchestrator=OrchestratorSnapshot(
+                cycle=0,
+                cycle_cap=3,
+                cycles_remaining=3,
+                last_activity="",
+                last_activity_age_seconds=None,
+                downstream_blocked=0,
+            ),
+        )
         monkeypatch.setattr(
             tools_health,
             "_probe_and_decide",
             lambda _u, _repo: (
-                _FakeReport(),
+                fake_report,
                 Decision(actions_to_apply=[sentinel_action], shadow_decisions=[]),
             ),
         )
@@ -571,6 +621,8 @@ class TestConcurrentDaemonsContend:
     test harness."""
 
     def test_second_daemon_run_is_noop(self, tmp_state_db, monkeypatch):
+        """Second daemon's ``run`` returns :data:`~orchestrator.daemon.EXIT_LOCK_HELD`
+        (PR #61 reviewer M2) — distinguishable from a clean-shutdown ``0``."""
         monkeypatch.setenv(daemon.DAEMON_DRIVE_ENV, "true")
         # First daemon takes the lock.
         first = daemon.claim_singleton(holder_id="first")
@@ -578,7 +630,7 @@ class TestConcurrentDaemonsContend:
         # Second daemon tries to run — should be a no-op.
         second = daemon.DaemonLoop(holder_id="second", poll_interval_s=0.01)
         ticks = second.run()
-        assert ticks == 0
+        assert ticks == daemon.EXIT_LOCK_HELD
         # First daemon's lock untouched.
         path = str(state.STATE_DB.resolve())
         assert state.get_daemon_lock(path)["holder_id"] == "first"
