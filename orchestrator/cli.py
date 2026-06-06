@@ -147,6 +147,17 @@ def daemon_status() -> None:
 
     Read-only — does not claim, heartbeat, or release. Use to debug
     "is the daemon actually running?" without restarting it.
+
+    The JSON branch emits via :func:`click.echo` rather than
+    ``rich.Console.print`` because Rich soft-wraps at the terminal
+    width (or ~80 cols when not attached to a TTY). On macOS / Windows
+    the workspace's ``state.db`` path can run past 100 chars
+    (``/private/var/folders/...``); a wrap landing INSIDE the
+    ``state_db_path`` string value injects a raw newline into the
+    middle of a JSON string and breaks ``json.loads`` on the receiver.
+    Machine-readable output goes through the non-wrapping channel; the
+    "no lock" human hint stays on Rich so its ``[dim]`` style renders
+    when a user runs the command interactively.
     """
     import json as _json
 
@@ -155,11 +166,11 @@ def daemon_status() -> None:
     state.init_db()
     path = str(state.STATE_DB.resolve())
     row = state.get_daemon_lock(path)
-    console = Console()
     if row is None:
+        console = Console()
         console.print(f"[dim]No daemon lock for {path}[/dim]")
         raise SystemExit(0)
-    console.print(_json.dumps(row, indent=2))
+    click.echo(_json.dumps(row, indent=2))
 
 
 # --------------------------- run ---------------------------

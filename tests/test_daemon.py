@@ -526,3 +526,70 @@ class TestDaemonLoopRun:
         # Lock released on shutdown.
         path = str(state.STATE_DB.resolve())
         assert state.get_daemon_lock(path) is None
+
+
+# --------------------------- CLI: daemon status JSON ---------------------------
+
+
+class TestDaemonStatusJSONIsNotSoftWrapped:
+    """``orchestrator daemon status`` must emit machine-readable JSON
+    that survives long ``state_db_path`` values.
+
+    Rich's ``console.print`` soft-wraps at terminal width (or ~80 cols
+    when ``COLUMNS`` is unset / the stream isn't a TTY). On macOS
+    (``/private/var/folders/...``) and Windows the workspace's
+    ``state.db`` path frequently runs past 100 chars; a wrap landing
+    INSIDE the ``state_db_path`` string value injects a raw newline
+    into a JSON string and breaks ``json.loads`` on the receiver. The
+    JSON branch of ``daemon status`` must therefore go through
+    :func:`click.echo` (or another non-wrapping channel), NOT through
+    Rich's wrapping print.
+
+    This test fixes ``COLUMNS=40`` (well below any realistic
+    ``state.db`` path) and a >100-char workspace path so a Rich-print
+    regression deterministically breaks the round-trip.
+    """
+
+    def test_long_path_round_trips_through_json_loads(self, monkeypatch, tmp_path):
+        import json as _json
+
+        from click.testing import CliRunner
+
+        from orchestrator.cli import cli
+
+        # Force a narrow terminal so a wrapping writer would visibly
+        # break the JSON; production Rich uses ``shutil.get_terminal_size``
+        # which falls back to ``COLUMNS``.
+        monkeypatch.setenv("COLUMNS", "40")
+
+        # Build a workspace path well over 100 characters so a soft
+        # wrap at COLUMNS would land mid-string.
+        long_dir = tmp_path / ("x" * 120)
+        long_dir.mkdir()
+        db_path = long_dir / "state.db"
+        monkeypatch.setattr("orchestrator.state.STATE_DB", db_path)
+
+        from orchestrator import state as state_mod
+
+        state_mod.init_db()
+        resolved_path = str(db_path.resolve())
+        assert len(resolved_path) > 100, (
+            f"test fixture path too short ({len(resolved_path)} chars); "
+            "the regression only reproduces past the wrap column"
+        )
+        assert state_mod.claim_daemon_lock(resolved_path, "long-path-holder") is True
+
+        result = CliRunner().invoke(cli, ["daemon", "status"])
+        assert result.exit_code == 0, f"`daemon status` exited non-zero; output={result.output!r}"
+        # The exact assertion: the receiver can ``json.loads`` the
+        # output. A wrap injected into the JSON string would raise
+        # ``JSONDecodeError: Invalid control character``.
+        try:
+            parsed = _json.loads(result.output)
+        except _json.JSONDecodeError as e:
+            pytest.fail(
+                f"daemon status output not valid JSON (soft-wrap regression?): "
+                f"{e}\nOUTPUT:\n{result.output!r}"
+            )
+        assert parsed["state_db_path"] == resolved_path
+        assert parsed["holder_id"] == "long-path-holder"
