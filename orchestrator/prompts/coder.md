@@ -183,6 +183,25 @@ normal, build from the unit description alone in that case.
 
    PR body must include:
    - **Unit ID** (e.g. F-001-U-1)
+   - **`## TL;DR`** section near the top — three required H3 sub-sections
+     the orchestrator mirrors verbatim into `features/F-XXX/<unit_id>.md`
+     and injects into downstream worker prompts. Keep each to a few
+     lines; this is the predecessor-contract surface a future
+     coder/tester/reviewer reads first. Format:
+     ```markdown
+     ## TL;DR
+
+     ### What shipped
+     <1-3 lines — what this unit actually delivered>
+
+     ### Downstream contract
+     <data types, invariants, side effects future units rely on>
+
+     ### Decisions worth knowing
+     <key choices a downstream worker should know about>
+     ```
+     Heading names match exactly. Sub-sections you omit appear in the
+     cycle log as `_TBD — coder did not fill in this sub-section._`.
    - **What this change does** (1-3 sentences — accurate to what was done)
    - **Manual verification needed** section, if any
    - **`## Spec satisfaction`** section — mandatory when `## FEATURE SPEC`
