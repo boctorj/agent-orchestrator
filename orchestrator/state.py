@@ -17,6 +17,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from orchestrator.models import (
+    ACTIVE_UNIT_STATUSES,
+    READY_TO_MERGE_STATUSES,
     Feature,
     Plan,
     VerificationResult,
@@ -235,6 +237,20 @@ def init_db() -> None:
                 has_codeowners          INTEGER NOT NULL DEFAULT 0,
                 requires_signed_commits INTEGER NOT NULL DEFAULT 0,
                 warnings_json           TEXT NOT NULL DEFAULT '[]'
+            );
+
+            -- F-016 Phase 3 watcher-daemon singleton. One row per
+            -- workspace (keyed by the absolute state.db path) so two
+            -- daemons targeting different workspaces coexist; two
+            -- daemons targeting the same workspace contend for the row
+            -- and the loser bails. Heartbeat-based takeover lets a
+            -- restarted daemon reclaim a row left by a crashed instance
+            -- after :data:`DEFAULT_DAEMON_LOCK_STALE_AFTER_S`.
+            CREATE TABLE IF NOT EXISTS daemon_locks (
+                state_db_path TEXT PRIMARY KEY,
+                holder_id     TEXT NOT NULL,
+                heartbeat_at  TEXT NOT NULL,
+                started_at    TEXT NOT NULL
             );
             """
         )
@@ -1068,3 +1084,213 @@ def forget_verified_repo(repo_url: str) -> bool:
     with _connect() as conn:
         cur = conn.execute("DELETE FROM verified_repos WHERE repo_url = ?", (repo_url,))
         return cur.rowcount > 0
+
+
+# --------------------------- F-016 Phase 3: watcher daemon ---------------------------
+#
+# Three helpers compose the singleton-per-workspace contract from spec
+# § "Singleton enforcement — SQLite-backed, not pidfile":
+#
+#   * :func:`claim_daemon_lock` — atomic INSERT-or-stale-takeover. Returns
+#     True only when ``holder_id`` now owns the row. Fresh holders block;
+#     a row whose ``heartbeat_at`` is older than ``stale_after_s`` is
+#     reclaimable.
+#   * :func:`heartbeat_daemon_lock` — periodic UPDATE the live daemon
+#     issues each tick. Succeeds only while the caller still holds the
+#     row, so a daemon that loses the lock to a takeover sees False and
+#     can shut down cleanly.
+#   * :func:`release_daemon_lock` — symmetric DELETE on shutdown.
+#
+# The shape mirrors :func:`claim_unit_owner` / :func:`release_unit_owner`
+# at the unit level — pure CAS, no in-process locks. The lock is keyed by
+# the absolute ``state.db`` path so multiple workspaces (per
+# ``memory/user_multi_orchestrator.md``) each get their own daemon
+# without coordination.
+
+
+DEFAULT_DAEMON_LOCK_STALE_AFTER_S = 30
+"""How old ``heartbeat_at`` must be before takeover is allowed.
+
+Matches the spec's 30s window: at the default 5s poll interval the live
+daemon refreshes 5x within the budget, leaving ample headroom for GC
+pauses or a slow SQLite write. A daemon that misses six consecutive
+heartbeats is assumed dead and the next caller of
+:func:`claim_daemon_lock` reclaims the row."""
+
+
+def claim_daemon_lock(
+    state_db_path: str,
+    holder_id: str,
+    *,
+    stale_after_s: int = DEFAULT_DAEMON_LOCK_STALE_AFTER_S,
+) -> bool:
+    """Atomically claim the workspace-scoped daemon lock.
+
+    Returns ``True`` iff ``holder_id`` now owns the row. ``False`` when
+    a different holder owns the row and their ``heartbeat_at`` is fresh
+    (within ``stale_after_s`` of now).
+
+    On an empty table: writes the row unconditionally (``started_at``
+    set to the claim time).
+    On a stale row: takes over by CAS-updating against the prior
+    ``holder_id`` so two concurrent takeovers can't both win;
+    ``started_at`` is reset to the takeover time (a new daemon owns
+    the row, so its "start time" begins now).
+    On an own row: idempotently succeeds (already-claimed → no-op
+    refresh of ``heartbeat_at`` only; ``started_at`` is preserved so
+    it always reflects the original daemon-start time for this
+    holder, never the most-recent re-claim).
+
+    Args:
+        state_db_path: Absolute filesystem path of the workspace's
+            ``state.db``. Distinct workspaces produce distinct rows.
+        holder_id: Random per-daemon-start identifier (the daemon
+            generates one on each launch — never reused across
+            restarts).
+        stale_after_s: Seconds since the live row's ``heartbeat_at``
+            before takeover is permitted.
+    """
+    now = _now()
+    try:
+        now_dt = datetime.fromisoformat(now)
+    except ValueError:  # pragma: no cover — _now produces a valid iso str
+        now_dt = datetime.now(UTC)
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=UTC)
+
+    with _connect() as conn:
+        # Fast path — no row exists. SQLite's PRIMARY KEY UNIQUE collides
+        # under concurrent inserts, so we catch IntegrityError and fall
+        # through to the takeover branch rather than racing the SELECT.
+        try:
+            conn.execute(
+                "INSERT INTO daemon_locks (state_db_path, holder_id, heartbeat_at, started_at) "
+                "VALUES (?, ?, ?, ?)",
+                (state_db_path, holder_id, now, now),
+            )
+            return True
+        except sqlite3.IntegrityError:
+            pass
+
+        row = conn.execute(
+            "SELECT holder_id, heartbeat_at FROM daemon_locks WHERE state_db_path = ?",
+            (state_db_path,),
+        ).fetchone()
+        if row is None:
+            # Vanishingly rare race — the row was deleted between our
+            # INSERT and SELECT. Caller's next tick can retry.
+            return False
+        if row["holder_id"] == holder_id:
+            # Idempotent — already ours. Refresh the heartbeat so a
+            # repeated claim_daemon_lock() acts as a manual heartbeat.
+            # ``started_at`` is deliberately NOT touched: it pins the
+            # original daemon-start time for this holder so an operator
+            # / ``daemon status`` reading can compute the daemon's
+            # uptime as ``now() - started_at``. A re-claim is just a
+            # cheap heartbeat refresh, not a "new daemon".
+            conn.execute(
+                "UPDATE daemon_locks SET heartbeat_at = ? "
+                "WHERE state_db_path = ? AND holder_id = ?",
+                (now, state_db_path, holder_id),
+            )
+            return True
+
+        existing_dt: datetime | None
+        try:
+            existing_dt = datetime.fromisoformat(row["heartbeat_at"])
+        except (TypeError, ValueError):
+            existing_dt = None
+        if existing_dt is None:
+            # Conservative — a corrupted ``heartbeat_at`` (clock skew,
+            # disk corruption, hand-edit) must not silently let a new
+            # daemon snipe the active row. Treat as fresh and refuse
+            # takeover; an operator who genuinely wants to reclaim a
+            # corrupted lock can DELETE the row by hand and re-claim.
+            return False
+        if existing_dt.tzinfo is None:
+            existing_dt = existing_dt.replace(tzinfo=UTC)
+        age = (now_dt - existing_dt).total_seconds()
+        if age < stale_after_s:
+            return False
+        # Stale row — take over via CAS so a concurrent takeover can
+        # not also win.
+        cur = conn.execute(
+            "UPDATE daemon_locks SET holder_id = ?, heartbeat_at = ?, started_at = ? "
+            "WHERE state_db_path = ? AND holder_id = ?",
+            (holder_id, now, now, state_db_path, row["holder_id"]),
+        )
+        return cur.rowcount > 0
+
+
+def heartbeat_daemon_lock(state_db_path: str, holder_id: str) -> bool:
+    """Bump ``heartbeat_at``. Returns True only while ``holder_id`` still owns the row.
+
+    A False return is the daemon's signal that another instance took
+    over — the caller should shut down cleanly rather than continue
+    driving state changes.
+    """
+    now = _now()
+    with _connect() as conn:
+        cur = conn.execute(
+            "UPDATE daemon_locks SET heartbeat_at = ? WHERE state_db_path = ? AND holder_id = ?",
+            (now, state_db_path, holder_id),
+        )
+        return cur.rowcount > 0
+
+
+def release_daemon_lock(state_db_path: str, holder_id: str) -> bool:
+    """Delete the lock row iff ``holder_id`` still holds it.
+
+    Symmetric to :func:`claim_daemon_lock` — the conditional DELETE
+    means a daemon that lost the lock to takeover can not accidentally
+    release the new holder's row on its own shutdown path.
+    """
+    with _connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM daemon_locks WHERE state_db_path = ? AND holder_id = ?",
+            (state_db_path, holder_id),
+        )
+        return cur.rowcount > 0
+
+
+def get_daemon_lock(state_db_path: str) -> dict | None:
+    """Read the current lock row, or ``None`` if no daemon holds it.
+
+    Used by the CLI's ``orchestrator daemon status`` subcommand to
+    report ``{holder_id, heartbeat_at, started_at}`` without taking the
+    lock itself.
+    """
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM daemon_locks WHERE state_db_path = ?", (state_db_path,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+# --------------------------- F-016 Phase 3: active-unit query ---------------------------
+
+
+def list_active_units() -> list[WorkUnitState]:
+    """Every ``work_units`` row the daemon should reconcile each tick.
+
+    Includes :data:`~orchestrator.models.ACTIVE_UNIT_STATUSES` (the agent-
+    driving statuses) plus :data:`~orchestrator.models.READY_TO_MERGE_STATUSES`
+    (``approved_awaiting_merge``) so F-014's ``merged → done`` reconcile
+    fires once the human merges. Terminal (``done`` / ``escalated``) and
+    sticky-cancel (``cancelled``) rows are excluded; the daemon's per-unit
+    ``cancelled_at`` short-circuit catches cancels that races a transition.
+
+    Ordered by ``last_activity`` so the oldest-touched units (the most
+    likely to need a heartbeat or marker re-scan) reconcile first.
+    """
+    statuses = tuple(ACTIVE_UNIT_STATUSES | READY_TO_MERGE_STATUSES)
+    placeholders = ",".join("?" * len(statuses))
+    with _connect() as conn:
+        # ``placeholders`` is a fixed ?,?,? string sized to the static
+        # status tuple; values bind via ``statuses`` — no user input.
+        rows = conn.execute(
+            f"SELECT * FROM work_units WHERE status IN ({placeholders}) "  # noqa: S608  # nosec B608
+            "ORDER BY last_activity",
+            statuses,
+        ).fetchall()
+    return [WorkUnitState(**dict(r)) for r in rows]
