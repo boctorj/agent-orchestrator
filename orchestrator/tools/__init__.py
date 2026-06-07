@@ -430,6 +430,19 @@ def compose_fix_task(
             f"possible)."
         )
 
+    # FEEDBACK label has to match the actual source-of-truth contract: for
+    # tester / reviewer / human, the inline review threads on the PR ARE the
+    # source of truth and FEEDBACK is just the orchestrator's tag pointing
+    # there; for ci / ultrareview, there are no inline anchors so FEEDBACK
+    # IS the full source of truth. Using the "actionable detail lives in
+    # PR comments" label on the latter group misleads the coder into
+    # fetching threads that don't exist for the cycle (and the variant
+    # guidance directly contradicts it — Copilot review on PR #51).
+    if source in ("ci", "ultrareview"):
+        feedback_label = "FEEDBACK (full context — no inline review threads for this source)"
+    else:
+        feedback_label = "FEEDBACK (orchestrator summary — actionable detail lives in PR comments)"
+
     return f"""You have feedback to address on your existing work for unit {unit.id}.
 
 REPO_URL:  {feature.repo_path}
@@ -437,7 +450,7 @@ BRANCH:    {branch} (your branch, already checked out from your previous turn)
 PR_NUMBER: {pr_number}
 SOURCE:    {source}
 
-FEEDBACK (orchestrator summary — actionable detail lives in PR comments):
+{feedback_label}:
 {feedback}
 
 {guidance}

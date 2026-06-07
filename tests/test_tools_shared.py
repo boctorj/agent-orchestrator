@@ -197,6 +197,40 @@ class TestComposeTasks:
         assert "PR_NUMBER: 42" in out
         assert "SOURCE:    tester" in out
 
+    def test_fix_task_feedback_label_source_conditional(self, sample_feature, sample_unit):
+        """FEEDBACK label has to match the source-of-truth contract:
+
+          * tester / reviewer / human → "actionable detail lives in PR comments"
+            (inline review threads ARE the source of truth; FEEDBACK is the tag)
+          * ci / ultrareview → "full context — no inline review threads"
+            (no inline anchors exist; FEEDBACK is the full source of truth)
+
+        Without this, the fixed label "actionable detail lives in PR comments"
+        misleads a coder resumed for ci / ultrareview into fetching inline
+        threads that don't exist for the cycle, contradicting the in-message
+        guidance. (Copilot review on PR #51.)
+        """
+        thread_sources = ("tester", "reviewer", "human")
+        threadless_sources = ("ci", "ultrareview")
+        thread_label = "actionable detail lives in PR comments"
+        threadless_label = "no inline review threads"
+
+        for src in thread_sources:
+            out = compose_fix_task(sample_feature, sample_unit, "branch", 42, src, "fb")
+            assert thread_label in out, (
+                f"source={src!r} must use the 'PR comments' label (inline "
+                f"threads are the source of truth)"
+            )
+            assert threadless_label not in out
+
+        for src in threadless_sources:
+            out = compose_fix_task(sample_feature, sample_unit, "branch", 42, src, "fb")
+            assert threadless_label in out, (
+                f"source={src!r} must use the 'no inline review threads' label "
+                f"(FEEDBACK is the full source of truth)"
+            )
+            assert thread_label not in out
+
 
 # --------------------------- constants ---------------------------
 
