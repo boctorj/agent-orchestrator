@@ -524,3 +524,180 @@ class TestExplicitVariantsAlwaysExist:
 
     def test_blocking_callable_at_module_scope(self):
         assert callable(execution.cycle_review_blocking)
+
+
+# --------------------------- PR #64 reviewer regressions ---------------------------
+
+
+class TestAsyncHandoffMessageIsHonest:
+    """Reviewer H1: the async-handoff response previously claimed
+    "The daemon will drive the unit to terminal and ntfy will push on
+    completion." The U-5 daemon (``orchestrator.daemon``) only observes
+    existing worker sessions and applies F-014 PR-merge transitions; it
+    does NOT spawn the next-phase worker, so a unit handed off after the
+    coder finishes strands in ``in_ci`` until something kicks the
+    pipeline forward. The honest message tells the operator that and
+    points them at ``advance_to_*`` / ``cycle_review_blocking`` for
+    actual progression."""
+
+    def test_handoff_message_does_not_promise_terminal_drive(self, tmp_state_db, with_github_token):
+        _seed_coded_unit()
+        _seed_daemon_lock()
+        out = execution.cycle_review_async("F-001", "F-016-U-6-T")
+        parsed = json.loads(out)
+        msg = parsed["message"]
+        assert "drive the unit to terminal" not in msg, (
+            f"async-handoff message claims terminal drive (reviewer H1); got: {msg!r}"
+        )
+
+    def test_handoff_message_points_at_advance_or_blocking(self, tmp_state_db, with_github_token):
+        _seed_coded_unit()
+        _seed_daemon_lock()
+        out = execution.cycle_review_async("F-001", "F-016-U-6-T")
+        parsed = json.loads(out)
+        msg = parsed["message"].lower()
+        assert "advance_to_tester" in msg or "cycle_review_blocking" in msg, (
+            f"async-handoff message must direct the user at the actual "
+            f"forward path; got: {parsed['message']!r}"
+        )
+
+    def test_handoff_message_names_u7_for_full_drive(self, tmp_state_db, with_github_token):
+        """The U-7 reference tells the operator when end-to-end drive
+        actually lands; without it the message reads like a permanent
+        limitation."""
+        _seed_coded_unit()
+        _seed_daemon_lock()
+        out = execution.cycle_review_async("F-001", "F-016-U-6-T")
+        parsed = json.loads(out)
+        assert "U-7" in parsed["message"] or "F-016-U-7" in parsed["message"], (
+            f"async-handoff message must reference U-7 (the unit that lands "
+            f"full daemon drive); got: {parsed['message']!r}"
+        )
+
+
+class TestDispatcherCallsDaemonHealthOnce:
+    """Reviewer M1: the dispatcher and ``cycle_review_async`` each used
+    to call ``_daemon_health`` independently, doubling SQLite reads on
+    the ≤2 s p95 path AND opening a TOCTOU window where the two reads
+    could disagree about the daemon's liveness. One call per dispatcher
+    entry; the snapshot is threaded through the impl helper."""
+
+    def test_ntfy_set_path_calls_daemon_health_exactly_once(
+        self, tmp_state_db, with_github_token, monkeypatch, with_ntfy_topic
+    ):
+        _seed_coded_unit()
+        _seed_daemon_lock()
+        original = execution._daemon_health
+        calls: list[int] = []
+
+        def counting_health():
+            calls.append(1)
+            return original()
+
+        monkeypatch.setattr(execution, "_daemon_health", counting_health)
+        execution.cycle_review("F-001", "F-016-U-6-T")
+        assert sum(calls) == 1, (
+            f"cycle_review with NTFY set should call _daemon_health "
+            f"exactly once per dispatch; got {sum(calls)} (reviewer M1)."
+        )
+
+
+class TestDispatcherShortCircuitsOnVerificationError:
+    """Reviewer M2: the dispatcher prepended the NTFY nudge to the
+    blocking variant's non-JSON ``ERROR: target repo … not verified``
+    string. The verification ERROR is the real blocker; the NTFY nudge
+    is unrelated noise that confuses the user about which message to
+    act on. Verification short-circuits at the dispatcher entry, before
+    any nudge logic runs — matching the NTFY+daemon path which already
+    returned the ERROR verbatim (line 2870 in ``cycle_review_async``'s
+    entry guard)."""
+
+    def test_unverified_repo_returns_error_without_nudge(
+        self, tmp_state_db, with_github_token, monkeypatch, no_ntfy_topic
+    ):
+        # Seed a feature whose repo is NOT in the pre-verified list.
+        unverified = "https://github.com/never/verified"
+        state.save_feature(
+            Feature(
+                id="F-001",
+                title="t",
+                description="d",
+                repo_path=unverified,
+                status="approved",
+            )
+        )
+        state.save_plan(
+            "F-001",
+            [
+                WorkUnit(
+                    id="F-016-U-6-T",
+                    feature_id="F-001",
+                    title="u1",
+                    description="impl this",
+                ),
+            ],
+        )
+        state.approve_plan("F-001")
+        state.upsert_unit_state(
+            WorkUnitState(
+                unit_id="F-016-U-6-T",
+                feature_id="F-001",
+                status="in_ci",
+                branch="b",
+                pr_number=5,
+                coder_session_id="sesn-c",
+            )
+        )
+        out = execution.cycle_review("F-001", "F-016-U-6-T")
+        # The verification gate's canonical ERROR is what the lead should
+        # surface; the NTFY nudge must NOT be prepended or appended to it.
+        assert "ERROR" in out and "not verified" in out
+        assert "NTFY_TOPIC" not in out, (
+            f"dispatcher prepended the NTFY nudge to an unrelated "
+            f"verification ERROR (reviewer M2); got: {out[:400]!r}"
+        )
+
+
+class TestNudgesAreModuleConstants:
+    """Reviewer M3: the daemon-down nudge was a literal string buried
+    inside the dispatcher body while its peer ``_CYCLE_REVIEW_NTFY_NUDGE``
+    was a module constant with a docstring. Asymmetric for two strings
+    with identical lifecycle (one-time setup hints) and identical
+    surface (the ``nudge`` JSON field). Both promoted to module
+    constants so tests can reference them by name."""
+
+    def test_daemon_down_nudge_is_module_constant(self):
+        assert hasattr(execution, "_CYCLE_REVIEW_DAEMON_DOWN_NUDGE"), (
+            "daemon-down nudge must be a module-level constant peer to "
+            "_CYCLE_REVIEW_NTFY_NUDGE (reviewer M3)."
+        )
+        nudge = execution._CYCLE_REVIEW_DAEMON_DOWN_NUDGE
+        assert "daemon" in nudge.lower()
+
+    def test_dispatcher_uses_module_constant_for_daemon_down(
+        self, tmp_state_db, with_github_token, monkeypatch, with_ntfy_topic
+    ):
+        """The dispatcher emits the module constant verbatim — patching
+        the constant must change the user-visible nudge."""
+        _seed_coded_unit()
+        # No daemon_locks row seeded → daemon down branch.
+        monkeypatch.setattr(
+            execution,
+            "_CYCLE_REVIEW_DAEMON_DOWN_NUDGE",
+            "SENTINEL daemon-down nudge for reviewer M3 lockdown",
+        )
+        monkeypatch.setattr(
+            execution,
+            "spawn_tester",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "TESTS_PASS", "session_id": "t"}),
+        )
+        monkeypatch.setattr(
+            execution,
+            "spawn_reviewer",
+            lambda f, u: json.dumps(
+                {"unit_id": u, "outcome": "REVIEW_RECOMMEND_MERGE", "session_id": "r"}
+            ),
+        )
+        _stub_github(monkeypatch)
+        out = execution.cycle_review("F-001", "F-016-U-6-T")
+        assert "SENTINEL daemon-down nudge for reviewer M3 lockdown" in out
