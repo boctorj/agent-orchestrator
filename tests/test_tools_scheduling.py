@@ -279,7 +279,10 @@ def test_run_one_cycle_raises(tmp_state_db, monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("cycle exploded")
 
-    monkeypatch.setattr(scheduling, "cycle_review", boom)
+    # Thread-pool callers always block, so _run_one routes through the
+    # explicit blocking variant (F-016-U-6). Patch THAT symbol — patching
+    # the legacy dispatcher would no-op.
+    monkeypatch.setattr(scheduling, "cycle_review_blocking", boom)
     out = scheduling._run_one("F-001", "U-X")
     assert out["phase"] == "cycle"
     assert "error" in out
@@ -293,7 +296,7 @@ def test_run_one_happy_path(tmp_state_db, monkeypatch):
     )
     monkeypatch.setattr(
         scheduling,
-        "cycle_review",
+        "cycle_review_blocking",
         lambda f, u: json.dumps({"outcome": "approved_awaiting_merge", "message": "ok"}),
     )
     out = scheduling._run_one("F-001", "U-X")
