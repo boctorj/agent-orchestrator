@@ -58,7 +58,6 @@ from orchestrator.cycle_log_render import (
 from orchestrator.models import Feature, WorkUnit, WorkUnitState
 from orchestrator.tools import _render_context_blocks, execution
 
-
 # --------------------------- shared fakes ---------------------------
 
 
@@ -173,9 +172,7 @@ class TestUnchangedAllowListAndCallSite:
                 "rely on the kwargs form"
             )
 
-    def test_predecessor_summaries_still_calls_cycle_log_summary(
-        self, monkeypatch
-    ) -> None:
+    def test_predecessor_summaries_still_calls_cycle_log_summary(self, monkeypatch) -> None:
         """``execution._predecessor_summaries`` must invoke ``cycle_log.cycle_log_summary``.
 
         Unit description: "no changes to ... ``execution.py:57``." The
@@ -325,23 +322,13 @@ class TestEndToEndWriterReadSummary:
         runner = _FakeRunner()
         runner.register(
             ("gh", "pr", "view"),
-            _FakeProc(
-                stdout=json.dumps(
-                    {"title": "T", "body": pr_body, "headRefOid": "deadbeef"}
-                )
-            ),
+            _FakeProc(stdout=json.dumps({"title": "T", "body": pr_body, "headRefOid": "deadbeef"})),
         )
         runner.register(
             ("gh", "api", "graphql"),
             _FakeProc(
                 stdout=json.dumps(
-                    {
-                        "data": {
-                            "repository": {
-                                "pullRequest": {"reviewThreads": {"nodes": []}}
-                            }
-                        }
-                    }
+                    {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}}
                 )
             ),
         )
@@ -356,9 +343,7 @@ class TestEndToEndWriterReadSummary:
         monkeypatch.setattr(cycle_log, "cycle_log_base_dir", lambda: tmp_path)
         runner = self._make_runner_with_pr_body(self.PR_BODY)
 
-        target = cycle_log.write_cycle_log(
-            "F-017-U-1", base_dir=tmp_path, run=runner
-        )
+        target = cycle_log.write_cycle_log("F-017-U-1", base_dir=tmp_path, run=runner)
         assert target.is_file(), "writer didn't materialize the cycle log"
 
         full = cycle_log.read_cycle_log("F-017-U-1", base_dir=tmp_path)
@@ -459,19 +444,13 @@ class TestTldrStructuralPlacement:
         h2_iter = list(_re.finditer(r"^## [^#\n][^\n]*$", md, _re.MULTILINE))
         h2_positions = [(m.start(), m.group(0)) for m in h2_iter]
 
-        between_pr_and_tldr = [
-            (pos, head)
-            for pos, head in h2_positions
-            if idx_pr < pos < idx_tldr
-        ]
+        between_pr_and_tldr = [(pos, head) for pos, head in h2_positions if idx_pr < pos < idx_tldr]
         assert between_pr_and_tldr == [], (
             f"unexpected H2 between '## PR' and '## TL;DR': {between_pr_and_tldr}"
         )
 
         between_tldr_and_desc = [
-            (pos, head)
-            for pos, head in h2_positions
-            if idx_tldr < pos < idx_desc
+            (pos, head) for pos, head in h2_positions if idx_tldr < pos < idx_desc
         ]
         assert between_tldr_and_desc == [], (
             f"unexpected H2 between '## TL;DR' and '## Coder's PR description': "
@@ -491,9 +470,8 @@ class TestCoderPromptMirrorsTbdWording:
     @pytest.fixture(scope="class")
     def coder_prompt(self) -> str:
         return (
-            (Path(__file__).resolve().parent.parent / "orchestrator" / "prompts" / "coder.md")
-            .read_text(encoding="utf-8")
-        )
+            Path(__file__).resolve().parent.parent / "orchestrator" / "prompts" / "coder.md"
+        ).read_text(encoding="utf-8")
 
     def test_prompt_mentions_tbd_placeholder_wording(self, coder_prompt: str) -> None:
         """Coder prompt names the placeholder so the coder knows the consequence."""
