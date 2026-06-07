@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import os
 import signal
 import threading
@@ -246,9 +247,12 @@ def reset_worker_cache() -> None:
 #   the natural follow-up) or the cross-cycle backflip becomes
 #   reachable. The
 #   ``tests/test_f016_u5_tester_extras.py::TestStaleMarkerNoBackflip``
-#   suite covers the downstream-status case; the new
-#   ``TestCallerSessionClearInvariant`` suite below pins the
-#   cross-cycle invariant on the production helpers.
+#   suite covers the in-scope downstream-status case; the cross-cycle
+#   invariant is documented (here) rather than test-pinned at this
+#   layer — pinning it would require a contract test on
+#   ``orchestrator.tools.execution._tester_phase`` /
+#   ``_reviewer_phase``, which is the right home for the assertion and
+#   the natural sibling of the U-6/U-7 fence work.
 _MARKER_SOURCE_STATUSES: dict[tuple[str, str], frozenset[str]] = {
     ("coder", "PR_URL"): frozenset({"coding", "opening_pr"}),
     ("coder", "FIX_PUSHED"): frozenset({"coding", "opening_pr", "fixing"}),
@@ -277,6 +281,15 @@ def _poll_interval_s() -> float:
     """Resolved poll interval from ``ORCH_DAEMON_POLL_INTERVAL_S`` or default.
 
     Floor of 0.1s so a misconfigured zero doesn't busy-spin SQLite.
+
+    Defensive rejection of non-finite values (``nan`` / ``inf`` /
+    ``-inf``) — these are valid ``float`` parses but propagating them
+    into :meth:`threading.Event.wait` would either hang the loop
+    forever (``inf``) or wake immediately on every iteration in a CPU
+    spin (``nan`` returns False from ``wait`` instantly on CPython). An
+    operator who set ``ORCH_DAEMON_POLL_INTERVAL_S=inf`` to "disable
+    polling" must see the daemon fall back to the safe default rather
+    than freeze the workspace.
     """
     raw = os.getenv(POLL_INTERVAL_ENV, "").strip()
     if not raw:
@@ -284,6 +297,14 @@ def _poll_interval_s() -> float:
     try:
         parsed = float(raw)
     except ValueError:
+        return POLL_INTERVAL_DEFAULT_S
+    if not math.isfinite(parsed):
+        logger.warning(
+            "daemon: %s=%r is not finite; falling back to %.1fs",
+            POLL_INTERVAL_ENV,
+            raw,
+            POLL_INTERVAL_DEFAULT_S,
+        )
         return POLL_INTERVAL_DEFAULT_S
     return max(0.1, parsed)
 

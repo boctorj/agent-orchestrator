@@ -1130,11 +1130,16 @@ def claim_daemon_lock(
     a different holder owns the row and their ``heartbeat_at`` is fresh
     (within ``stale_after_s`` of now).
 
-    On an empty table: writes the row unconditionally.
+    On an empty table: writes the row unconditionally (``started_at``
+    set to the claim time).
     On a stale row: takes over by CAS-updating against the prior
-    ``holder_id`` so two concurrent takeovers can't both win.
+    ``holder_id`` so two concurrent takeovers can't both win;
+    ``started_at`` is reset to the takeover time (a new daemon owns
+    the row, so its "start time" begins now).
     On an own row: idempotently succeeds (already-claimed → no-op
-    refresh of ``heartbeat_at`` / ``started_at``).
+    refresh of ``heartbeat_at`` only; ``started_at`` is preserved so
+    it always reflects the original daemon-start time for this
+    holder, never the most-recent re-claim).
 
     Args:
         state_db_path: Absolute filesystem path of the workspace's
@@ -1178,6 +1183,11 @@ def claim_daemon_lock(
         if row["holder_id"] == holder_id:
             # Idempotent — already ours. Refresh the heartbeat so a
             # repeated claim_daemon_lock() acts as a manual heartbeat.
+            # ``started_at`` is deliberately NOT touched: it pins the
+            # original daemon-start time for this holder so an operator
+            # / ``daemon status`` reading can compute the daemon's
+            # uptime as ``now() - started_at``. A re-claim is just a
+            # cheap heartbeat refresh, not a "new daemon".
             conn.execute(
                 "UPDATE daemon_locks SET heartbeat_at = ? "
                 "WHERE state_db_path = ? AND holder_id = ?",

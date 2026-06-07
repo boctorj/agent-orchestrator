@@ -130,6 +130,24 @@ class TestPollInterval:
         monkeypatch.setenv(daemon.POLL_INTERVAL_ENV, "not-a-number")
         assert daemon._poll_interval_s() == daemon.POLL_INTERVAL_DEFAULT_S
 
+    @pytest.mark.parametrize("raw", ["nan", "NaN", "inf", "-inf", "Infinity"])
+    def test_non_finite_rejected(self, monkeypatch, raw):
+        """PR #61 Copilot 2: ``nan`` / ``inf`` parse as valid ``float`` but
+        propagating either into :meth:`threading.Event.wait` would either
+        hang the loop forever (``inf``) or burn CPU on instant wake-ups
+        (``nan``). Operator-controlled env vars must NOT silently break
+        the loop semantics — fall back to the default and warn."""
+        monkeypatch.setenv(daemon.POLL_INTERVAL_ENV, raw)
+        assert daemon._poll_interval_s() == daemon.POLL_INTERVAL_DEFAULT_S
+
+    def test_negative_finite_floors_to_min(self, monkeypatch):
+        """A finite negative value still gets floored by ``max(0.1, ...)``
+        so the loop never gets a zero or negative wait — keeps the
+        Event.wait contract intact even if an operator sets
+        ``ORCH_DAEMON_POLL_INTERVAL_S=-5``."""
+        monkeypatch.setenv(daemon.POLL_INTERVAL_ENV, "-5")
+        assert daemon._poll_interval_s() == 0.1
+
 
 # --------------------------- marker scan + record ---------------------------
 

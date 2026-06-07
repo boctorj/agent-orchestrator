@@ -1047,6 +1047,29 @@ class TestDaemonLockClaim:
         # Same holder, but heartbeat refreshed.
         assert after >= before
 
+    def test_own_holder_reclaim_preserves_started_at(self, tmp_state_db):
+        """``started_at`` is the daemon's process-start time and must NOT
+        be overwritten by a re-claim heartbeat (PR #61 Copilot 1).
+
+        A re-claim is just a cheap heartbeat refresh, not a "new daemon" —
+        ``daemon status`` / monitoring relies on ``now - started_at``
+        being the live daemon's uptime, not the time since the most
+        recent re-claim.
+        """
+        state.claim_daemon_lock(self.PATH, "h1")
+        original_started_at = state.get_daemon_lock(self.PATH)["started_at"]
+        # Sleep so a wall-clock comparison can detect an accidental
+        # overwrite even on coarse-grained clocks.
+        time.sleep(0.05)
+        assert state.claim_daemon_lock(self.PATH, "h1") is True
+        after = state.get_daemon_lock(self.PATH)
+        assert after["started_at"] == original_started_at, (
+            f"re-claim overwrote started_at: was {original_started_at!r}, "
+            f"now {after['started_at']!r}"
+        )
+        # heartbeat_at should still have moved forward as the docstring promises.
+        assert after["heartbeat_at"] >= original_started_at
+
     def test_stale_heartbeat_allows_takeover(self, tmp_state_db):
         state.claim_daemon_lock(self.PATH, "h1")
         _age_lock(self.PATH, age_seconds=60)
