@@ -3040,7 +3040,24 @@ def cycle_review_blocking(feature_id: str, unit_id: str) -> str:
     """
     if err := ensure_verified_for_feature(feature_id):
         return err
+    return _cycle_review_blocking_impl(feature_id, unit_id)
 
+
+def _cycle_review_blocking_impl(feature_id: str, unit_id: str) -> str:
+    """Engine body of :func:`cycle_review_blocking` — assumes verified.
+
+    Always returns the JSON string ``_emit_terminal`` produces (success
+    OR escalation). The verification gate lives in the public
+    :func:`cycle_review_blocking` wrapper so direct MCP callers keep the
+    gate; the dispatcher calls this impl directly because it has already
+    verified at its own entry, avoiding a redundant SQLite read (PR #64
+    reviewer M2).
+
+    Side benefit: the dispatcher can now treat the return value as
+    guaranteed JSON, so attaching the ``nudge`` field never has to wrap
+    a non-JSON ``ERROR: …`` string with the unrelated NTFY hint —
+    closes the original M2 bug at its source.
+    """
     ctx = CycleContext(feature_id=feature_id, unit_id=unit_id, history=[])
 
     ok, msg = _run_tester_advance(ctx)
@@ -3114,15 +3131,16 @@ def cycle_review(feature_id: str, unit_id: str) -> str:
     # Both are one-time setup nudges, not per-call noise.
     nudge = _CYCLE_REVIEW_DAEMON_DOWN_NUDGE if ntfy_set else _CYCLE_REVIEW_NTFY_NUDGE
 
-    blocking_result = cycle_review_blocking(feature_id, unit_id)
-    try:
-        parsed = json.loads(blocking_result)
-    except (json.JSONDecodeError, TypeError):
-        return f"{nudge}\n\n{blocking_result}"
-    if isinstance(parsed, dict):
-        parsed["nudge"] = nudge
-        return json.dumps(parsed, indent=2)
-    return blocking_result
+    # Call the impl directly (skipping the redundant verify gate; we
+    # already verified at the dispatcher entry, PR #64 reviewer M2).
+    # The impl is guaranteed to return JSON from ``_emit_terminal``, so
+    # the dispatcher can attach ``nudge`` unconditionally — no risk of
+    # the original M2 bug class where the NTFY hint piggybacked on an
+    # unrelated ``ERROR: target repo … not verified`` string.
+    blocking_result = _cycle_review_blocking_impl(feature_id, unit_id)
+    parsed = json.loads(blocking_result)
+    parsed["nudge"] = nudge
+    return json.dumps(parsed, indent=2)
 
 
 # --------------------------- send_to_unit (low-level) ---------------------------

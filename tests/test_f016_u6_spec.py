@@ -612,10 +612,7 @@ class TestDispatcherShortCircuitsOnVerificationError:
     returned the ERROR verbatim (line 2870 in ``cycle_review_async``'s
     entry guard)."""
 
-    def test_unverified_repo_returns_error_without_nudge(
-        self, tmp_state_db, with_github_token, monkeypatch, no_ntfy_topic
-    ):
-        # Seed a feature whose repo is NOT in the pre-verified list.
+    def _seed_unverified(self):
         unverified = "https://github.com/never/verified"
         state.save_feature(
             Feature(
@@ -648,6 +645,11 @@ class TestDispatcherShortCircuitsOnVerificationError:
                 coder_session_id="sesn-c",
             )
         )
+
+    def test_unverified_repo_returns_error_without_nudge(
+        self, tmp_state_db, with_github_token, monkeypatch, no_ntfy_topic
+    ):
+        self._seed_unverified()
         out = execution.cycle_review("F-001", "F-016-U-6-T")
         # The verification gate's canonical ERROR is what the lead should
         # surface; the NTFY nudge must NOT be prepended or appended to it.
@@ -655,6 +657,62 @@ class TestDispatcherShortCircuitsOnVerificationError:
         assert "NTFY_TOPIC" not in out, (
             f"dispatcher prepended the NTFY nudge to an unrelated "
             f"verification ERROR (reviewer M2); got: {out[:400]!r}"
+        )
+
+    def test_dispatcher_skips_blocking_path_redundant_verify(
+        self, tmp_state_db, with_github_token, monkeypatch, no_ntfy_topic
+    ):
+        """Reviewer M2 follow-through: the dispatcher already verified at
+        its own entry, so re-verifying inside the blocking call is
+        wasted SQLite work. The dispatcher routes through the
+        ``_cycle_review_blocking_impl`` private helper that skips the
+        gate — patching ``ensure_verified_for_feature`` to a counter and
+        invoking the verified-repo happy path must show exactly ONE
+        verify call (the dispatcher's own)."""
+        _seed_coded_unit()
+        from orchestrator.tools import (
+            execution as execution_mod,
+        )
+
+        verify_calls: list[str] = []
+        original = execution_mod.ensure_verified_for_feature
+
+        def counting_verify(fid):
+            verify_calls.append(fid)
+            return original(fid)
+
+        monkeypatch.setattr(execution_mod, "ensure_verified_for_feature", counting_verify)
+        monkeypatch.setattr(
+            execution,
+            "spawn_tester",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "TESTS_PASS", "session_id": "t"}),
+        )
+        monkeypatch.setattr(
+            execution,
+            "spawn_reviewer",
+            lambda f, u: json.dumps(
+                {"unit_id": u, "outcome": "REVIEW_RECOMMEND_MERGE", "session_id": "r"}
+            ),
+        )
+        _stub_github(monkeypatch)
+        execution.cycle_review("F-001", "F-016-U-6-T")
+        assert verify_calls == ["F-001"], (
+            f"dispatcher should verify exactly once per call; got "
+            f"{verify_calls} (reviewer M2 follow-through)."
+        )
+
+    def test_blocking_mcp_tool_still_verifies(self, tmp_state_db, with_github_token, no_ntfy_topic):
+        """The public ``cycle_review_blocking`` MCP tool must KEEP its
+        own verification gate — direct callers (operators using the
+        explicit blocking variant from the lead chat) don't go through
+        the dispatcher's entry-gate. Refusing to verify here would
+        regress the branch-protection policy on a public MCP surface."""
+        self._seed_unverified()
+        out = execution.cycle_review_blocking("F-001", "F-016-U-6-T")
+        assert "ERROR" in out and "not verified" in out, (
+            "cycle_review_blocking lost its verification gate; the "
+            "explicit blocking variant is a public MCP surface and must "
+            "still enforce verify_repo (reviewer M2 boundary)."
         )
 
 
