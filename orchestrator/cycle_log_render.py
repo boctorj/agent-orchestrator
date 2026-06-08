@@ -13,6 +13,7 @@ Schema reference: ``docs/PROPOSAL-feature-spec-and-headless-daemon.md``
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from orchestrator import state
@@ -25,6 +26,20 @@ from orchestrator.models import WorkUnit
 # reworded, the import in ``cycle_log.py`` fails loudly instead of
 # silently degrading to a no-op stripper.
 PR_DESCRIPTION_HEADING = "## Coder's PR description (verbatim, as of last capture)"
+
+# F-017 § Acceptance: every new cycle log carries a ``## TL;DR`` block
+# between ``## PR`` and ``## Coder's PR description``, with three
+# required H3 sub-headings (always present — empty sub-sections get a
+# TBD placeholder so downstream prompts remain grep-stable).
+TLDR_HEADING = "## TL;DR"
+TLDR_SUBHEADINGS: tuple[str, ...] = (
+    "### What shipped",
+    "### Downstream contract",
+    "### Decisions worth knowing",
+)
+# F-017 § Decisions: "Empty sub-sections still emit the heading with a
+# TBD placeholder — callers and tests can rely on heading presence."
+TLDR_PLACEHOLDER = "_TBD — coder did not fill in this sub-section._"
 
 
 def _unit_basename(unit_id: str) -> str:
@@ -151,6 +166,54 @@ def _render_pr_description(pr_info: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _extract_tldr_subsections(pr_body: str) -> dict[str, str]:
+    """Mirror the coder PR body's three canonical ``### `` sub-sections.
+
+    Returns ``{sub_heading: content}`` keyed by the canonical names in
+    :data:`TLDR_SUBHEADINGS`. Missing sub-sections map to ``""``; the
+    renderer then substitutes :data:`TLDR_PLACEHOLDER` per F-017
+    § Decisions ("Empty sub-sections still emit the heading with a TBD
+    placeholder").
+
+    Matching is *strict* on the canonical heading text (F-017 § Open
+    questions — revisit only if reviewers report frequent mismatches).
+    A sub-section's body runs from the heading line to the next markdown
+    heading at any level, or EOF.
+    """
+    found: dict[str, str] = dict.fromkeys(TLDR_SUBHEADINGS, "")
+    if not pr_body:
+        return found
+    for name in TLDR_SUBHEADINGS:
+        # Strict canonical-heading match: only spaces/tabs may follow the
+        # canonical text on the heading line. Without that anchor, the
+        # extractor would silently match prefix collisions like
+        # ``### What shippedness`` and mirror the wrong content
+        # (Copilot PR #63 review). Sub-section body then runs to the next
+        # markdown heading at any level, or EOF.
+        pattern = rf"^{re.escape(name)}[ \t]*\n(?P<content>.*?)(?=^#{{1,}}\s|\Z)"
+        m = re.search(pattern, pr_body, re.MULTILINE | re.DOTALL)
+        if m:
+            found[name] = m.group("content").strip()
+    return found
+
+
+def _render_tldr(pr_info: dict[str, Any]) -> list[str]:
+    """Render the ``## TL;DR`` block from the coder's PR body.
+
+    Always emits the H2 heading and all three H3 sub-headings — missing
+    sub-sections fall through to :data:`TLDR_PLACEHOLDER` so the format
+    stays grep-stable (F-017 § Acceptance #1, #4) and the downstream
+    worker prompt content is predictable (F-017 § Decisions).
+    """
+    sections = _extract_tldr_subsections(pr_info.get("body") or "")
+    lines = [TLDR_HEADING]
+    for name in TLDR_SUBHEADINGS:
+        lines.append("")
+        lines.append(name)
+        lines.append(sections[name] or TLDR_PLACEHOLDER)
+    return lines
+
+
 def _render_cycle_history(
     events: list[dict[str, Any]],
     *,
@@ -274,6 +337,10 @@ def render_cycle_log(
             status_ts=unit_state.last_activity if unit_state else "",
             merge_commit_sha=merge_commit_sha,
         ),
+        # F-017: TL;DR sits *above* the strip boundary used by
+        # ``cycle_log.cycle_log_summary`` so predecessor injection naturally
+        # picks it up — no caller change needed.
+        _render_tldr(pr_info),
         _render_pr_description(pr_info),
         _render_cycle_history(
             state.list_events(unit_id) if unit_state else [],
@@ -286,5 +353,8 @@ def render_cycle_log(
 
 __all__ = [
     "PR_DESCRIPTION_HEADING",
+    "TLDR_HEADING",
+    "TLDR_PLACEHOLDER",
+    "TLDR_SUBHEADINGS",
     "render_cycle_log",
 ]
