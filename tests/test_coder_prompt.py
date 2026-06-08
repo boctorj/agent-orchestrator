@@ -133,3 +133,65 @@ class TestRebaseConflictBlockedEscape:
         assert "BLOCKED: reason=" in rebase_section, (
             "rebase section doesn't show the structured BLOCKED format"
         )
+
+
+# --------------------------- F-018 merge-source guidance ---------------------------
+
+
+class TestMergeSourceFixGuidance:
+    """F-018 — the ``SOURCE: merge`` fix-loop section walks the coder
+    through a rebase-not-merge + force-push against the file list. Pin
+    the load-bearing pieces so a future trim doesn't silently drop them.
+    """
+
+    def test_merge_source_section_exists(self, coder_prompt):
+        assert "SOURCE: merge" in coder_prompt, (
+            "coder prompt is missing the F-018 merge-source section; "
+            "address_review(source='merge', ...) has no docs for the agent"
+        )
+
+    def _merge_section(self, coder_prompt: str) -> str:
+        idx = coder_prompt.find("### `SOURCE: merge`")
+        assert idx > -1, "merge-source heading missing"
+        # Bound by the next ### heading.
+        after = coder_prompt[idx + 1 :]
+        next_idx = after.find("\n### ")
+        return after if next_idx == -1 else after[:next_idx]
+
+    def test_rebase_not_merge_explicit(self, coder_prompt):
+        """The whole point is the rebase keeps the PR's commit graph linear;
+        a `git merge origin/main` would smash main's history into the PR
+        and defeat delta review."""
+        section = self._merge_section(coder_prompt)
+        assert "rebase" in section.lower()
+        # The "don't merge" / linear-graph rule must be explicit so the
+        # agent doesn't reach for `git merge` as the obvious tool.
+        assert "linear" in section.lower()
+        assert "git rebase origin/main" in section
+
+    def test_force_push_with_lease_present(self, coder_prompt):
+        """Rebase rewrites SHAs → force-push is the only way to land them.
+        `--force-with-lease` (not bare `--force`) so an intervening push
+        aborts the force instead of being silently overwritten."""
+        section = self._merge_section(coder_prompt)
+        assert "--force-with-lease" in section
+        # `git push --force` (without --with-lease) is what the prompt
+        # is calling OUT, not endorsing — accept either presence as long
+        # as `--force-with-lease` is also there. The lease semantics
+        # paragraph is the load-bearing thing.
+        assert "lease" in section.lower()
+
+    def test_blocked_escape_for_unresolvable_conflict(self, coder_prompt):
+        """Same escape valve as the rebase step in the main workflow —
+        if the conflict requires guessing, abort and emit BLOCKED with
+        the merge_conflict_unresolved slug."""
+        section = self._merge_section(coder_prompt)
+        assert "git rebase --abort" in section
+        assert "merge_conflict_unresolved" in section
+
+    def test_scope_is_rebase_only(self, coder_prompt):
+        """The reviewer already endorsed the unrebased content; the
+        coder must not opportunistically refactor. Same "no scope creep"
+        rule the ultrareview section uses."""
+        section = self._merge_section(coder_prompt)
+        assert "scope" in section.lower()

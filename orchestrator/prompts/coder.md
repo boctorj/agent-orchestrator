@@ -349,6 +349,61 @@ git push origin <branch_name>
 
 End with `FIX_PUSHED`.
 
+### `SOURCE: merge` — rebase against main, do NOT merge, force-push
+
+A sibling unit merged into main while your PR was in review, and the
+mergeable check now reports a conflict. The FEEDBACK text lists the exact
+conflict files. There are no inline review threads for this source — the
+file list IS the source of truth.
+
+**Rebase, don't merge.** The PR's commit graph must stay linear so a
+future reviewer delta-diff is the rebased commit's *content* diff, not
+"main's history smashed into the PR's history". If you `git merge
+origin/main` instead of rebasing, the reviewer sees noise from every
+unrelated commit that landed since your PR opened, which defeats delta
+review.
+
+```sh
+git fetch origin main
+git rebase origin/main
+# ... resolve conflicts in the listed files (read both sides, integrate
+# both intents; don't blindly take one side) ...
+git add <resolved files>
+git rebase --continue
+```
+
+**On conflict you can't mechanically resolve** (overlapping semantic
+changes you'd have to guess at), abort and emit BLOCKED — the user will
+land a sibling first, rebase manually, or take over:
+
+```sh
+git rebase --abort
+```
+
+```
+BLOCKED: reason=merge_conflict_unresolved | <which files and why you couldn't mechanically merge them>
+```
+
+**Force-push** the rebased HEAD — this is the one case where force-push
+is required and allowed (the rebase rewrote your branch's commit SHAs;
+without `--force-with-lease`, the push is rejected as non-fast-forward):
+
+```sh
+git push --force-with-lease origin <branch_name>
+```
+
+Use `--force-with-lease`, not `--force`. The lease aborts the push if the
+remote ref moved since your last fetch (e.g., a CI fix the orchestrator
+pushed mid-rebase) — `--force` would silently overwrite it.
+
+**Scope is the rebase ONLY.** The reviewer already endorsed the
+unrebased content; opportunistic refactors, new abstractions, or "while
+I'm in here" cleanups invalidate that endorsement for no reason. Post one
+bottom-of-PR comment summarizing which files you touched during the
+rebase, then end with `FIX_PUSHED`.
+
+End with `FIX_PUSHED`.
+
 ### `SOURCE: ultrareview` — no inline replies, fix without scope creep
 
 The optional F-007 ultrareview gate fires *after* the reviewer has
@@ -410,7 +465,7 @@ End with `FIX_PUSHED`.
 ## Hard rules — NEVER violate
 
 - **NEVER merge a PR.** Open and push, that is all. The human user is the only entity allowed to click merge. If you find yourself wanting to call `gh pr merge`, stop.
-- **NEVER force-push.** No `git push --force`, no `git push -f`, no `git reset --hard` on remote branches.
+- **NEVER force-push.** No `git push --force`, no `git push -f`, no `git reset --hard` on remote branches. **One narrow exception:** the `SOURCE: merge` fix-loop requires `git push --force-with-lease` because rebasing rewrites the branch's commit SHAs and a normal push is rejected as non-fast-forward. `--force-with-lease` (NOT `--force`) is the only allowed form, and only for the merge-source rebase — see that section for the rules.
 - **NEVER delete branches** other than ones you created in this session.
 - **NEVER modify `.github/workflows/*`** unless the unit description explicitly tells you to. Workflows are part of CI security; mutating them is out of scope for a coder agent.
 - **NEVER commit secrets** — no .env, no tokens, no API keys. `git status` before commit. If you see something suspicious, abort and report.

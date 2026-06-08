@@ -202,16 +202,16 @@ class TestComposeTasks:
 
           * tester / reviewer / human → "actionable detail lives in PR comments"
             (inline review threads ARE the source of truth; FEEDBACK is the tag)
-          * ci / ultrareview → "full context — no inline review threads"
+          * ci / ultrareview / merge → "full context — no inline review threads"
             (no inline anchors exist; FEEDBACK is the full source of truth)
 
         Without this, the fixed label "actionable detail lives in PR comments"
-        misleads a coder resumed for ci / ultrareview into fetching inline
-        threads that don't exist for the cycle, contradicting the in-message
-        guidance. (Copilot review on PR #51.)
+        misleads a coder resumed for ci / ultrareview / merge into fetching
+        inline threads that don't exist for the cycle, contradicting the
+        in-message guidance. (Copilot review on PR #51.)
         """
         thread_sources = ("tester", "reviewer", "human")
-        threadless_sources = ("ci", "ultrareview")
+        threadless_sources = ("ci", "ultrareview", "merge")
         thread_label = "actionable detail lives in PR comments"
         threadless_label = "no inline review threads"
 
@@ -273,6 +273,45 @@ class TestComposeTasks:
         out = compose_fix_task(sample_feature, sample_unit, "branch", 42, "ci", "test failed")
         assert "## FEATURE SPEC" not in out
         assert "## PREDECESSOR UNITS" not in out
+
+    def test_fix_task_merge_source_emits_rebase_guidance(self, sample_feature, sample_unit):
+        """F-018: ``source='merge'`` must emit rebase-against-main guidance.
+
+        Not ``git merge`` — the PR's commit graph must stay linear so the
+        reviewer's delta-diff (``prior_sha..current_sha``) shows only the
+        rebased commit's content delta, not main's intervening history
+        smashed in. Force-push is required because the rebase rewrites
+        SHAs.
+        """
+        out = compose_fix_task(
+            sample_feature,
+            sample_unit,
+            "branch",
+            42,
+            "merge",
+            "Rebase against main; resolve conflicts in: a.py, b.py.",
+        )
+        # Mechanical rebase, not merge.
+        assert "rebase" in out.lower()
+        # Force-push is required for the rewritten commit graph.
+        assert "force-push" in out.lower() or "force push" in out.lower()
+        # The "do NOT merge" rule must be explicit so the agent doesn't
+        # silently `git merge origin/main` and smash main's history into
+        # the PR — that's the failure mode the spec calls out.
+        assert "merge" in out.lower() and "linear" in out.lower()
+        assert "SOURCE:    merge" in out
+        # The conflict file list (the FEEDBACK above) must reach the agent.
+        assert "a.py" in out and "b.py" in out
+
+    def test_fix_task_merge_source_no_inline_review_threads_label(
+        self, sample_feature, sample_unit
+    ):
+        """A merge-source fix has no inline review threads (no reviewer
+        ran on the conflict); the FEEDBACK list of files IS the source of
+        truth. Coder must NOT be told to fetch threads that don't exist."""
+        out = compose_fix_task(sample_feature, sample_unit, "branch", 42, "merge", "files: x.py")
+        assert "no inline review threads" in out
+        assert "actionable detail lives in PR comments" not in out
 
 
 # --------------------------- constants ---------------------------

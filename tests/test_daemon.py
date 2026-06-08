@@ -921,3 +921,274 @@ class TestWorkerCacheMemoization:
         for _ in range(3):
             daemon.reconcile_unit("U-W")
         assert sorted(constructed_roles) == ["coder", "reviewer", "tester"]
+
+
+# --------------------------- F-018 conflict-fix dispatch ---------------------------
+
+
+def _conflict_action(files: list[str], mergeable_state: str = "dirty"):
+    """Build the ``pr_conflict_detected`` Action the F-014 decision table emits."""
+    from orchestrator.health import Action
+
+    return Action.event(
+        "pr_conflict_detected",
+        f"PR conflict ({mergeable_state})",
+        details=f"conflict files: {', '.join(files)}",
+        payload={"conflict_files": list(files), "mergeable_state": mergeable_state},
+    )
+
+
+def _seed_awaiting_merge(
+    *,
+    unit_id: str = "U-AM",
+    feature_id: str = "F-AM",
+    coder_session: str = "sc",
+    branch: str = "feat/x",
+    pr_number: int = 7,
+    conflict_attempts: int = 0,
+) -> WorkUnitState:
+    """Seed a unit parked in ``approved_awaiting_merge`` for daemon
+    conflict-fix tests. Includes a feature + plan row so
+    ``_dispatch_conflict_fix``'s lookup chain succeeds.
+    """
+    from orchestrator.models import WorkUnit
+
+    state.save_feature(
+        Feature(
+            id=feature_id,
+            title="t",
+            description="d",
+            repo_path="https://github.com/o/r",
+            status="approved",
+        )
+    )
+    state.save_plan(
+        feature_id,
+        [WorkUnit(id=unit_id, feature_id=feature_id, title="u", description="d")],
+    )
+    state.approve_plan(feature_id)
+    state.upsert_unit_state(
+        WorkUnitState(
+            unit_id=unit_id,
+            feature_id=feature_id,
+            status="approved_awaiting_merge",
+            branch=branch,
+            pr_number=pr_number,
+            coder_session_id=coder_session,
+        )
+    )
+    for _ in range(conflict_attempts):
+        state.increment_conflict_fix_attempts(unit_id)
+    return state.get_unit_state(unit_id)  # type: ignore[return-value]
+
+
+class _RecordingWorker:
+    """Captures ``resume_async`` calls for assertion. Other methods no-op."""
+
+    def __init__(self) -> None:
+        self.resume_calls: list[tuple[str, str]] = []
+
+    def resume_async(self, session_id: str, msg: str) -> None:
+        self.resume_calls.append((session_id, msg))
+
+    def tail_messages(self, _sid: str, *, limit: int = 50):  # noqa: ARG002
+        return _FakeTailResult()
+
+
+class TestDaemonConflictFixDispatch:
+    """The F-018 daemon trigger: a unit sitting in
+    ``approved_awaiting_merge`` develops a conflict (sibling unit merged
+    underneath). The reconcile loop catches ``pr_conflict_detected`` via
+    ``inspect_unit_health``, transitions the unit back to ``fixing``,
+    and submits a rebase request to the coder via
+    :meth:`~orchestrator.workers.base.Worker.resume_async` (submit-only
+    so the daemon's tick isn't blocked).
+
+    Mirrors the cycle_review-side conflict-fix loop's semantics:
+    ``conflict_fix_attempts`` is independent of ``review_round``, cap-3
+    on the counter escalates with ``conflict_rebase_diverging``, and
+    the dispatch is idempotent (per-unit owner CAS).
+    """
+
+    def test_conflict_on_awaiting_merge_dispatches_coder_resume_async(
+        self, tmp_state_db, monkeypatch
+    ):
+        unit = _seed_awaiting_merge()
+        worker = _RecordingWorker()
+        monkeypatch.setattr("orchestrator.daemon.make_worker", lambda _r: worker)
+        monkeypatch.setattr(
+            daemon, "_probe_and_decide_unit", lambda _u: [_conflict_action(["a.py", "b.py"])]
+        )
+
+        daemon.reconcile_unit(unit.unit_id)
+
+        # Status flipped to fixing.
+        got = state.get_unit_state(unit.unit_id)
+        assert got is not None
+        assert got.status == "fixing"
+        assert got.conflict_fix_attempts == 1
+        # Coder was resumed asynchronously with the conflict file list.
+        assert len(worker.resume_calls) == 1
+        sid, msg = worker.resume_calls[0]
+        assert sid == "sc"
+        assert "SOURCE:    merge" in msg
+        assert "a.py" in msg and "b.py" in msg
+
+    def test_no_dispatch_when_status_is_not_awaiting_merge(self, tmp_state_db, monkeypatch):
+        """The F-018 daemon trigger fires ONLY for the post-terminal
+        sibling-conflict case. An active unit (``in_ci`` / ``coding`` / …)
+        is handled by cycle_review's gate; the daemon must not race it.
+        """
+        from orchestrator.models import WorkUnit
+
+        state.save_feature(
+            Feature(
+                id="F-A",
+                title="t",
+                description="d",
+                repo_path="https://github.com/o/r",
+                status="approved",
+            )
+        )
+        state.save_plan("F-A", [WorkUnit(id="U-A", feature_id="F-A", title="u", description="d")])
+        state.approve_plan("F-A")
+        state.upsert_unit_state(
+            WorkUnitState(
+                unit_id="U-A",
+                feature_id="F-A",
+                status="in_ci",
+                branch="b",
+                pr_number=5,
+                coder_session_id="sc",
+            )
+        )
+
+        worker = _RecordingWorker()
+        monkeypatch.setattr("orchestrator.daemon.make_worker", lambda _r: worker)
+        monkeypatch.setattr(
+            daemon, "_probe_and_decide_unit", lambda _u: [_conflict_action(["a.py"])]
+        )
+
+        daemon.reconcile_unit("U-A")
+
+        # Status untouched; no daemon dispatch.
+        got = state.get_unit_state("U-A")
+        assert got is not None
+        assert got.status == "in_ci"
+        assert got.conflict_fix_attempts == 0
+        assert worker.resume_calls == []
+
+    def test_cap_3_escalates_with_conflict_rebase_diverging(self, tmp_state_db, monkeypatch):
+        unit = _seed_awaiting_merge(conflict_attempts=3)
+        worker = _RecordingWorker()
+        monkeypatch.setattr("orchestrator.daemon.make_worker", lambda _r: worker)
+        monkeypatch.setattr(
+            daemon, "_probe_and_decide_unit", lambda _u: [_conflict_action(["x.py"])]
+        )
+
+        daemon.reconcile_unit(unit.unit_id)
+
+        got = state.get_unit_state(unit.unit_id)
+        assert got is not None
+        assert got.status == "escalated"
+        assert "conflict_rebase_diverging" in got.last_error
+        # No further resume_async on cap-3.
+        assert worker.resume_calls == []
+        # Audit event for the dashboard.
+        events = state.list_events(unit.unit_id)
+        assert any(e["event_type"] == "conflict_rebase_diverging" for e in events)
+
+    def test_dispatch_skipped_when_no_coder_session(self, tmp_state_db, monkeypatch):
+        """Defensive — without a coder session there's nothing to resume.
+        Daemon logs + skips rather than crashing the tick or escalating."""
+        unit = _seed_awaiting_merge(coder_session="")
+        worker = _RecordingWorker()
+        monkeypatch.setattr("orchestrator.daemon.make_worker", lambda _r: worker)
+        monkeypatch.setattr(
+            daemon, "_probe_and_decide_unit", lambda _u: [_conflict_action(["a.py"])]
+        )
+
+        daemon.reconcile_unit(unit.unit_id)
+
+        got = state.get_unit_state(unit.unit_id)
+        assert got is not None
+        # Status unchanged — no transition, no dispatch.
+        assert got.status == "approved_awaiting_merge"
+        assert got.conflict_fix_attempts == 0
+        assert worker.resume_calls == []
+
+    def test_dispatch_releases_owner_cas(self, tmp_state_db, monkeypatch):
+        """The owner CAS must be released after the dispatch lands so a
+        later tick (or a lead's ``send_to_unit_async``) can proceed.
+        Symmetric to the daemon's other CAS sites (PR #61 reviewer)."""
+        unit = _seed_awaiting_merge()
+        worker = _RecordingWorker()
+        monkeypatch.setattr("orchestrator.daemon.make_worker", lambda _r: worker)
+        monkeypatch.setattr(
+            daemon, "_probe_and_decide_unit", lambda _u: [_conflict_action(["a.py"])]
+        )
+
+        daemon.reconcile_unit(unit.unit_id)
+        assert state.has_active_advance_lock(unit.unit_id) is False
+        got = state.get_unit_state(unit.unit_id)
+        assert got is not None
+        assert got.owner == ""
+
+    def test_no_dispatch_when_no_conflict_action(self, tmp_state_db, monkeypatch):
+        """Sanity — without a ``pr_conflict_detected`` action, the unit
+        stays in ``approved_awaiting_merge`` and nothing dispatches."""
+        unit = _seed_awaiting_merge()
+        worker = _RecordingWorker()
+        monkeypatch.setattr("orchestrator.daemon.make_worker", lambda _r: worker)
+        monkeypatch.setattr(daemon, "_probe_and_decide_unit", lambda _u: [])
+
+        daemon.reconcile_unit(unit.unit_id)
+
+        got = state.get_unit_state(unit.unit_id)
+        assert got is not None
+        assert got.status == "approved_awaiting_merge"
+        assert got.conflict_fix_attempts == 0
+        assert worker.resume_calls == []
+
+    def test_dispatch_skipped_when_resume_async_raises(self, tmp_state_db, monkeypatch):
+        """A backend hiccup on ``resume_async`` must NOT crash the tick.
+        The dispatch returns False and the next tick re-derives — the
+        ``conflict_fix_attempts`` bump is already persisted, so the
+        retry burns one of the cap-3 mechanically (acceptable; the
+        alternative is silently looping on a broken backend)."""
+        unit = _seed_awaiting_merge()
+
+        class _RaisingWorker:
+            def resume_async(self, _sid: str, _msg: str) -> None:
+                raise RuntimeError("backend down")
+
+            def tail_messages(self, _sid: str, *, limit: int = 50):  # noqa: ARG002
+                return _FakeTailResult()
+
+        worker = _RaisingWorker()
+        monkeypatch.setattr("orchestrator.daemon.make_worker", lambda _r: worker)
+        monkeypatch.setattr(
+            daemon, "_probe_and_decide_unit", lambda _u: [_conflict_action(["a.py"])]
+        )
+
+        # Should not raise.
+        daemon.reconcile_unit(unit.unit_id)
+        # Owner CAS released so a later tick can retry.
+        assert state.has_active_advance_lock(unit.unit_id) is False
+
+    def test_dispatch_skipped_when_feature_missing(self, tmp_state_db, monkeypatch):
+        """Daemon must not crash when the feature row is gone (test fixture
+        / cleanup race). Logs + skips, no status change."""
+        unit = _seed_awaiting_merge()
+        # Drop the feature row (and its cascade-deleted plan).
+        from orchestrator import state as _state
+
+        with _state._connect() as conn:
+            conn.execute("DELETE FROM features WHERE id = ?", (unit.feature_id,))
+
+        worker = _RecordingWorker()
+        monkeypatch.setattr("orchestrator.daemon.make_worker", lambda _r: worker)
+        # The conflict action is on a unit whose feature is gone.
+        result = daemon._dispatch_conflict_fix(unit, ["a.py"])
+        assert result is False
+        assert worker.resume_calls == []

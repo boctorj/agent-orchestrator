@@ -3774,3 +3774,419 @@ class TestCancelUnitTakesAdvanceLock:
         assert archive_calls == ["coder:sesn-c"], (
             f"archive must land exactly once across the two calls; got {archive_calls}"
         )
+
+
+# --------------------------- F-018 conflict-fix ---------------------------
+
+
+def _stub_mergeable_probe(monkeypatch, files: list[str] | None, mergeable_state: str = "dirty"):
+    """Patch the underlying F-014 probe so ``_check_mergeable`` returns the
+    desired ``ConflictResult`` (when ``files is not None``) or ``None``.
+
+    Goes through ``orchestrator.tools.health``'s ``_load_context`` +
+    ``_probe_and_decide`` because ``_check_mergeable`` calls them directly
+    — patching one level up keeps the test honest about which probe
+    path is under inspection.
+    """
+    from orchestrator.health import Action, Decision
+
+    def fake_load_context(unit_id):
+        unit_state = state.get_unit_state(unit_id)
+        return unit_state, "https://github.com/o/r"
+
+    def fake_probe_and_decide(unit_state, repo_url):  # noqa: ARG001
+        actions: list[Action] = []
+        if files is not None:
+            actions.append(
+                Action.event(
+                    "pr_conflict_detected",
+                    f"PR conflict ({mergeable_state})",
+                    details=f"conflict files: {', '.join(files)}",
+                    payload={"conflict_files": list(files), "mergeable_state": mergeable_state},
+                )
+            )
+        # Fake a stub HealthReport — the function returns
+        # (report, decision); only the decision is consulted.
+        report = type("R", (), {})()
+        return report, Decision(actions_to_apply=actions, shadow_decisions=[])
+
+    monkeypatch.setattr("orchestrator.tools.health._load_context", fake_load_context)
+    monkeypatch.setattr("orchestrator.tools.health._probe_and_decide", fake_probe_and_decide)
+
+
+class TestCheckMergeable:
+    """``_check_mergeable`` returns a ``ConflictResult`` when the F-014
+    probe surfaces ``pr_conflict_detected``, else ``None``. Honors the
+    same defensive posture as ``inspect_unit_health(dry_run=True)``
+    (returns ``None`` on error rather than raising) so a cycle_review
+    gate is never aborted by a transient probe failure.
+    """
+
+    def test_returns_none_on_clean_pr(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        _stub_mergeable_probe(monkeypatch, files=None)
+        assert execution._check_mergeable("F-001-U-1") is None
+
+    def test_returns_conflict_result_on_dirty_pr(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        _seed_coded_unit()
+        _stub_mergeable_probe(monkeypatch, files=["src/a.py", "src/b.py"])
+        result = execution._check_mergeable("F-001-U-1")
+        assert result is not None
+        assert result.conflict_files == ["src/a.py", "src/b.py"]
+        assert result.mergeable_state == "dirty"
+
+    def test_returns_none_on_load_context_error(self, tmp_state_db, monkeypatch):
+        """No PR + missing feature → ``_load_context`` returns an error
+        string. ``_check_mergeable`` must NOT raise; the cycle_review
+        gate should pass through (treat as clean) rather than abort."""
+        monkeypatch.setattr(
+            "orchestrator.tools.health._load_context",
+            lambda uid: "ERROR: no PR",
+        )
+        assert execution._check_mergeable("F-001-U-1") is None
+
+    def test_returns_none_on_probe_error(self, tmp_state_db, with_github_token, monkeypatch):
+        """Probe error (GH 5xx, network hiccup) returns ``None`` rather
+        than escalating. Same defensive posture as
+        ``inspect_unit_health(dry_run=True)``."""
+        _seed_coded_unit()
+        monkeypatch.setattr(
+            "orchestrator.tools.health._load_context",
+            lambda uid: (state.get_unit_state(uid), "https://github.com/o/r"),
+        )
+        monkeypatch.setattr(
+            "orchestrator.tools.health._probe_and_decide",
+            lambda *a, **k: "ERROR querying GitHub: 502",
+        )
+        assert execution._check_mergeable("F-001-U-1") is None
+
+
+class TestConflictFixLoop:
+    """``_conflict_fix_loop`` — the heart of F-018 trigger 1.
+
+    Dispatches ``address_review('merge', ...)`` on conflict, re-waits CI
+    via ``_wait_ci_with_fix_loop``, re-probes mergeable. Counter is
+    ``conflict_fix_attempts`` (independent of ``review_round``); cap-3
+    on the counter escalates with the ``conflict_rebase_diverging`` slug.
+    """
+
+    def _ctx(self) -> execution.CycleContext:
+        return execution.CycleContext(feature_id="F-001", unit_id="F-001-U-1", history=[])
+
+    def test_returns_ok_when_no_conflict(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        _stub_mergeable_probe(monkeypatch, files=None)
+        ctx = self._ctx()
+        ok, msg = execution._conflict_fix_loop(ctx, "coder PR push")
+        assert ok is True
+        assert msg is None
+        # History records the probe outcome for breadcrumbs.
+        assert any(s.get("status") == "clean" for s in ctx.history)
+
+    def test_dispatches_merge_fix_on_conflict_then_clears(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """Conflict → ``address_review('merge')`` → re-wait CI → re-probe
+        clean. Counter bumps to 1, ``review_round`` is untouched (the F-018
+        spec's independent-counters guarantee)."""
+        _seed_coded_unit()
+        # Toggle: first probe conflict, second probe clean.
+        from orchestrator.health import Action, Decision
+
+        probe_calls = {"n": 0}
+
+        def fake_load_context(unit_id):
+            return state.get_unit_state(unit_id), "https://github.com/o/r"
+
+        def fake_probe_and_decide(unit_state, repo_url):  # noqa: ARG001
+            probe_calls["n"] += 1
+            report = type("R", (), {})()
+            if probe_calls["n"] == 1:
+                action = Action.event(
+                    "pr_conflict_detected",
+                    "PR conflict",
+                    payload={"conflict_files": ["a.py"], "mergeable_state": "dirty"},
+                )
+                return report, Decision(actions_to_apply=[action], shadow_decisions=[])
+            return report, Decision(actions_to_apply=[], shadow_decisions=[])
+
+        monkeypatch.setattr("orchestrator.tools.health._load_context", fake_load_context)
+        monkeypatch.setattr("orchestrator.tools.health._probe_and_decide", fake_probe_and_decide)
+
+        dispatched: list[tuple[str, str, str]] = []
+
+        def fake_address_review(uid, src, fb):
+            dispatched.append((uid, src, fb))
+            return json.dumps({"outcome": "FIX_PUSHED", "cycle": 1, "summary": "rebased"})
+
+        monkeypatch.setattr(execution, "address_review", fake_address_review)
+        _stub_github(monkeypatch)
+
+        ctx = self._ctx()
+        ok, msg = execution._conflict_fix_loop(ctx, "coder PR push")
+        assert ok is True
+        assert msg is None
+        # address_review was called once with source='merge' and the
+        # conflict file list in the feedback.
+        assert len(dispatched) == 1
+        assert dispatched[0][1] == "merge"
+        assert "a.py" in dispatched[0][2]
+        # Counter incremented; review_round unchanged.
+        got = state.get_unit_state("F-001-U-1")
+        assert got is not None
+        assert got.conflict_fix_attempts == 1
+        assert got.review_round == 0
+
+    def test_cap_3_escalates_with_conflict_rebase_diverging(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """When ``conflict_fix_attempts`` has already hit CAP_3, the loop
+        emits the ``conflict_rebase_diverging`` event + escalation
+        without dispatching the coder."""
+        _seed_coded_unit()
+        # Pre-load the counter to CAP_3 so the next probe trips the cap.
+        for _ in range(3):
+            state.increment_conflict_fix_attempts("F-001-U-1")
+
+        _stub_mergeable_probe(monkeypatch, files=["x.py"])
+
+        dispatched: list[tuple] = []
+
+        def fake_address_review(uid, src, fb):
+            dispatched.append((uid, src, fb))
+            return json.dumps({"outcome": "FIX_PUSHED"})
+
+        monkeypatch.setattr(execution, "address_review", fake_address_review)
+
+        ctx = self._ctx()
+        ok, msg = execution._conflict_fix_loop(ctx, "coder PR push")
+        assert ok is False
+        assert msg is not None
+        assert "conflict_rebase_diverging" in msg
+        # No fix dispatched after cap-3.
+        assert dispatched == []
+        # Unit flipped to escalated with the slug in last_error.
+        got = state.get_unit_state("F-001-U-1")
+        assert got is not None
+        assert got.status == "escalated"
+        assert "conflict_rebase_diverging" in got.last_error
+        # Audit event recorded for the dashboard.
+        events = state.list_events("F-001-U-1")
+        assert any(e["event_type"] == "conflict_rebase_diverging" for e in events)
+
+    def test_counter_independent_of_review_round(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """Two conflict-fix rounds, three review_round bumps from other
+        sources (tester-bug, reviewer-changes) — the two counters
+        never cross.
+
+        F-018 acceptance: "``conflict_fix_attempts`` is independent of
+        ``cycle_number`` (a conflict-fix cycle does not increment
+        cap-3, and a cap-3 tester-bug fix does not increment
+        conflict_fix_attempts)."
+        """
+        _seed_coded_unit()
+        # Pre-set review_round to 3 (cap-3 hit on tester bugs).
+        for _ in range(3):
+            state.increment_review_round("F-001-U-1")
+        # Pre-set conflict_fix_attempts to 1 (one rebase round already done).
+        state.increment_conflict_fix_attempts("F-001-U-1")
+
+        got = state.get_unit_state("F-001-U-1")
+        assert got is not None
+        assert got.review_round == 3
+        assert got.conflict_fix_attempts == 1
+
+        # A clean probe must NOT touch either counter.
+        _stub_mergeable_probe(monkeypatch, files=None)
+        ctx = self._ctx()
+        ok, _ = execution._conflict_fix_loop(ctx, "tester test push")
+        assert ok is True
+
+        got = state.get_unit_state("F-001-U-1")
+        assert got is not None
+        assert got.review_round == 3
+        assert got.conflict_fix_attempts == 1
+
+    def test_address_review_merge_source_does_not_bump_review_round(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """F-018: ``address_review(source='merge')`` must NOT increment
+        ``review_round``. The conflict_fix_attempts counter (bumped by
+        ``_conflict_fix_loop``) is the merge-source's separate budget;
+        sharing the review_round budget would let three sibling-merge
+        conflicts burn the whole quality cap-3.
+
+        Pin via a direct ``address_review`` call so the contract holds
+        even when called outside cycle_review (e.g. manual recovery via
+        ``send_to_unit`` or a future MCP surface).
+        """
+        _seed_coded_unit()
+        # Tester-bug + reviewer-change already burned 2 of 3 review_round.
+        state.increment_review_round("F-001-U-1")
+        state.increment_review_round("F-001-U-1")
+
+        # Stub the worker resume so the call doesn't reach Anthropic.
+        instances = _install_fake_worker(monkeypatch, resume_response="rebased\nFIX_PUSHED")
+        _stub_github(monkeypatch)
+
+        before = state.get_unit_state("F-001-U-1")
+        assert before is not None
+        assert before.review_round == 2
+
+        out = execution.address_review("F-001-U-1", "merge", "rebase against main; files: x.py")
+
+        # FIX_PUSHED outcome lands as JSON.
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "FIX_PUSHED"
+
+        after = state.get_unit_state("F-001-U-1")
+        assert after is not None
+        # review_round must be UNCHANGED — the merge source has its own
+        # budget (conflict_fix_attempts).
+        assert after.review_round == 2, (
+            f"address_review(source='merge') leaked into review_round: "
+            f"before={before.review_round}, after={after.review_round}"
+        )
+        # FIX_PUSHED marker flips status to in_ci (waiting for CI on the
+        # rebased HEAD); same as every other fix source.
+        assert after.status == "in_ci"
+        # Coder session was actually resumed.
+        assert len(instances["coder"].resume_calls) == 1
+
+    def test_loop_fails_when_address_review_does_not_fix_push(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """If the coder's merge-source resume doesn't end with FIX_PUSHED
+        (BLOCKED on unresolvable conflict, no-marker, etc.), the loop
+        bails so cycle_review can escalate cleanly rather than spinning."""
+        _seed_coded_unit()
+        _stub_mergeable_probe(monkeypatch, files=["a.py"])
+
+        # Coder returns BLOCKED on the rebase.
+        monkeypatch.setattr(
+            execution,
+            "address_review",
+            lambda u, src, fb: (
+                "BLOCKED — coder couldn't apply fix [merge_conflict_unresolved]: hand-coded conflict"
+            ),
+        )
+
+        ctx = self._ctx()
+        ok, msg = execution._conflict_fix_loop(ctx, "coder PR push")
+        assert ok is False
+        assert msg is not None
+        assert "coder fix for merge conflict" in msg
+
+
+class TestCycleReviewMergeableGates:
+    """End-to-end: ``cycle_review`` fires ``_check_mergeable`` at both
+    CI-green gates (pre-tester, pre-reviewer). Sibling-induced conflict
+    triggers the rebase flow; clean PR proceeds normally.
+    """
+
+    def test_mergeable_gate_fires_at_both_gates_on_clean_pr(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """Happy path: both gates fire ``_check_mergeable`` and both
+        return clean, so the cycle proceeds to terminal."""
+        _seed_coded_unit()
+        _stub_mergeable_probe(monkeypatch, files=None)
+        monkeypatch.setattr(
+            execution,
+            "spawn_tester",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "TESTS_PASS"}),
+        )
+        monkeypatch.setattr(
+            execution,
+            "spawn_reviewer",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "REVIEW_RECOMMEND_MERGE"}),
+        )
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_ready_to_merge",
+            lambda *a, **k: True,
+        )
+
+        out = execution.cycle_review("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "approved_awaiting_merge"
+        # Both mergeable gates fired (one after each ci_wait).
+        history_steps = [s.get("step") for s in parsed["history"]]
+        mergeable_probes = [s for s in history_steps if "_check_mergeable" in s]
+        assert len(mergeable_probes) >= 2, (
+            f"expected at least 2 _check_mergeable steps (pre-tester + pre-reviewer); "
+            f"got {mergeable_probes}"
+        )
+
+    def test_pre_tester_conflict_triggers_rebase_flow(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """A sibling-induced conflict at the pre-tester gate dispatches
+        ``address_review('merge', ...)`` to the coder, the rebase
+        clears, and the cycle proceeds to terminal."""
+        _seed_coded_unit()
+
+        # First probe: conflict. Second probe (after rebase): clean.
+        # Third probe (pre-reviewer): clean.
+        from orchestrator.health import Action, Decision
+
+        probe_calls = {"n": 0}
+
+        def fake_load_context(unit_id):
+            return state.get_unit_state(unit_id), "https://github.com/o/r"
+
+        def fake_probe_and_decide(unit_state, repo_url):  # noqa: ARG001
+            probe_calls["n"] += 1
+            report = type("R", (), {})()
+            if probe_calls["n"] == 1:
+                action = Action.event(
+                    "pr_conflict_detected",
+                    "PR conflict",
+                    payload={"conflict_files": ["sibling.py"], "mergeable_state": "dirty"},
+                )
+                return report, Decision(actions_to_apply=[action], shadow_decisions=[])
+            return report, Decision(actions_to_apply=[], shadow_decisions=[])
+
+        monkeypatch.setattr("orchestrator.tools.health._load_context", fake_load_context)
+        monkeypatch.setattr("orchestrator.tools.health._probe_and_decide", fake_probe_and_decide)
+
+        # Track address_review calls; only the merge-source one should
+        # land for this flow.
+        dispatched: list[tuple[str, str]] = []
+
+        def fake_address_review(uid, src, fb):  # noqa: ARG001
+            dispatched.append((uid, src))
+            return json.dumps({"outcome": "FIX_PUSHED", "cycle": 0})
+
+        monkeypatch.setattr(execution, "address_review", fake_address_review)
+        monkeypatch.setattr(
+            execution,
+            "spawn_tester",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "TESTS_PASS"}),
+        )
+        monkeypatch.setattr(
+            execution,
+            "spawn_reviewer",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "REVIEW_RECOMMEND_MERGE"}),
+        )
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_ready_to_merge",
+            lambda *a, **k: True,
+        )
+
+        out = execution.cycle_review("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "approved_awaiting_merge"
+        # Exactly one merge dispatch fired (the conflict at pre-tester gate).
+        merge_dispatches = [d for d in dispatched if d[1] == "merge"]
+        assert len(merge_dispatches) == 1
+        # Counter was bumped to 1; review_round still 0 (no quality issue).
+        got = state.get_unit_state("F-001-U-1")
+        assert got is not None
+        assert got.conflict_fix_attempts == 1
+        assert got.review_round == 0

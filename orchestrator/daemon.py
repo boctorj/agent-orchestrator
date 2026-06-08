@@ -63,6 +63,7 @@ a workspace that hasn't migrated to Phase 3.
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import math
 import os
@@ -78,9 +79,11 @@ from orchestrator.health import Action, Decision, HealthReport, ShadowDecision
 from orchestrator.markers import MarkerSpec
 from orchestrator.models import (
     ACTIVE_UNIT_STATUSES,
+    READY_TO_MERGE_STATUSES,
     TERMINAL_UNIT_STATUSES,
     WorkUnitState,
 )
+from orchestrator.tools import CAP_3, compose_fix_task
 from orchestrator.workers import make_worker
 from orchestrator.workers.base import Worker
 
@@ -566,6 +569,167 @@ def _maybe_persist_snapshot(unit: WorkUnitState, report: HealthReport) -> bool:
     return _maybe_record_snapshot(unit, report)
 
 
+# --------------------------- F-018 conflict-fix dispatch ---------------------------
+
+
+def _dispatch_conflict_fix(unit: WorkUnitState, conflict_files: list[str]) -> bool:
+    """F-018 daemon-side conflict-fix dispatch. Returns True on dispatch.
+
+    Mirrors ``cycle_review``'s mergeable-gate flow for the post-terminal
+    case: a unit sitting in ``approved_awaiting_merge`` develops a
+    conflict because a sibling unit merged. The daemon transitions the
+    unit back to ``fixing`` and submits a rebase request to the coder
+    via :meth:`~orchestrator.workers.base.Worker.resume_async` — the
+    submit-only variant so the daemon's tick isn't blocked while the
+    coder rebases (minutes). The next tick observes the coder's
+    ``FIX_PUSHED`` marker via the normal ``_scan_role`` path and the
+    reviewer agent's stale-marker delta rule (F-016 Phase 2.5) re-runs
+    the review on the new SHA.
+
+    Cap check: ``conflict_fix_attempts`` is bumped via
+    :func:`~orchestrator.state.increment_conflict_fix_attempts` and
+    capped at ``CAP_3`` independent of ``review_round``. On cap-3 hit
+    the unit transitions to ``escalated`` with the
+    ``conflict_rebase_diverging`` reason — main is too volatile and a
+    human must decide whether to land a sibling first, rebase manually,
+    or take over.
+
+    Pre-conditions checked before any mutation:
+
+      * ``coder_session_id`` is set (no coder → can't resume; daemon
+        records an escalation event so the lead notices on the next
+        ``unit_history`` read).
+      * ``pr_number`` is set + feature row + plan row + unit row exist
+        (compose_fix_task requires them).
+      * Owner CAS is grabbed so the lead's ``send_to_unit_async`` window
+        doesn't race the transition flip + resume submit.
+
+    Idempotence: the per-unit CAS ensures only one daemon instance (or
+    tick) lands the transition + dispatch. A daemon re-tick on the same
+    conflict signal observes ``status='fixing'`` and skips Stage 3
+    entirely (the ``READY_TO_MERGE_STATUSES`` guard above).
+    """
+    if not unit.coder_session_id or not unit.pr_number:
+        logger.info(
+            "daemon: conflict-fix dispatch skipped for %s — missing coder session / PR",
+            unit.unit_id,
+        )
+        return False
+
+    feature = state.get_feature(unit.feature_id)
+    plan = state.get_plan(unit.feature_id)
+    if feature is None or plan is None:
+        logger.info(
+            "daemon: conflict-fix dispatch skipped for %s — missing feature/plan",
+            unit.unit_id,
+        )
+        return False
+    work_unit = next((u for u in plan.units if u.id == unit.unit_id), None)
+    if work_unit is None:
+        logger.info(
+            "daemon: conflict-fix dispatch skipped for %s — unit not in plan",
+            unit.unit_id,
+        )
+        return False
+
+    attempts = unit.conflict_fix_attempts
+    if attempts >= CAP_3:
+        state.record_event(
+            unit.unit_id,
+            unit.feature_id,
+            "conflict_rebase_diverging",
+            source="orchestrator",
+            cycle_number=attempts,
+            summary=f"cap-{CAP_3} on conflict-fix attempts (daemon-detected)",
+            details=json.dumps(
+                {
+                    "reason": "conflict_rebase_diverging",
+                    "conflict_files": list(conflict_files),
+                }
+            ),
+        )
+        if state.claim_unit_owner(unit.unit_id, DAEMON_OWNER, expected_owner=""):
+            try:
+                state.touch_unit(
+                    unit.unit_id,
+                    status="escalated",
+                    error=(
+                        f"BLOCKED [conflict_rebase_diverging]: "
+                        f"cap-{CAP_3} rebase attempts on approved_awaiting_merge unit"
+                    ),
+                )
+            finally:
+                state.release_unit_owner(unit.unit_id, expected_owner=DAEMON_OWNER)
+        return False
+
+    if not state.claim_unit_owner(unit.unit_id, DAEMON_OWNER, expected_owner=""):
+        return False
+    try:
+        latest = state.get_unit_state(unit.unit_id)
+        if latest is None or latest.cancelled_at is not None:
+            return False
+        if latest.status not in READY_TO_MERGE_STATUSES:
+            return False
+        # ``pr_number`` was non-None at the entry pre-condition; re-asserting
+        # here narrows the type for ``compose_fix_task`` and guards the rare
+        # race where another path nulled it between the entry check and the
+        # owner CAS.
+        if latest.pr_number is None:
+            return False
+
+        new_attempts = state.increment_conflict_fix_attempts(unit.unit_id)
+        state.touch_unit(unit.unit_id, status="fixing")
+        state.record_event(
+            unit.unit_id,
+            unit.feature_id,
+            "coder_resumed",
+            source="merge",
+            cycle_number=latest.review_round,
+            summary=(
+                f"daemon conflict-fix dispatch (attempt {new_attempts}/{CAP_3}); "
+                f"sibling-induced conflict on awaiting-merge unit"
+            ),
+            details=json.dumps({"conflict_files": list(conflict_files)}),
+        )
+
+        files_csv = ", ".join(conflict_files) if conflict_files else "(unspecified)"
+        feedback = (
+            f"A sibling unit merged while this PR was awaiting human merge; "
+            f"a conflict is now blocking the merge (attempt {new_attempts}/{CAP_3}). "
+            f"Rebase against main; resolve conflicts in: {files_csv}. Force-push "
+            f"the rebased HEAD (see `## When resumed with feedback` → `SOURCE: "
+            f"merge` in your system prompt)."
+        )
+        # Re-inject feature spec + predecessor cycle-log context on every
+        # resume so a spec edit between the original spawn and this
+        # daemon-driven resume reaches the coder (F-006 contract). Lazy
+        # import so a missing ``feature_spec`` / ``cycle_log`` module
+        # doesn't break the daemon's module load.
+        from orchestrator import cycle_log, feature_spec  # noqa: PLC0415
+
+        fix_msg = compose_fix_task(
+            feature,
+            work_unit,
+            latest.branch,
+            latest.pr_number,
+            "merge",
+            feedback,
+            feature_spec_text=feature_spec.read_spec(feature.id),
+            predecessor_logs=[
+                (dep_id, cycle_log.cycle_log_summary(dep_id)) for dep_id in work_unit.depends_on
+            ],
+        )
+        try:
+            worker = _cached_worker("coder")
+            worker.resume_async(latest.coder_session_id, fix_msg)
+        except Exception:  # noqa: BLE001 — log + escalation via the next tick
+            logger.exception("daemon: conflict-fix resume_async failed for %s", unit.unit_id)
+            return False
+        return True
+    finally:
+        state.release_unit_owner(unit.unit_id, expected_owner=DAEMON_OWNER)
+
+
 # --------------------------- reconciler ---------------------------
 
 
@@ -591,6 +755,14 @@ def reconcile_unit(unit_id: str) -> None:
     The cancel and lock guards are re-checked between stages so a user
     cancellation mid-tick stops further work immediately rather than
     completing the F-014 probe on a unit the user just stopped.
+
+    F-018: when the F-014 probe surfaces a ``pr_conflict_detected``
+    event AND the unit is currently in ``approved_awaiting_merge`` (i.e.
+    a sibling unit merged while this PR sat awaiting human merge), the
+    daemon transitions the unit back to ``fixing`` and dispatches a
+    rebase request to the coder via the same ``address_review('merge', …)``
+    machinery ``cycle_review``'s gate uses — see
+    :func:`_dispatch_conflict_fix`.
     """
     unit = state.get_unit_state(unit_id)
     if unit is None:
@@ -628,11 +800,33 @@ def reconcile_unit(unit_id: str) -> None:
     # telemetry is F-016's validation harness).
     if not _is_actionable(unit):
         return
+    conflict_action: Action | None = None
     for action in _probe_and_decide_unit(unit):
         unit = state.get_unit_state(unit_id) or unit
         if not _is_actionable(unit):
             return
         _apply_health_action(unit, action)
+        # Capture the F-018 conflict signal so Stage 3 can dispatch the
+        # rebase without re-probing GitHub. We only care about the most
+        # recent conflict action of the tick — the decision table emits
+        # at most one ``pr_conflict_detected`` per probe.
+        if action.kind == "event" and action.event_type == "pr_conflict_detected":
+            conflict_action = action
+
+    # Stage 3 (F-018): post-terminal conflict recovery. The transition
+    # row ``(approved_awaiting_merge, PrConflictDetected) → DispatchConflictFix``
+    # fires only when the unit is currently parked awaiting human merge
+    # — for an active unit the gate inside ``cycle_review`` already
+    # handles the same case synchronously.
+    if conflict_action is None:
+        return
+    unit = state.get_unit_state(unit_id) or unit
+    if not _is_actionable(unit):
+        return
+    if unit.status not in READY_TO_MERGE_STATUSES:
+        return
+    files_raw = conflict_action.payload.get("conflict_files") or []
+    _dispatch_conflict_fix(unit, list(files_raw))
 
 
 def _is_actionable(unit: WorkUnitState) -> bool:

@@ -112,6 +112,30 @@ def _migrate_work_units_cancel_owner(conn: sqlite3.Connection) -> None:
                 raise
 
 
+def _migrate_work_units_conflict_fix_attempts(conn: sqlite3.Connection) -> None:
+    """Add F-018 ``conflict_fix_attempts`` to ``work_units`` for pre-F-018 DBs.
+
+    A separate counter from ``review_round`` so a sibling-merge-induced
+    rebase loop doesn't consume the quality cap-3 budget — merge
+    conflicts are mechanical, not a quality failure. Capped at the same
+    ``CAP_3`` via :func:`orchestrator.tools.execution._conflict_fix_loop`
+    and the daemon's conflict-fix dispatch.
+
+    Race-safe in the same shape as :func:`_migrate_features_ultrareview`
+    (PRAGMA-probe → ALTER → swallow ``duplicate column name``).
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(work_units)").fetchall()}
+    if "conflict_fix_attempts" in cols:
+        return
+    try:
+        conn.execute(
+            "ALTER TABLE work_units ADD COLUMN conflict_fix_attempts INTEGER NOT NULL DEFAULT 0"
+        )
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e).lower():
+            raise
+
+
 def _migrate_unit_events_dedupe_key(conn: sqlite3.Connection) -> None:
     """Add `dedupe_key` + its UNIQUE index to `unit_events` for pre-F-016 DBs.
 
@@ -177,19 +201,20 @@ def init_db() -> None:
             );
 
             CREATE TABLE IF NOT EXISTS work_units (
-                unit_id              TEXT PRIMARY KEY,
-                feature_id           TEXT NOT NULL,
-                status               TEXT NOT NULL DEFAULT 'pending',
-                branch               TEXT NOT NULL DEFAULT '',
-                pr_number            INTEGER,
-                coder_session_id     TEXT NOT NULL DEFAULT '',
-                tester_session_id    TEXT NOT NULL DEFAULT '',
-                reviewer_session_id  TEXT NOT NULL DEFAULT '',
-                review_round         INTEGER NOT NULL DEFAULT 0,
-                last_activity        TEXT NOT NULL DEFAULT '',
-                last_error           TEXT NOT NULL DEFAULT '',
-                cancelled_at         TEXT,
-                owner                TEXT NOT NULL DEFAULT '',
+                unit_id                 TEXT PRIMARY KEY,
+                feature_id              TEXT NOT NULL,
+                status                  TEXT NOT NULL DEFAULT 'pending',
+                branch                  TEXT NOT NULL DEFAULT '',
+                pr_number               INTEGER,
+                coder_session_id        TEXT NOT NULL DEFAULT '',
+                tester_session_id       TEXT NOT NULL DEFAULT '',
+                reviewer_session_id     TEXT NOT NULL DEFAULT '',
+                review_round            INTEGER NOT NULL DEFAULT 0,
+                last_activity           TEXT NOT NULL DEFAULT '',
+                last_error              TEXT NOT NULL DEFAULT '',
+                cancelled_at            TEXT,
+                owner                   TEXT NOT NULL DEFAULT '',
+                conflict_fix_attempts   INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (feature_id) REFERENCES features(id) ON DELETE CASCADE
             );
 
@@ -256,6 +281,7 @@ def init_db() -> None:
         )
         _migrate_features_ultrareview(conn)
         _migrate_work_units_cancel_owner(conn)
+        _migrate_work_units_conflict_fix_attempts(conn)
         _migrate_unit_events_dedupe_key(conn)
 
 
@@ -542,6 +568,34 @@ def increment_review_round(unit_id: str) -> int:
             "SELECT review_round FROM work_units WHERE unit_id = ?", (unit_id,)
         ).fetchone()
     return row["review_round"] if row else 0
+
+
+def increment_conflict_fix_attempts(unit_id: str) -> int:
+    """Bump the F-018 ``conflict_fix_attempts`` counter. Returns the new value.
+
+    Mechanical-rebase retry counter kept independent of ``review_round`` so
+    a sibling-induced conflict-fix doesn't burn the quality cap-3 budget,
+    and a cap-3 tester-bug fix doesn't bump conflict_fix_attempts.
+    """
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE work_units SET conflict_fix_attempts = conflict_fix_attempts + 1, "
+            "last_activity = ? WHERE unit_id = ?",
+            (_now(), unit_id),
+        )
+        row = conn.execute(
+            "SELECT conflict_fix_attempts FROM work_units WHERE unit_id = ?", (unit_id,)
+        ).fetchone()
+    return row["conflict_fix_attempts"] if row else 0
+
+
+def get_conflict_fix_attempts(unit_id: str) -> int:
+    """Return the current ``conflict_fix_attempts`` value, or 0 if the row is missing."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT conflict_fix_attempts FROM work_units WHERE unit_id = ?", (unit_id,)
+        ).fetchone()
+    return row["conflict_fix_attempts"] if row else 0
 
 
 # --------------------------- F-016 Phase 2.5: lead/daemon contract ----------
