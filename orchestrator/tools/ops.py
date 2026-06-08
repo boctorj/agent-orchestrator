@@ -4,14 +4,25 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import sqlite3
 
-from orchestrator import blocked_hints, cycle_log, github, github_app, repo_verify, state
+from orchestrator import (
+    blocked_hints,
+    cycle_log,
+    github,
+    github_app,
+    markers,
+    repo_verify,
+    state,
+)
 from orchestrator.agents import ManagedAgentWorker
 from orchestrator.models import ACTIVE_UNIT_STATUSES, READY_TO_MERGE_STATUSES
 from orchestrator.tools import mcp, need_github_token
 from orchestrator.workers import make_worker
 from orchestrator.workers.base import TailMessage
+
+logger = logging.getLogger(__name__)
 
 # Active statuses that should not legally observe a merged PR — coding/
 # testing/reviewing/fixing/opening_pr units have an agent mid-flight, so
@@ -46,14 +57,23 @@ def hello_world_test() -> str:
 def check_unit_pr(unit_id: str) -> str:
     """Poll GitHub for the PR's state + check_runs. **Read-only.**
 
+    .. deprecated:: F-014-U-2
+        Use ``inspect_unit_health(unit_id, dry_run=True)`` instead — the
+        canonical health surface covers the same read path plus
+        conflict / required-check / CI-drift signals and the shadow
+        decision channel. This alias preserves the legacy JSON shape for
+        existing callers and logs a deprecation warning on each call.
+
     Returns the observed PR state and CI checks alongside the orchestrator's
     current ``status`` for the unit. Does NOT mutate state — safe to call
     from dashboards, diagnostics, or monitors as often as you like.
 
     To advance a unit's state when its PR has been merged, call
-    ``reconcile_unit_pr(unit_id)`` instead. That tool reads via this one
-    and then applies the (PR-state, unit-status) transitions.
+    ``reconcile_unit_pr(unit_id)`` (also deprecated; prefer
+    ``inspect_unit_health(unit_id)``). That tool reads via this one and
+    then applies the (PR-state, unit-status) transitions.
     """
+    logger.warning("check_unit_pr is deprecated; use inspect_unit_health(unit_id, dry_run=True)")
     unit_state = state.get_unit_state(unit_id)
     if not unit_state or not unit_state.pr_number:
         return f"ERROR: unit {unit_id} has no PR"
@@ -86,6 +106,17 @@ def check_unit_pr(unit_id: str) -> str:
 @mcp.tool()
 def reconcile_unit_pr(unit_id: str) -> str:
     """Reconcile orchestrator state with the PR's actual status on GitHub.
+
+    .. deprecated:: F-014-U-2
+        Use ``inspect_unit_health(unit_id)`` (non-dry-run) instead —
+        the canonical health surface applies the same ``merged → done``
+        transitions plus the richer event-only signals
+        (``pr_conflict_detected`` / ``required_check_missing`` /
+        ``ci_drift_detected``) and persists shadow decisions for the
+        F-015 promotion runway. This alias preserves the legacy JSON
+        shape (``action`` slug + ``reconciled`` flag) and the cycle-log
+        writer side effect on merged polls; it logs a deprecation
+        warning on each call.
 
     Reads via ``check_unit_pr`` (which never mutates), then applies state
     transitions based on the (PR state, orchestrator status) pair:
@@ -122,6 +153,7 @@ def reconcile_unit_pr(unit_id: str) -> str:
     race that GitHub's REST API can hit catches up on a subsequent
     call. See ``orchestrator.cycle_log.write_cycle_log``.
     """
+    logger.warning("reconcile_unit_pr is deprecated; use inspect_unit_health(unit_id)")
     poll_result = check_unit_pr(unit_id)
     # Surface upstream errors verbatim (no PR, no feature, no token, GH error).
     if poll_result.startswith("ERROR"):
@@ -498,6 +530,86 @@ def tail_worker(unit_id: str, role: str = "coder", limit: int = 20) -> str:
     header = f"worker active, last {n} {plural}{reason_suffix}"
     body = _format_tail_messages(messages)
     return f"{header}\n\n{body}"
+
+
+# --------------------------- scan_unit_session (F-016 Phase 0) ---------------------------
+
+
+@mcp.tool()
+def scan_unit_session(unit_id: str, role: str = "coder") -> str:
+    """Re-scan a worker's recent messages for a terminal marker. **Read-only.**
+
+    Fetches the same ``tail_messages`` ``tail_worker`` shows, joins the
+    assistant text, and runs the pure
+    :func:`orchestrator.markers.scan_response` parser against it. Returns
+    the matched marker (if any) WITHOUT writing any events or flipping
+    state — useful for manual triage when a session went idle and you
+    want to know what marker (if any) the agent emitted before deciding
+    the next step.
+
+    This is the F-016 Phase 0 read-only complement to
+    ``_record_terminal_marker``. The watcher daemon (F-016-U-5) will use
+    the same parser on the same input plus the recorder's
+    ``INSERT OR IGNORE`` dedupe to advance state idempotently; this tool
+    exists so the lead can see what the daemon *would* see without
+    waiting for the daemon to land.
+
+    Returned JSON shape:
+
+      * marker: ``PR_URL`` / ``FIX_PUSHED`` / ``TESTS_PASS`` / … /
+        ``BLOCKED`` / ``null``.
+      * event_type: the unit_events slug that would be recorded.
+      * target_status: the status the unit would transition to (when in
+        an active state). ``null`` for non-flipping markers (BUG_FOUND,
+        REVIEW_REQUEST_CHANGES) and for no-match.
+      * summary / payload: the unit_events fields scan_response would
+        suggest. ``payload`` is the hash input for the dedupe key.
+      * tail_status: the backend's ``tail_messages`` status
+        (``running`` / ``idle`` / ``terminated`` / ``not_found``).
+      * tail_reason: the backend's free-form reason string, when set.
+      * message_count: number of messages scanned (capped at 50).
+
+    Args:
+        unit_id: Work unit whose worker session to scan.
+        role: ``coder`` / ``tester`` / ``reviewer``.
+    """
+    if role not in _ROLE_TO_SESSION_ATTR:
+        valid = "|".join(_ROLE_TO_SESSION_ATTR)
+        return f"ERROR: role must be {valid}, got {role!r}"
+
+    unit_state = state.get_unit_state(unit_id)
+    if not unit_state:
+        return f"ERROR: no state for {unit_id}"
+
+    sid = getattr(unit_state, _ROLE_TO_SESSION_ATTR[role])
+    if not sid:
+        return f"ERROR: no {role} session for {unit_id} — likely never spawned"
+
+    try:
+        worker = make_worker(role)
+        tail_result = worker.tail_messages(sid, limit=50)
+    except ValueError as e:
+        return f"ERROR: {e}"
+    except Exception as e:  # noqa: BLE001 — read-only tool must not crash chat
+        return f"ERROR scanning session {sid}: {e}"
+
+    text = "\n".join(m["text"] for m in tail_result["messages"])
+    spec = markers.scan_response(role, text)
+
+    out: dict[str, object] = {
+        "unit_id": unit_id,
+        "role": role,
+        "session_id": sid,
+        "tail_status": tail_result["status"],
+        "tail_reason": tail_result.get("reason"),
+        "message_count": len(tail_result["messages"]),
+        "marker": spec.marker if spec else None,
+        "event_type": spec.event_type if spec else None,
+        "target_status": spec.target_status if spec else None,
+        "summary": spec.summary if spec else "",
+        "payload": spec.payload if spec else "",
+    }
+    return json.dumps(out, indent=2)
 
 
 # --------------------------- repo verification ---------------------------

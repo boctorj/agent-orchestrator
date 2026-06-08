@@ -87,15 +87,31 @@ gate that refuses to spawn against repos without branch protection.
   know — spec compliance, scope, intent — without duplicating Copilot's
   line-level work. If Copilot's review doesn't arrive within 5 min
   (timeout / not enabled on repo), our reviewer runs solo.
-- `check_unit_pr(unit_id)` — **read-only** poll of GitHub for PR state +
-  CI checks. Does NOT mutate orchestrator state — safe for dashboards
-  and diagnostics. To advance state on a merged PR, use
-  `reconcile_unit_pr`.
-- `reconcile_unit_pr(unit_id)` — read via `check_unit_pr`, then apply
-  state transitions: merged + in_ci → `done` (+ `merged` event); merged
-  + escalated → `done` (+ `merged` AND `recovered_from_escalated` events,
-  clears `last_error`); open / closed-unmerged → no-op. This is the
-  state-advancing call.
+- `inspect_unit_health(unit_id, dry_run=False)` — **canonical** unit-
+  health surface (F-014). Probes the unit's PR (merge state, conflicts,
+  CI check_runs, reviews), worker sessions, and orchestrator-side
+  counters, then runs the `orchestrator.health` decision table. On
+  non-dry-run: applies the same `merged → done` transitions
+  `reconcile_unit_pr` does plus emits `pr_conflict_detected` /
+  `required_check_missing` / `ci_drift_detected` events where
+  applicable; persists each predicted-but-not-yet-promoted shadow
+  rule as a `shadow_transition_proposed` event; and at most once per
+  `ORCH_HEALTH_SNAPSHOT_INTERVAL_HOURS` (default 24h) per unit
+  snapshots the full HealthReport as a `health_report_snapshot` event
+  for forensics. Returns a markdown digest (HealthReport summary +
+  applied actions + shadow decisions). Use this in new flows.
+- `check_unit_pr(unit_id)` — **deprecated** alias for
+  `inspect_unit_health(unit_id, dry_run=True)`. Read-only poll of
+  GitHub for PR state + CI checks. Does NOT mutate orchestrator
+  state. Kept as a thin alias for backward compatibility; prefer
+  `inspect_unit_health(unit_id, dry_run=True)` in new code.
+- `reconcile_unit_pr(unit_id)` — **deprecated** alias for
+  `inspect_unit_health(unit_id)` (non-dry-run). Reads via
+  `check_unit_pr`, then applies state transitions: merged + in_ci →
+  `done` (+ `merged` event); merged + escalated → `done` (+ `merged`
+  AND `recovered_from_escalated` events, clears `last_error`); open /
+  closed-unmerged → no-op. Kept as a thin alias for backward
+  compatibility; prefer `inspect_unit_health(unit_id)` in new code.
 - `unit_history(unit_id)` — full event timeline for debugging.
 - `unit_summary(unit_id)` — human-readable digest.
 
@@ -160,7 +176,8 @@ gate that refuses to spawn against repos without branch protection.
   - `idle` → "worker completed, final messages" + the messages. The
     session finished but the orchestrator hasn't observed the terminal
     marker yet (common after an MCP restart). Read `unit_history` to
-    decide the next step; often `reconcile_unit_pr` is what you want.
+    decide the next step; often `inspect_unit_health(unit_id)` (or the
+    deprecated `reconcile_unit_pr` alias) is what you want.
   - `terminated` → "worker dead (reason); last messages before death" +
     whatever messages were captured pre-crash. The agent crashed. Follow
     up with `resume_unit` to confirm the session is dead, then escalate
@@ -220,12 +237,12 @@ gate that refuses to spawn against repos without branch protection.
 **Verification gating (automatic — you don't call this):**
 
   Every spawn surface (`spawn_unit`, `spawn_tester`, `spawn_reviewer`,
-  `address_review`, `cycle_review`, `send_to_unit`, `parallel_units`,
-  `parallel_units_global`) blocks if the target repo isn't fresh-verified
-  (<24h). On block, the tool returns an ERROR with a fix-it message
-  telling the user to run `verify_repo(<url>)`. Surface that message
-  verbatim; offer to run `verify_repo` for them. After verification
-  succeeds, retry the original spawn.
+  `address_review`, `cycle_review`, `send_to_unit`, `send_to_unit_async`,
+  `cancel_unit`, `parallel_units`, `parallel_units_global`) blocks if the
+  target repo isn't fresh-verified (<24h). On block, the tool returns an
+  ERROR with a fix-it message telling the user to run `verify_repo(<url>)`.
+  Surface that message verbatim; offer to run `verify_repo` for them.
+  After verification succeeds, retry the original spawn.
 
   `load_feature` only WARNS (doesn't block) for an unverified repo —
   planning is free, action requires verification. When you see a ⚠ in
@@ -234,8 +251,41 @@ gate that refuses to spawn against repos without branch protection.
 
 **Low-level / introspection:**
 - `send_to_unit(unit_id, role, message)` — manually resume any role's
-  session with arbitrary text. Use sparingly; prefer the structured tools.
+  session with arbitrary text (synchronous; blocks for the worker's
+  reply). Use sparingly; prefer the structured tools.
 - `get_unit_status(unit_id)`, `list_units(feature_id)`
+
+**Lead/daemon interaction primitives (F-016 Phase 2.5):**
+
+Three primitives — "Observe any time. Send-message is ~1s. Cancel is
+sticky. Graph edits are orthogonal."
+
+- `send_to_unit_async(unit_id, message, role="")` — submit-only mirror
+  of `send_to_unit`. Returns in ~1s after the user-message event lands
+  on the worker's queue; the worker's reply arrives later via the
+  daemon's normal poll (or via `wait_unit` if you want to block).
+  Holds a per-unit advance-lock during the ~1s submit window so a
+  Phase-3 daemon doesn't race the state machine on the same tick.
+  Default role is picked from the unit's current status when `role=""`
+  (coding/opening_pr/in_ci/fixing/escalated → coder, testing → tester,
+  reviewing → reviewer; approved_awaiting_merge/done/cancelled return
+  a structured error). Returns JSON
+  with `{delivered, role, session_id}` on success or `{delivered:
+  false, reason, role_diagnostics, next_steps}` on a not-actionable
+  delivery.
+- `cancel_unit(unit_id)` — sticky cancel: archives every role's worker
+  session and marks the unit `cancelled` with a `cancelled_at`
+  timestamp. The daemon reads `cancelled_at` on every tick and stops
+  driving the unit; downstream dep-evaluation treats it as not-done
+  (depending units stay blocked until you reshape the graph via
+  `update_unit_deps`). Idempotent — a second call returns
+  `already_cancelled`.
+- `update_unit_deps(feature_id, unit_id, depends_on)` — re-shape the
+  DAG for future scheduling without touching any in-flight worker.
+  Validates the resulting graph is still acyclic and every dep refers
+  to a unit in the same plan. Use when the user says "U-3 also depends
+  on U-2 now"; the change takes effect on the next
+  `next_ready_units` / `next_ready_units_all` call.
 
 ### The standard flow per unit (recommended)
 
@@ -244,9 +294,12 @@ gate that refuses to spawn against repos without branch protection.
 3. After `cycle_review` returns `approved_awaiting_merge`: tell the user
    the PR URL and that you're awaiting their merge
 4. Later (when user says "did F-001-U-1 merge?" or you want to advance
-   downstream units): `reconcile_unit_pr(unit_id)` — flips to `done` if
-   merged. (Use `check_unit_pr` if you only want to peek without
-   advancing.)
+   downstream units): `inspect_unit_health(unit_id)` — the canonical
+   F-014 surface. Flips to `done` if merged and surfaces conflict /
+   CI-drift / shadow signals in the same digest. Use
+   `inspect_unit_health(unit_id, dry_run=True)` to peek without
+   advancing. (The legacy `reconcile_unit_pr(unit_id)` and
+   `check_unit_pr(unit_id)` still work as deprecated aliases.)
 
 ### Scheduling rule (when user has approved a plan)
 
@@ -272,9 +325,12 @@ unless the user is explicitly focused on one feature.
 7. After all currently-ready units are processed, tell the user which ones
    are awaiting their merge and stop.
 8. When the user says "I merged X" or "what's next?", call
-   `reconcile_unit_pr(X)` to flip it to done (or `recovered_from_escalated`
-   + done if X was escalated), then `next_ready_units_all()` to find
-   newly-unblocked units across the whole project, and repeat from step 2.
+   `inspect_unit_health(X)` (the F-014 canonical surface) to flip it
+   to done (or `recovered_from_escalated` + done if X was escalated),
+   then `next_ready_units_all()` to find newly-unblocked units across
+   the whole project, and repeat from step 2. The deprecated
+   `reconcile_unit_pr(X)` alias still works for muscle-memory; it
+   routes to the same state-advancing path.
 9. On any escalation, the failure summary already includes the cycle
    history. Don't paraphrase — surface the orchestrator's response. The
    ntfy push has already gone out (if NTFY_TOPIC is set).
@@ -291,7 +347,9 @@ that the orchestrator was restarted, do this FIRST before anything else:
 3. Report what you find:
    - `session_status: idle` → agent finished while away. Read the unit's
      history with `unit_history` to figure out what happened, then decide:
-     spawn the next role manually, or run `reconcile_unit_pr` if merged.
+     spawn the next role manually, or run `inspect_unit_health(unit_id)`
+     (the F-014 canonical surface; `reconcile_unit_pr` remains as a
+     deprecated alias) if merged.
    - `session_status: running` → still working. Note it, move on.
    - `session_status: terminated` → call `tail_worker(unit_id, role)` for
      the last messages before death so the user has actionable context,
@@ -406,6 +464,35 @@ When the user gives you a feature, do this:
 7. On explicit approval (user says "approve", "looks good", "go ahead",
    "ship it", etc.): call `approve_plan(feature_id)` and confirm.
 8. Do **not** auto-approve your own plan. The human decides.
+
+### Feature spec + cycle log discipline (F-006)
+
+Per [`docs/PROPOSAL-feature-spec-and-headless-daemon.md`](docs/PROPOSAL-feature-spec-and-headless-daemon.md)
+§ "CLAUDE.md updates" and the spec/cycle-log format in
+[`docs/SPEC-FORMAT.md`](docs/SPEC-FORMAT.md):
+
+- **Before discussing F-X, call `feature_memory(F-X)`.** Don't rely on
+  prior chat history — fresh sessions re-bootstrap from durable state
+  (spec.md + cycle logs + recent events). One call per feature per
+  session is enough; the digest holds for the conversation.
+- **Edit `features/F-XXX/spec.md` whenever you make a non-obvious design
+  decision** (scope clarification, escalation triaged to a design
+  change, choice between alternatives). Commit with a `Why:` line in
+  the body following the format in `docs/SPEC-FORMAT.md`:
+  ```
+  spec(F-007): keep U-2 monolithic, no DB-schema split
+
+  Why: <one paragraph — what changed in the world, what alternatives
+  were considered, why this option won.>
+  ```
+  The git log of `spec.md` IS the decision log; no separate
+  `decisions.md`. Trivial typo fixes can skip the `Why:` line.
+- **Cycle logs (`features/F-XXX/U-N.md`) are read-only history.** They
+  are auto-written by the orchestrator on terminal state and are
+  immutable on the normal path. To revise a past decision, edit
+  `spec.md` (the canonical source) — never the cycle log. The only
+  allowed mutations are the orchestrator's own post-merge SHA backfill
+  and `regenerate_cycle_log(unit_id)` for orphan recovery.
 
 ## Hard rules
 

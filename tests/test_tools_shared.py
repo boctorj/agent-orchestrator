@@ -231,6 +231,49 @@ class TestComposeTasks:
             )
             assert thread_label not in out
 
+    def test_fix_task_renders_feature_spec_block_when_provided(self, sample_feature, sample_unit):
+        """F-006-U-6 review feedback (H1): the coder.md "Re-read FEATURE
+        SPEC on every resume" rule promises the orchestrator re-injects
+        the block on each fix-loop turn. compose_fix_task must accept the
+        spec kwarg and render it so the prompt's contract is true at
+        runtime, per features/F-006/spec.md § Constraints.
+        """
+        out = compose_fix_task(
+            sample_feature,
+            sample_unit,
+            "branch",
+            42,
+            "human",
+            "spec was clarified",
+            feature_spec_text="# F-001\n\n## Acceptance\n- add(2, 3) == 5",
+        )
+        assert "## FEATURE SPEC" in out
+        assert "add(2, 3) == 5" in out
+
+    def test_fix_task_renders_predecessor_units_block_when_provided(
+        self, sample_feature, sample_unit
+    ):
+        out = compose_fix_task(
+            sample_feature,
+            sample_unit,
+            "branch",
+            42,
+            "reviewer",
+            "drift on validator",
+            predecessor_logs=[("F-001-U-0", "Picked validator Y over X.")],
+        )
+        assert "## PREDECESSOR UNITS" in out
+        assert "F-001-U-0" in out
+        assert "validator Y" in out
+
+    def test_fix_task_omits_context_blocks_when_kwargs_empty(self, sample_feature, sample_unit):
+        """The new kwargs default to empty, so pre-F-006 call sites
+        (and tests that don't pass them) see the original message
+        unchanged — no stray block headers."""
+        out = compose_fix_task(sample_feature, sample_unit, "branch", 42, "ci", "test failed")
+        assert "## FEATURE SPEC" not in out
+        assert "## PREDECESSOR UNITS" not in out
+
 
 # --------------------------- constants ---------------------------
 

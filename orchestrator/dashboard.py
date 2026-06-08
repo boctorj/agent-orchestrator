@@ -45,6 +45,10 @@ STATUS_STYLE: dict[str, tuple[str, str]] = {
     "approved_awaiting_merge": ("green", "🟢"),
     "done": ("green", "✅"),
     "escalated": ("bold red", "🚨"),
+    # F-016 Phase 2.5: sticky-cancel terminal. Distinct from `escalated`
+    # (a triage-required failure) — `cancelled` means the user
+    # explicitly pulled the unit, so it renders dim rather than red.
+    "cancelled": ("dim", "🚫"),
     "in_progress": ("yellow", "🔄"),
 }
 

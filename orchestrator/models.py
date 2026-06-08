@@ -22,6 +22,7 @@ UnitStatus = Literal[
     "approved_awaiting_merge",  # reviewer endorsed; awaits human merge
     "done",  # merged (by human) or otherwise complete
     "escalated",  # cap-3 hit or hard error; awaits human
+    "cancelled",  # user-cancelled via cancel_unit (F-016 Phase 2.5)
 ]
 
 # Single source of truth for status-set membership.
@@ -41,6 +42,11 @@ ACTIVE_UNIT_STATUSES: frozenset[str] = frozenset(
 # the merge flips it to ``done``) — sits in its own bucket. F-009-U-4.
 READY_TO_MERGE_STATUSES: frozenset[str] = frozenset({"approved_awaiting_merge"})
 TERMINAL_UNIT_STATUSES: frozenset[str] = frozenset({"done", "escalated"})
+# Sticky-cancel terminal (F-016 Phase 2.5): the user pulled the unit; no
+# agent is running, no merge will land, and downstream dep-evaluation
+# treats it as not-done (a dep on a ``cancelled`` unit stays blocked
+# forever unless the lead reshapes the graph via ``update_unit_deps``).
+CANCELLED_UNIT_STATUSES: frozenset[str] = frozenset({"cancelled"})
 
 
 @dataclass
@@ -79,7 +85,20 @@ class Plan:
 
 @dataclass
 class WorkUnitState:
-    """Per-unit runtime state, persisted to the work_units table."""
+    """Per-unit runtime state, persisted to the work_units table.
+
+    ``cancelled_at`` and ``owner`` are the F-016 Phase 2.5 additions:
+
+      * ``cancelled_at`` — ISO timestamp when ``cancel_unit`` ran. Sticky:
+        once set, the daemon (F-016-U-5) reads it on every tick and stops
+        driving the unit; the state machine never leaves ``cancelled``.
+      * ``owner`` — short-lived claim string (``"lead"`` while the
+        lead-advance-lock is held; ``""`` otherwise). The Phase 3 daemon
+        will use this column as a CAS target for terminal advances; for
+        Phase 2.5 it just makes the lock visible across processes so the
+        daemon doesn't race the lead's ~1s ``send_to_unit_async`` submit
+        window.
+    """
 
     unit_id: str
     feature_id: str
@@ -92,6 +111,8 @@ class WorkUnitState:
     review_round: int = 0
     last_activity: str = ""
     last_error: str = ""
+    cancelled_at: str | None = None
+    owner: str = ""
 
 
 # --------------------------- repo verification ---------------------------

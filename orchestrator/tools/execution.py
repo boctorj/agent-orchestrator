@@ -10,24 +10,25 @@ from __future__ import annotations
 
 import contextlib
 import json
-import re
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
 from orchestrator import ci_wait, cycle_log, feature_spec, github, ntfy, state, ultrareview
+from orchestrator import markers as markers_module
 from orchestrator.agents import ManagedAgentWorker
 from orchestrator.blocked_reasons import parse_blocked_marker
-from orchestrator.models import ACTIVE_UNIT_STATUSES, Feature, WorkUnit, WorkUnitState
+from orchestrator.models import (
+    ACTIVE_UNIT_STATUSES,
+    CANCELLED_UNIT_STATUSES,
+    READY_TO_MERGE_STATUSES,
+    TERMINAL_UNIT_STATUSES,
+    Feature,
+    WorkUnit,
+    WorkUnitState,
+)
 from orchestrator.tools import (
-    BUG_FOUND_RE,
     CAP_3,
-    FIX_PUSHED_RE,
     PR_URL_RE,
-    REVIEW_CHANGES_RE,
-    REVIEW_COMMENT_RE,
-    REVIEW_RECOMMEND_MERGE_RE,
-    TESTS_PASS_RE,
     blocked_event_details,
     branch_for,
     compose_coder_task,
@@ -47,6 +48,7 @@ from orchestrator.tools import (
     safe_submit_pr_review,
     tail,
 )
+from orchestrator.workers import make_worker
 
 # --------------------------- task-message context helpers ---------------------------
 
@@ -261,6 +263,236 @@ def spawn_unit(feature_id: str, unit_id: str) -> str:
     return (
         f"ESCALATED — coder did not emit a clear marker.\n"
         f"Session: {session_id}\nLast output:\n{tail(response)}"
+    )
+
+
+# --------------------------- spawn_unit_async (F-016 Phase 1) ---------------------------
+
+
+@mcp.tool()
+def spawn_unit_async(feature_id: str, unit_id: str) -> str:
+    """Dispatch a coder for one unit; return in ~2s without waiting.
+
+    Phase 1 of the dispatcher/watcher split (F-016). Persists
+    ``coder_session_id`` to ``state.db`` BEFORE ``spawn_unit_async``
+    returns — a lead killed between this tool's return and the next
+    ``wait_unit`` / daemon tick leaves a recoverable row rather than the
+    ghost-row failure mode (status=coding with empty session_id) the
+    F-014-U-1 escalation surfaced. Pair with
+    ``wait_unit(unit_id, 'coder')`` when the caller wants the marker, or
+    let the F-016-U-5 watcher daemon advance the unit asynchronously.
+
+    The mid-spawn window — between ``worker.spawn_async`` accepting the
+    dispatch and us writing the session id — is the only state where the
+    row exists with ``coder_session_id=""``; a fresh lead can still
+    recover via ``scan_unit_session`` since the row carries
+    ``status=coding`` and the worker session is live on the backend.
+
+    Same preconditions as ``spawn_unit``: feature loaded + approved,
+    GITHUB_TOKEN set, target repo fresh-verified.
+
+    Backend selection follows ``ORCH_WORKER_BACKEND`` via
+    :func:`orchestrator.workers.make_worker`. The ``docker`` backend's
+    ``spawn_async`` raises ``NotImplementedError`` until its async split
+    lands; the lead sees an actionable error rather than a silent block.
+    """
+    if err := ensure_verified_for_feature(feature_id):
+        return err
+
+    feature = state.get_feature(feature_id)
+    if not feature:
+        return f"ERROR: feature {feature_id} not found"
+    if feature.status != "approved":
+        return f"ERROR: feature {feature_id} status is '{feature.status}' — must be 'approved'."
+    if not feature.repo_path:
+        return f"ERROR: feature {feature_id} has no repo_path."
+
+    plan = state.get_plan(feature_id)
+    if not plan:
+        return f"ERROR: no plan for {feature_id}"
+
+    unit = next((u for u in plan.units if u.id == unit_id), None)
+    if not unit:
+        return f"ERROR: unit {unit_id} not in plan for {feature_id}"
+
+    existing = state.get_unit_state(unit_id)
+    if existing and existing.coder_session_id:
+        return (
+            f"ERROR: unit {unit_id} already has coder session {existing.coder_session_id}. "
+            f"Use wait_unit, cycle_review, or address_review to advance it."
+        )
+
+    if err := need_github_token():
+        return err
+    github_token = get_agent_token()
+
+    branch = branch_for(feature, unit)
+    task = compose_coder_task(
+        feature, unit, branch, github_token, **_task_context_kwargs(feature, unit)
+    )
+
+    # Seed the row BEFORE the worker call so a kill between the
+    # ``spawn_async`` submit and our session-id write still leaves a
+    # ``status=coding`` row the next restart can recover (worst case
+    # via ``scan_unit_session`` once the lead manually correlates the
+    # Anthropic-side session). Order matters: row first, then submit,
+    # then session_id write.
+    state.upsert_unit_state(
+        WorkUnitState(unit_id=unit_id, feature_id=feature_id, status="coding", branch=branch)
+    )
+    state.record_event(
+        unit_id,
+        feature_id,
+        "spawn_coder_async",
+        source="orchestrator",
+        cycle_number=0,
+        summary=f"Dispatching coder for {unit_id} (non-blocking)",
+    )
+
+    try:
+        worker = make_worker("coder")
+        session_id = worker.spawn_async(task, title=f"{unit_id}: {unit.title}")
+    except Exception as e:  # noqa: BLE001 — surface as orchestrator error
+        state.touch_unit(unit_id, status="escalated", error=str(e))
+        state.record_event(
+            unit_id,
+            feature_id,
+            "coder_error",
+            source="orchestrator",
+            cycle_number=0,
+            summary=str(e),
+        )
+        return f"ERROR spawning coder for {unit_id}: {e}"
+
+    # Persist session_id immediately. A kill from here on still leaves
+    # ``coder_session_id`` recorded — ``wait_unit`` / the daemon can pick
+    # up the still-running worker. ``last_activity`` advances as part of
+    # the upsert and surfaces in the JSON below.
+    state.upsert_unit_state(
+        WorkUnitState(
+            unit_id=unit_id,
+            feature_id=feature_id,
+            status="coding",
+            branch=branch,
+            coder_session_id=session_id,
+        )
+    )
+    refreshed = state.get_unit_state(unit_id)
+
+    result: dict[str, Any] = {
+        "unit_id": unit_id,
+        "feature_id": feature_id,
+        "session_id": session_id,
+        "branch": branch,
+        "status": "coding",
+        "submitted_at": refreshed.last_activity if refreshed else "",
+    }
+    return json.dumps(result, indent=2)
+
+
+# --------------------------- wait_unit (F-016 Phase 1) ---------------------------
+
+
+@mcp.tool()
+def wait_unit(unit_id: str, role: str = "coder", timeout_s: int = 600) -> str:
+    """Explicit-wait counterpart to ``spawn_unit_async`` / ``resume_async``.
+
+    Streams the worker session via the backend's ``wait_idle`` and:
+
+      * on a recognised terminal marker → records the event idempotently
+        (Phase-0 dedupe), advances the unit row, returns the parsed
+        marker plus its extras (``pr_url`` / ``pr_number`` / etc.) as
+        JSON.
+      * on ``TimeoutError`` after ``timeout_s`` → returns
+        ``{"status": "still_running", "reason": "timeout"}`` WITHOUT
+        flipping the unit row. The caller (lead or daemon) decides
+        whether to retry, escalate, or hand off.
+      * on idle-with-no-marker → returns ``{"status": "still_running",
+        "reason": "no_marker"}`` (status unchanged). Phase-1 wait is a
+        read surface; ``cycle_review`` keeps the "no marker → escalate"
+        policy.
+
+    Backend selection follows ``ORCH_WORKER_BACKEND`` via
+    :func:`orchestrator.workers.make_worker` — the ``docker`` backend's
+    ``wait_idle`` raises ``NotImplementedError`` until its async split
+    lands.
+
+    Args:
+        unit_id: The work unit to wait on.
+        role: ``coder`` / ``tester`` / ``reviewer``.
+        timeout_s: Max seconds before returning ``still_running``.
+    """
+    if role not in ("coder", "tester", "reviewer"):
+        return f"ERROR: role must be coder|tester|reviewer, got {role!r}"
+
+    unit_state = state.get_unit_state(unit_id)
+    if not unit_state:
+        return f"ERROR: no state for unit {unit_id}"
+
+    session_id = _resolve_session_id(unit_state, role)
+    if not session_id:
+        return f"ERROR: no {role} session for {unit_id} — likely never spawned"
+
+    try:
+        worker = make_worker(role)
+        response = worker.wait_idle(session_id, timeout_seconds=timeout_s)
+    except TimeoutError:
+        return json.dumps(
+            {
+                "unit_id": unit_id,
+                "role": role,
+                "session_id": session_id,
+                "status": "still_running",
+                "reason": "timeout",
+                "timeout_s": timeout_s,
+            },
+            indent=2,
+        )
+    except Exception as e:  # noqa: BLE001
+        return f"ERROR waiting on {role} session {session_id}: {e}"
+
+    marker = _record_terminal_marker(
+        unit_id=unit_id,
+        feature_id=unit_state.feature_id,
+        role=role,
+        response=response,
+        session_id=session_id,
+        cycle_number=unit_state.review_round,
+    )
+    if marker is None:
+        # Idled without a recognised marker. Don't escalate here — the
+        # cycle_review and daemon paths own that policy. Phase-1 wait
+        # reports observations; the caller decides next step.
+        return json.dumps(
+            {
+                "unit_id": unit_id,
+                "role": role,
+                "session_id": session_id,
+                "status": "still_running",
+                "reason": "no_marker",
+                "marker": None,
+                "response_tail": tail(response),
+            },
+            indent=2,
+        )
+
+    # ``_record_terminal_marker`` returns ``{"marker": <name>, **extras}``
+    # — for PR_URL that includes ``pr_url`` + ``pr_number``; for BLOCKED
+    # the structured payload. Spread it into the response so callers
+    # don't have to call ``unit_history`` to recover the URL the worker
+    # just emitted.
+    refreshed = state.get_unit_state(unit_id)
+    return json.dumps(
+        {
+            "unit_id": unit_id,
+            "role": role,
+            "session_id": session_id,
+            **marker,
+            "status": refreshed.status if refreshed else unit_state.status,
+            "response_tail": tail(response),
+        },
+        indent=2,
+        default=str,
     )
 
 
@@ -722,7 +954,13 @@ def address_review(unit_id: str, source: str, feedback: str) -> str:
     )
 
     fix_msg = compose_fix_task(
-        feature, unit, unit_state.branch, unit_state.pr_number, source, feedback
+        feature,
+        unit,
+        unit_state.branch,
+        unit_state.pr_number,
+        source,
+        feedback,
+        **_task_context_kwargs(feature, unit),
     )
     try:
         worker = ManagedAgentWorker(role="coder")
@@ -845,7 +1083,19 @@ def _pr_url_for(feature_id: str, unit_state: WorkUnitState | None) -> str | None
 
 
 def _emit_terminal(ctx: CycleContext, outcome: str, msg: str) -> str:
-    """Final return value of cycle_review. Fires ntfy push as side effect."""
+    """Final return value of cycle_review. Fires ntfy push as side effect.
+
+    The ``approved_awaiting_merge`` ntfy push is dedupe-keyed per unit via
+    the ``cycle_terminal_emitted`` event row: ``state.record_event`` with a
+    constant ``cycle_terminal_emitted:<unit_id>`` key uses
+    ``INSERT OR IGNORE`` (Phase 0's primitive) so the second call against
+    the same unit returns ``rowcount == 0`` and the status flip + ntfy push
+    skip. Closes the F-016-U-5 daemon's notification-storm window: a unit
+    sitting in ``approved_awaiting_merge`` for hours waiting on the human
+    merge collects exactly one push, not one per poll interval (PR #58 H1).
+    The escalation branch stays unconditional — re-escalation is rare and
+    the human needs the signal each time.
+    """
     # Finalize the cycle log before the ntfy push so an operator who taps
     # the notification and looks at features/F-XXX/U-N.md sees the
     # current terminal state captured on disk. Covers all cycle_review
@@ -860,12 +1110,31 @@ def _emit_terminal(ctx: CycleContext, outcome: str, msg: str) -> str:
     if outcome == "escalated":
         ntfy.push_escalation(ctx.unit_id, msg, pr_url=pr_url)
     elif outcome == "approved_awaiting_merge":
-        # Persist the awaiting-merge status before pushing — the ntfy listener
-        # follows the URL to the dashboard, which reads this row. The flip is
-        # gated on an active from-state so a stray re-entry can't drift a
-        # `done` unit back to `approved_awaiting_merge` (F-009-U-4).
-        _flip_status_if_active(ctx.unit_id, target="approved_awaiting_merge")
-        ntfy.push_ready_to_merge(ctx.unit_id, pr_url or "(no PR url)", summary=msg)
+        # Dedupe via cycle_terminal_emitted event. INSERT OR IGNORE on the
+        # per-unit dedupe_key means a re-call (daemon tick, accidental
+        # double cycle_review, etc.) returns False here and skips the
+        # status flip + ntfy push (PR #58 H1). Without this, the F-016-U-5
+        # daemon would re-fire the ntfy push on every tick against a unit
+        # sitting in approved_awaiting_merge — a notification storm for
+        # any unit waiting hours/days for the human merge.
+        inserted = state.record_event(
+            ctx.unit_id,
+            ctx.feature_id,
+            "cycle_terminal_emitted",
+            source="orchestrator",
+            cycle_number=unit_state.review_round if unit_state else None,
+            summary="approved_awaiting_merge terminal fired",
+            details=msg,
+            dedupe_key=f"cycle_terminal_emitted:{ctx.unit_id}",
+        )
+        if inserted:
+            # Persist the awaiting-merge status before pushing — the ntfy
+            # listener follows the URL to the dashboard, which reads this
+            # row. The flip is gated on an active from-state so a stray
+            # re-entry can't drift a `done` unit back to
+            # `approved_awaiting_merge` (F-009-U-4).
+            _flip_status_if_active(ctx.unit_id, target="approved_awaiting_merge")
+            ntfy.push_ready_to_merge(ctx.unit_id, pr_url or "(no PR url)", summary=msg)
 
     final_state_json = get_unit_status(ctx.unit_id)
     try:
@@ -912,120 +1181,6 @@ def _flip_status_if_active(unit_id: str, *, target: str, error: str = "") -> Non
         state.touch_unit(unit_id, status=target, error=error)
 
 
-@dataclass(frozen=True)
-class _MarkerSpec:
-    """One (role, marker) pair: regex + the event-recording shape it produces.
-
-    Drives `_record_terminal_marker`'s dispatch loop. Each spec captures
-    everything that varies per marker so the loop body stays a four-liner:
-    regex match → build event payload → optional status flip → return.
-
-    ``build`` receives the regex match plus the worker response and produces
-    ``(extras, event_kwargs)``:
-      - ``extras`` is merged into the helper's return dict alongside
-        ``{"marker": <name>}``.
-      - ``event_kwargs`` is the keyword payload for ``state.record_event``
-        (``summary`` / ``details`` — the rest is filled by the loop).
-
-    ``target_status`` is the status the unit transitions to when this marker
-    matches (and the unit is currently in an active state — see
-    :func:`_flip_status_if_active`). ``None`` means "leave status alone"
-    (BUG_FOUND / REVIEW_REQUEST_CHANGES — the caller's loop owns the next
-    transition). Most success-side markers target ``"in_ci"``;
-    ``REVIEW_RECOMMEND_MERGE`` targets ``"approved_awaiting_merge"`` so the
-    reviewer's endorsement lands the unit in the same status cycle_review's
-    ``_emit_terminal`` would set — closes audit Gap H (F-009-U-4).
-    """
-
-    role: str
-    marker: str
-    pattern: re.Pattern[str]
-    event_type: str
-    target_status: str | None
-    build: Callable[[re.Match[str], str], tuple[dict[str, Any], dict[str, str]]]
-
-
-def _build_pr_url(m: re.Match[str], _response: str) -> tuple[dict[str, Any], dict[str, str]]:
-    pr_url, pr_number = m.group(1), int(m.group(2))
-    return (
-        {"pr_url": pr_url, "pr_number": pr_number},
-        {"summary": f"PR #{pr_number} opened", "details": pr_url},
-    )
-
-
-def _build_fix_pushed(_m: re.Match[str], response: str) -> tuple[dict[str, Any], dict[str, str]]:
-    return ({}, {"summary": "Fix committed and pushed", "details": tail(response)})
-
-
-def _build_tests_pass(_m: re.Match[str], _response: str) -> tuple[dict[str, Any], dict[str, str]]:
-    return ({}, {"summary": "All tests pass", "details": ""})
-
-
-def _build_bug_found(m: re.Match[str], response: str) -> tuple[dict[str, Any], dict[str, str]]:
-    reason = m.group(1).strip()
-    return ({"bug": reason}, {"summary": reason, "details": tail(response)})
-
-
-def _build_recommend_merge(
-    m: re.Match[str], _response: str
-) -> tuple[dict[str, Any], dict[str, str]]:
-    reason = m.group(1).strip()
-    return (
-        {"reason": reason},
-        {"summary": f"Endorsed (self-approval blocked): {reason}", "details": ""},
-    )
-
-
-def _build_request_changes(
-    m: re.Match[str], response: str
-) -> tuple[dict[str, Any], dict[str, str]]:
-    reason = m.group(1).strip()
-    return ({"issue": reason}, {"summary": reason, "details": tail(response)})
-
-
-def _build_review_comment(
-    _m: re.Match[str], _response: str
-) -> tuple[dict[str, Any], dict[str, str]]:
-    return ({}, {"summary": "Comment-only review", "details": ""})
-
-
-# Ordered per role: PR_URL before FIX_PUSHED for the coder branch matches the
-# pre-refactor precedence (the spawn_unit path checks PR_URL first too).
-_MARKER_SPECS: tuple[_MarkerSpec, ...] = (
-    _MarkerSpec("coder", "PR_URL", PR_URL_RE, "pr_opened", "in_ci", _build_pr_url),
-    _MarkerSpec("coder", "FIX_PUSHED", FIX_PUSHED_RE, "fix_pushed", "in_ci", _build_fix_pushed),
-    _MarkerSpec("tester", "TESTS_PASS", TESTS_PASS_RE, "tests_pass", "in_ci", _build_tests_pass),
-    _MarkerSpec("tester", "BUG_FOUND", BUG_FOUND_RE, "tester_bug_found", None, _build_bug_found),
-    _MarkerSpec(
-        "reviewer",
-        "REVIEW_RECOMMEND_MERGE",
-        REVIEW_RECOMMEND_MERGE_RE,
-        "reviewer_recommend_merge",
-        # Reviewer endorsement is terminal for the cycle — land directly in
-        # the awaiting-merge bucket so send_to_unit(reviewer) endorsements
-        # match cycle_review's terminal state (audit Gap H, F-009-U-4).
-        "approved_awaiting_merge",
-        _build_recommend_merge,
-    ),
-    _MarkerSpec(
-        "reviewer",
-        "REVIEW_REQUEST_CHANGES",
-        REVIEW_CHANGES_RE,
-        "reviewer_request_changes",
-        None,
-        _build_request_changes,
-    ),
-    _MarkerSpec(
-        "reviewer",
-        "REVIEW_COMMENT",
-        REVIEW_COMMENT_RE,
-        "reviewer_comment",
-        "in_ci",
-        _build_review_comment,
-    ),
-)
-
-
 def _record_terminal_marker(
     *,
     unit_id: str,
@@ -1041,35 +1196,43 @@ def _record_terminal_marker(
 
     Single source of truth for the marker → (event, status) mapping shared by
     ``spawn_tester``, ``spawn_reviewer``, ``address_review``, and
-    ``send_to_unit``. Cross-role markers are ignored — a tester response
-    containing ``REVIEW_RECOMMEND_MERGE`` is NOT a recognised marker.
+    ``send_to_unit``. The grammar lives in
+    :mod:`orchestrator.markers`; this helper is the recorder half — it
+    takes the pure :class:`markers.MarkerSpec` and applies the audit-row
+    write + status flip side-effects.
 
-    Per-role marker scope::
+    Cross-role markers are ignored — a tester response containing
+    ``REVIEW_RECOMMEND_MERGE`` is NOT a recognised marker. Per-role
+    marker scope::
 
         coder    -> PR_URL | FIX_PUSHED | BLOCKED
         tester   -> TESTS_PASS | BUG_FOUND | BLOCKED
         reviewer -> REVIEW_RECOMMEND_MERGE | REVIEW_REQUEST_CHANGES |
                     REVIEW_COMMENT | BLOCKED
 
-    Each (role, marker) pair is encoded once in ``_MARKER_SPECS``; the body
-    is a single dispatch loop. Callers that know certain role-appropriate
-    markers are invalid in their context can narrow the search via
-    ``markers`` (e.g. ``address_review`` and ``send_to_unit(role='coder')``
-    pass ``{"FIX_PUSHED", "BLOCKED"}`` — a coder resume returning ``PR_URL``
-    is anomalous since the unit already has a PR from ``spawn_unit``, and
-    matching it here would write a spurious ``pr_opened`` event without
-    persisting ``pr_number`` to the unit row).
+    Callers that know certain role-appropriate markers are invalid in
+    their context can narrow the search via ``markers`` (e.g.
+    ``address_review`` and ``send_to_unit(role='coder')`` pass
+    ``{"FIX_PUSHED", "BLOCKED"}`` — a coder resume returning ``PR_URL``
+    is anomalous since the unit already has a PR from ``spawn_unit``,
+    and matching it here would write a spurious ``pr_opened`` event
+    without persisting ``pr_number`` to the unit row).
 
     Side effects on match:
-      - Appends one ``unit_event`` row (``pr_opened`` / ``fix_pushed`` /
-        ``tests_pass`` / ``tester_bug_found`` / ``reviewer_recommend_merge`` /
-        ``reviewer_request_changes`` / ``reviewer_comment`` / ``{role}_blocked``
-        — or the ``blocked_event`` override, used by ``address_review`` to
-        keep the historical ``coder_blocked_on_fix`` distinction).
+      - Appends one ``unit_event`` row keyed by
+        :func:`orchestrator.markers.dedupe_key` — a second call on the
+        same response (e.g. the F-016 watcher daemon re-scanning an idle
+        session) is a no-op via ``INSERT OR IGNORE``. Event types:
+        ``pr_opened`` / ``fix_pushed`` / ``tests_pass`` /
+        ``tester_bug_found`` / ``reviewer_recommend_merge`` /
+        ``reviewer_request_changes`` / ``reviewer_comment`` /
+        ``{role}_blocked`` — or the ``blocked_event`` override, used by
+        ``address_review`` to keep the historical
+        ``coder_blocked_on_fix`` distinction.
       - Updates ``work_units.status`` *only when the unit is currently in an
         active state* (see :func:`_flip_status_if_active`) to the
-        per-marker ``target_status`` from ``_MARKER_SPECS``: most success
-        markers target ``in_ci``; ``REVIEW_RECOMMEND_MERGE`` targets
+        per-marker ``target_status``: most success markers target
+        ``in_ci``; ``REVIEW_RECOMMEND_MERGE`` targets
         ``approved_awaiting_merge`` (F-009-U-4 — matches cycle_review's
         terminal); ``BLOCKED`` flips to ``escalated`` and populates
         ``last_error``; ``BUG_FOUND`` / ``REVIEW_REQUEST_CHANGES`` leave
@@ -1082,51 +1245,46 @@ def _record_terminal_marker(
     Returns ``None`` if no marker matched (caller should escalate as no-marker),
     or a dict ``{"marker": <name>, ...extras}`` describing the match.
     """
-    allowed = (lambda _name: True) if markers is None else (lambda name: name in markers)
+    spec = markers_module.scan_response(role, response, allowed=markers)
+    if spec is None:
+        return None
 
-    for spec in _MARKER_SPECS:
-        if spec.role != role or not allowed(spec.marker):
-            continue
-        match = spec.pattern.search(response)
-        if not match:
-            continue
-        extras, event_kwargs = spec.build(match, response)
-        if spec.target_status is not None:
-            _flip_status_if_active(unit_id, target=spec.target_status)
-        state.record_event(
-            unit_id,
-            feature_id,
-            spec.event_type,
-            source=role,
-            cycle_number=cycle_number,
-            session_id=session_id,
-            **event_kwargs,
-        )
-        return {"marker": spec.marker, **extras}
+    # ``address_review`` keeps the historical ``coder_blocked_on_fix``
+    # discriminator. The override lands BEFORE the dedupe key is hashed so
+    # a fix-loop BLOCKED cannot collide with a spawn-time BLOCKED on the
+    # same coder session.
+    event_type = spec.event_type
+    if spec.marker == "BLOCKED" and blocked_event:
+        event_type = blocked_event
 
-    # BLOCKED is universal across roles and uses parse_blocked_marker (not a
-    # plain regex), so it sits outside the spec table.
-    if allowed("BLOCKED"):
-        payload = parse_blocked_marker(response)
-        if payload is not None:
-            _flip_status_if_active(
-                unit_id,
-                target="escalated",
-                error=format_blocked_last_error(payload),
-            )
-            state.record_event(
-                unit_id,
-                feature_id,
-                blocked_event or f"{role}_blocked",
-                source=role,
-                cycle_number=cycle_number,
-                summary=payload.prose,
-                session_id=session_id,
-                details=blocked_event_details(payload, tail(response)),
-            )
-            return {"marker": "BLOCKED", "payload": payload}
+    # BLOCKED's details JSON-encodes the structured payload + response
+    # tail; the pure scan leaves details empty so the recorder owns the
+    # response-truncation side. Other markers use scan_response's details.
+    details = spec.details
+    if spec.blocked_payload is not None:
+        details = blocked_event_details(spec.blocked_payload, tail(response))
 
-    return None
+    if spec.target_status is not None:
+        _flip_status_if_active(unit_id, target=spec.target_status, error=spec.last_error)
+
+    key = markers_module.dedupe_key(
+        session_id=session_id,
+        cycle_number=cycle_number,
+        event_type=event_type,
+        marker_payload=spec.payload,
+    )
+    state.record_event(
+        unit_id,
+        feature_id,
+        event_type,
+        source=role,
+        cycle_number=cycle_number,
+        session_id=session_id,
+        summary=spec.summary,
+        details=details,
+        dedupe_key=key,
+    )
+    return {"marker": spec.marker, **spec.extras}
 
 
 def _escalate_no_marker(
@@ -1836,6 +1994,9 @@ def _resume_reviewer_for_delta(
     except Exception:  # noqa: BLE001 — best-effort; prompt has a fallback
         current_sha = ""
 
+    delta_kwargs = _task_context_kwargs(feature, unit)
+    if unit_state.review_round >= REVIEWER_OWN_LOG_MIN_ROUND:
+        delta_kwargs["own_cycle_log"] = cycle_log.read_cycle_log(ctx.unit_id)
     delta_msg = compose_reviewer_delta_task(
         feature=feature,
         unit=unit,
@@ -1844,6 +2005,7 @@ def _resume_reviewer_for_delta(
         current_sha=current_sha,
         prior_findings=prior_findings,
         fix_summary=fix_summary,
+        **delta_kwargs,
     )
 
     state.touch_unit(ctx.unit_id, status="reviewing")
@@ -2395,9 +2557,375 @@ def _ultrareview_phase(ctx: CycleContext) -> tuple[bool, str | None]:
             return True, None
 
 
+# --------------------------- F-016 Phase 2: phase commands ---------------------------
+#
+# Status sets define each phase's idempotence boundary: a unit whose status
+# falls in the bucket has already moved past that phase, so the corresponding
+# ``advance_to_X`` returns an ``already_past`` no-op. Single source of truth
+# for the daemon (F-016-U-5) and the lead.
+#
+# Why ``approved_awaiting_merge`` is NOT in ``_PAST_TERMINAL_STATUSES``: the
+# REVIEW_RECOMMEND_MERGE marker flips status to ``approved_awaiting_merge``
+# BEFORE ``advance_to_terminal`` runs; treating it as already-past on the
+# status side alone would skip the ntfy push + cycle-log finalize in
+# ``_emit_terminal``. Re-call dedupe is layered instead via
+# ``_terminal_already_emitted`` (the ``cycle_terminal_emitted`` event row
+# ``_emit_terminal`` records on its first success); a daemon re-tick during
+# the human-merge waiting window reads that event and short-circuits to
+# ``already_past`` without re-pushing ntfy (PR #58 H1). The narrow status
+# bucket + the event-based dedupe together fence the firing window from
+# both sides.
+_PAST_TESTER_STATUSES: frozenset[str] = frozenset(
+    {"reviewing", "fixing", "approved_awaiting_merge", "done"}
+)
+_PAST_REVIEWER_STATUSES: frozenset[str] = frozenset({"approved_awaiting_merge", "done"})
+_PAST_TERMINAL_STATUSES: frozenset[str] = frozenset({"done"})
+
+
+def _not_ready_response(unit_id: str) -> str:
+    """JSON when ``advance_to_X`` is called before ``spawn_unit`` ran.
+
+    The unit row doesn't exist yet — no PR, no worker session. Distinct
+    from ``escalated`` (a terminal failure with last_error context) so a
+    Phase-3 daemon can branch on it: ``not_ready`` means "wait" or
+    "spawn first", not "human triage needed".
+    """
+    return json.dumps(
+        {
+            "unit_id": unit_id,
+            "outcome": "not_ready",
+            "message": f"no state for unit {unit_id} — call spawn_unit first",
+        },
+        indent=2,
+    )
+
+
+def _already_past_response(unit_id: str, unit_state: WorkUnitState, next_action: str | None) -> str:
+    """JSON for a no-op ``advance_to_X`` call.
+
+    Shape mirrors the success-advance JSON so callers (lead chat + daemon)
+    don't need to special-case the idempotent path: same ``unit_id`` /
+    ``status`` / ``next_action`` keys, distinguished only by
+    ``outcome == "already_past"``.
+    """
+    return json.dumps(
+        {
+            "unit_id": unit_id,
+            "outcome": "already_past",
+            "status": unit_state.status,
+            "next_action": next_action,
+        },
+        indent=2,
+    )
+
+
+def _escalated_response(unit_id: str, unit_state: WorkUnitState) -> str:
+    """JSON for an ``advance_to_X`` call on an already-escalated unit.
+
+    Surfaces ``last_error`` so the lead can see why the unit was escalated
+    without an extra ``unit_history`` round-trip. Distinct outcome from
+    ``already_past`` so a Phase-3 daemon can branch on it: escalated units
+    need a human decision, not the next advance.
+    """
+    return json.dumps(
+        {
+            "unit_id": unit_id,
+            "outcome": "escalated",
+            "status": "escalated",
+            "message": unit_state.last_error or "unit already escalated",
+        },
+        indent=2,
+    )
+
+
+def _advance_response(unit_id: str, next_action: str, ctx: CycleContext, **extras: Any) -> str:
+    """JSON for a successful ``advance_to_X`` mid-pipeline advance.
+
+    Intermediate phases (tester, reviewer) don't emit the terminal — that's
+    ``advance_to_terminal``'s job. This helper packages the post-phase
+    status + accumulated history into a uniform shape for the chat and the
+    daemon's reconcile loop.
+    """
+    refreshed = state.get_unit_state(unit_id)
+    body: dict[str, Any] = {
+        "unit_id": unit_id,
+        "outcome": "advanced",
+        "status": refreshed.status if refreshed else "unknown",
+        "next_action": next_action,
+        "history": ctx.history,
+    }
+    body.update(extras)
+    return json.dumps(body, indent=2)
+
+
+def _last_reviewer_outcome(unit_id: str) -> str | None:
+    """Most-recent reviewer terminal marker for the unit, as a marker name.
+
+    Returns ``"REVIEW_RECOMMEND_MERGE"`` / ``"REVIEW_COMMENT"`` /
+    ``"REVIEW_REQUEST_CHANGES"`` or ``None`` if no reviewer marker has
+    landed yet. Used by ``advance_to_terminal`` to decide whether to fire
+    the F-007 ultrareview gate — only endorsements (RECOMMEND_MERGE)
+    trigger it. Reads events rather than threading the outcome through a
+    separate state column so the lead+daemon callers don't need to share
+    in-memory context across MCP calls.
+    """
+    events = state.list_events(unit_id)
+    # Events are oldest-first; we want the most recent reviewer marker.
+    marker_for_event = {
+        "reviewer_recommend_merge": "REVIEW_RECOMMEND_MERGE",
+        "reviewer_comment": "REVIEW_COMMENT",
+        "reviewer_request_changes": "REVIEW_REQUEST_CHANGES",
+    }
+    for event in reversed(events):
+        marker = marker_for_event.get(event.get("event_type", ""))
+        if marker is not None:
+            return marker
+    return None
+
+
+def _terminal_already_emitted(unit_id: str) -> bool:
+    """True iff ``_emit_terminal`` has already fired the
+    ``approved_awaiting_merge`` ntfy push for this unit.
+
+    Checks for the ``cycle_terminal_emitted`` event ``_emit_terminal``
+    records via the per-unit dedupe_key. The single-row read lets
+    ``advance_to_terminal`` short-circuit a daemon re-tick (PR #58 H1)
+    against a unit waiting hours/days for the human merge: status sits
+    in ``approved_awaiting_merge`` for the duration but the dedupe event
+    pins "the terminal already fired", so the second call returns
+    ``already_past`` rather than re-pushing the ntfy.
+    """
+    return any(e.get("event_type") == "cycle_terminal_emitted" for e in state.list_events(unit_id))
+
+
+def _run_tester_advance(ctx: CycleContext) -> tuple[bool, str | None]:
+    """Tester-phase work: GATE 1 (CI on coder push) → tester → GATE 2.
+
+    Returns ``(success, escalation_msg)``. Shared by ``advance_to_tester``
+    and the ``cycle_review`` wrapper so both paths walk the same engine
+    (spec § "No parallel state machine").
+    """
+    ok, msg = _wait_ci_with_fix_loop(ctx, "coder PR push")
+    if not ok:
+        return False, msg or "CI gate failed before tester"
+
+    passed, msg = _tester_phase(ctx)
+    if not passed:
+        return False, msg or "tester phase failed"
+
+    ok, msg = _wait_ci_with_fix_loop(ctx, "tester test push")
+    if not ok:
+        return False, msg or "CI gate failed before reviewer"
+
+    return True, None
+
+
+def _run_reviewer_advance(ctx: CycleContext) -> tuple[bool, str | None, str | None]:
+    """Reviewer-phase work: copilot best-effort + reviewer fix-loop.
+
+    Returns ``(success, escalation_msg, reviewer_outcome)`` where
+    ``reviewer_outcome`` is the final reviewer marker name
+    (``"REVIEW_RECOMMEND_MERGE"`` / ``"REVIEW_COMMENT"`` / ``"BLOCKED…"``)
+    so callers can branch on endorsement vs. comment-only.
+    """
+    _copilot_phase(ctx)
+    approved, msg, reviewer_outcome = _reviewer_phase(ctx)
+    if not approved:
+        return False, msg or "reviewer phase failed", reviewer_outcome
+    return True, None, reviewer_outcome
+
+
+def _run_terminal_advance(
+    ctx: CycleContext, reviewer_outcome: str | None
+) -> tuple[bool, str | None]:
+    """Terminal-phase work: optional ultrareview gate per F-007.
+
+    Doesn't emit the terminal itself — the caller does, so the wrapper can
+    share one ``_emit_terminal`` call (one ntfy push, one cycle-log write)
+    across the three phases. ``reviewer_outcome`` gates the ultrareview
+    fire: only ``REVIEW_RECOMMEND_MERGE`` triggers the audit (comment-only
+    terminals aren't endorsements; the gate stays quiet).
+
+    On FAIL, :func:`_ultrareview_phase` runs its own coder fix-loop (F-007-U-4)
+    sharing the ``CAP_3`` budget with tester-bug / reviewer-change / CI-fix
+    cycles. The reviewer agent is NOT re-engaged inside the loop — endorsement
+    already happened; only the audit needs to clear.
+    """
+    feature = state.get_feature(ctx.feature_id)
+    if (
+        reviewer_outcome == "REVIEW_RECOMMEND_MERGE"
+        and feature is not None
+        and feature.ultrareview_enabled
+    ):
+        ur_passed, ur_msg = _ultrareview_phase(ctx)
+        if not ur_passed:
+            return False, ur_msg or "ultrareview phase failed"
+    return True, None
+
+
+_TERMINAL_SUCCESS_MSG = (
+    "Review terminal (approved/comment/recommend_merge), CI green. PR awaits human merge."
+)
+
+
+@mcp.tool()
+def advance_to_tester(feature_id: str, unit_id: str) -> str:
+    """Phase 1 of the cycle pipeline: wait for CI green → tester → CI green.
+
+    Idempotent on current ``WorkUnitState.status``: returns ``already_past``
+    when the unit has moved past the tester boundary (status in
+    ``{reviewing, fixing, approved_awaiting_merge, done}``). On escalation,
+    fires the same terminal handler as ``cycle_review`` so the cycle log +
+    ntfy push land.
+
+    Returns JSON ``{unit_id, outcome, status, next_action, ...}`` where
+    ``outcome`` is one of ``advanced`` / ``already_past`` / ``escalated`` /
+    ``not_ready``. F-016 Phase 2 — pair with ``advance_to_reviewer`` and
+    ``advance_to_terminal`` to drive the pipeline phase-by-phase.
+    """
+    if err := ensure_verified_for_feature(feature_id):
+        return err
+
+    unit_state = state.get_unit_state(unit_id)
+    if unit_state is None:
+        return _not_ready_response(unit_id)
+
+    if unit_state.status == "escalated":
+        return _escalated_response(unit_id, unit_state)
+
+    if unit_state.status in _PAST_TESTER_STATUSES:
+        return _already_past_response(unit_id, unit_state, next_action="advance_to_reviewer")
+
+    ctx = CycleContext(feature_id=feature_id, unit_id=unit_id, history=[])
+    ok, msg = _run_tester_advance(ctx)
+    if not ok:
+        return _emit_terminal(ctx, "escalated", msg or "tester phase failed")
+
+    return _advance_response(unit_id, next_action="advance_to_reviewer", ctx=ctx)
+
+
+@mcp.tool()
+def advance_to_reviewer(feature_id: str, unit_id: str) -> str:
+    """Phase 2 of the cycle pipeline: Copilot review (best-effort) + reviewer.
+
+    Idempotent on current ``WorkUnitState.status``: returns ``already_past``
+    when status is in ``{approved_awaiting_merge, done}``. On reviewer
+    BLOCKED or cap-3 hit, fires the terminal handler. Mid-flight restart
+    (lead killed between tester and reviewer phases) is supported via
+    ``_resume_or_spawn_reviewer`` — the existing reviewer session is reused
+    for a cheap verdict re-emission rather than a cold spawn (F-013-U-2).
+    """
+    if err := ensure_verified_for_feature(feature_id):
+        return err
+
+    unit_state = state.get_unit_state(unit_id)
+    if unit_state is None:
+        return _not_ready_response(unit_id)
+
+    if unit_state.status == "escalated":
+        return _escalated_response(unit_id, unit_state)
+
+    if unit_state.status in _PAST_REVIEWER_STATUSES:
+        return _already_past_response(unit_id, unit_state, next_action="advance_to_terminal")
+
+    ctx = CycleContext(feature_id=feature_id, unit_id=unit_id, history=[])
+    ok, msg, reviewer_outcome = _run_reviewer_advance(ctx)
+    if not ok:
+        return _emit_terminal(ctx, "escalated", msg or "reviewer phase failed")
+
+    return _advance_response(
+        unit_id,
+        next_action="advance_to_terminal",
+        ctx=ctx,
+        reviewer_outcome=reviewer_outcome,
+    )
+
+
+@mcp.tool()
+def advance_to_terminal(feature_id: str, unit_id: str) -> str:
+    """Phase 3 of the cycle pipeline: optional F-007 ultrareview gate, then
+    emit the terminal (ntfy push + cycle-log finalize + status flip).
+
+    **Reviewer-marker precondition (PR #58 C1).** The success path requires
+    a prior ``reviewer_recommend_merge`` or ``reviewer_comment`` event for
+    this unit. Without one, the call returns ``not_ready`` and does NOT
+    flip status, fire ntfy, or finalize cycle-log — exactly the false
+    "ready to merge" notification the daemon (F-016-U-5) would otherwise
+    push on every poll of a unit still in ``coding`` / ``testing`` /
+    ``in_ci`` / ``reviewing`` / ``fixing``. ``reviewer_request_changes``
+    and the absence of a marker both fall under "no terminal possible
+    yet"; the caller's right next step is ``advance_to_reviewer``.
+
+    **Idempotence on terminal emit (PR #58 H1).** The first successful
+    terminal-emit records a ``cycle_terminal_emitted`` event keyed on the
+    unit; subsequent calls (daemon re-ticks, accidental double
+    ``cycle_review``) read the event in the early already-emitted check
+    and return ``already_past`` without re-firing the ntfy push. The
+    ``status='done'`` short-circuit handles the post-merge path; the
+    event check handles the ``approved_awaiting_merge`` waiting window
+    where a unit can sit for hours/days before a human merges.
+
+    Reads the latest reviewer marker from ``unit_events`` to decide
+    whether to fire ultrareview — only ``REVIEW_RECOMMEND_MERGE``
+    endorsements trigger it (REVIEW_COMMENT terminals are comment-only,
+    not endorsements).
+    """
+    if err := ensure_verified_for_feature(feature_id):
+        return err
+
+    unit_state = state.get_unit_state(unit_id)
+    if unit_state is None:
+        return _not_ready_response(unit_id)
+
+    if unit_state.status == "escalated":
+        return _escalated_response(unit_id, unit_state)
+
+    if unit_state.status in _PAST_TERMINAL_STATUSES:
+        return _already_past_response(unit_id, unit_state, next_action=None)
+
+    # H1 dedupe: if a previous _emit_terminal already fired the ntfy push
+    # and flipped status, the dedupe-keyed cycle_terminal_emitted event
+    # lives in unit_events. Treat the unit as already_past so the daemon's
+    # repeated calls during the human-merge waiting window are no-ops.
+    if _terminal_already_emitted(unit_id):
+        return _already_past_response(unit_id, unit_state, next_action=None)
+
+    reviewer_outcome = _last_reviewer_outcome(unit_id)
+
+    # C1 precondition: no reviewer endorsement / comment means the
+    # terminal phase is not the next action. Returning not_ready (rather
+    # than silently emitting a false-positive "ready to merge") is the
+    # contract every misuse route (lead typo, daemon speculative tick,
+    # test forgetting to seed events) needs.
+    if reviewer_outcome not in ("REVIEW_RECOMMEND_MERGE", "REVIEW_COMMENT"):
+        return json.dumps(
+            {
+                "unit_id": unit_id,
+                "outcome": "not_ready",
+                "status": unit_state.status,
+                "message": (
+                    "no reviewer marker yet — run advance_to_reviewer first "
+                    "(latest reviewer event: " + (reviewer_outcome or "none") + ")"
+                ),
+            },
+            indent=2,
+        )
+
+    ctx = CycleContext(feature_id=feature_id, unit_id=unit_id, history=[])
+    ok, msg = _run_terminal_advance(ctx, reviewer_outcome)
+    if not ok:
+        return _emit_terminal(ctx, "escalated", msg or "ultrareview phase failed")
+
+    return _emit_terminal(ctx, "approved_awaiting_merge", _TERMINAL_SUCCESS_MSG)
+
+
 @mcp.tool()
 def cycle_review(feature_id: str, unit_id: str) -> str:
-    """Full automated post-spawn loop:
+    """Convenience wrapper: ``advance_to_tester`` → ``advance_to_reviewer``
+    → ``advance_to_terminal``, sharing one ``CycleContext`` so history,
+    ntfy push, and cycle-log finalize happen exactly once.
+
+    The post-spawn loop:
       tester → (if BUG: address_review → tester) → Copilot review →
       our reviewer → (if CHANGES: address_review → reviewer) → optional
       ultrareview gate (if feature.ultrareview_enabled) → terminal.
@@ -2416,54 +2944,32 @@ def cycle_review(feature_id: str, unit_id: str) -> str:
     verdict) rather than spawning a fresh one. See
     ``docs/STATE-MACHINE-AUDIT.md``
     § "Stale-session recovery at tester/reviewer re-entry".
+
+    Why a shared ``CycleContext`` rather than three nested MCP calls: the
+    three ``_run_*_advance`` helpers are the engine, the MCP tools are
+    thin wrappers around them with their own idempotence checks. Sharing
+    one ctx keeps history contiguous and lets ``_emit_terminal`` fire
+    exactly once with the full timeline — spec § "No parallel state
+    machine" makes the engine the contract, not the MCP-call topology.
     """
     if err := ensure_verified_for_feature(feature_id):
         return err
 
     ctx = CycleContext(feature_id=feature_id, unit_id=unit_id, history=[])
 
-    # GATE 1: wait for CI on the coder's initial PR push before testing.
-    # If CI is red, the helper runs an embedded fix loop (counts toward CAP_3).
-    ok, msg = _wait_ci_with_fix_loop(ctx, "coder PR push")
+    ok, msg = _run_tester_advance(ctx)
     if not ok:
-        return _emit_terminal(ctx, "escalated", msg or "CI gate failed before tester")
-
-    passed, msg = _tester_phase(ctx)
-    if not passed:
         return _emit_terminal(ctx, "escalated", msg or "tester phase failed")
 
-    # GATE 2: tester pushed its tests; wait for CI green before Copilot + reviewer.
-    ok, msg = _wait_ci_with_fix_loop(ctx, "tester test push")
+    ok, msg, reviewer_outcome = _run_reviewer_advance(ctx)
     if not ok:
-        return _emit_terminal(ctx, "escalated", msg or "CI gate failed before reviewer")
-
-    _copilot_phase(ctx)
-
-    approved, msg, reviewer_outcome = _reviewer_phase(ctx)
-    if not approved:
         return _emit_terminal(ctx, "escalated", msg or "reviewer phase failed")
 
-    # F-007 ultrareview gate: opt-in per feature, fires only after our
-    # reviewer endorsed via REVIEW_RECOMMEND_MERGE (REVIEW_COMMENT is a
-    # comment-only terminal — not an endorsement, so the gate is skipped).
-    # On FAIL, _ultrareview_phase runs its own coder fix-loop (U-4) sharing
-    # the CAP_3 budget; the reviewer agent is NOT re-engaged (endorsement
-    # already happened — only the audit needs to clear).
-    feature = state.get_feature(ctx.feature_id)
-    if (
-        reviewer_outcome == "REVIEW_RECOMMEND_MERGE"
-        and feature is not None
-        and feature.ultrareview_enabled
-    ):
-        ur_passed, ur_msg = _ultrareview_phase(ctx)
-        if not ur_passed:
-            return _emit_terminal(ctx, "escalated", ur_msg or "ultrareview phase failed")
+    ok, msg = _run_terminal_advance(ctx, reviewer_outcome)
+    if not ok:
+        return _emit_terminal(ctx, "escalated", msg or "ultrareview phase failed")
 
-    return _emit_terminal(
-        ctx,
-        "approved_awaiting_merge",
-        "Review terminal (approved/comment/recommend_merge), CI green. PR awaits human merge.",
-    )
+    return _emit_terminal(ctx, "approved_awaiting_merge", _TERMINAL_SUCCESS_MSG)
 
 
 # --------------------------- send_to_unit (low-level) ---------------------------
@@ -2576,6 +3082,450 @@ def send_to_unit(unit_id: str, role: str, message: str) -> str:
         cycle_number=unit_state.review_round,
     )
     return response
+
+
+# --------------------------- F-016 Phase 2.5: lead/daemon contract ---------------------------
+#
+# Three primitives the lead has at runtime to influence a unit while the
+# (Phase 3) daemon drives it:
+#
+#   * ``send_to_unit_async`` — submit-only message; holds the per-unit
+#     advance-lock for the ~1s submit window so the daemon's tick
+#     doesn't race ``advance_state_machine`` against an in-flight send.
+#   * ``cancel_unit`` — sticky cancel; archives every role's session and
+#     marks the unit ``cancelled`` so the daemon's next tick stops
+#     driving it.
+#
+# The graph-mutation primitive ``update_unit_deps`` lives in
+# ``orchestrator/tools/planning.py`` because it edits the plan, not the
+# work-unit row.
+
+
+# Per the spec § "Routing rule for send_to_unit(unit_id, message, role=None)":
+# default role by current ``WorkUnitState.status``. Statuses where no
+# role is actionable map to ``None`` so :func:`_resolve_default_role`
+# returns ``None`` and :func:`send_to_unit_async` surfaces a structured
+# error rather than picking a wrong role.
+_DEFAULT_ROLE_BY_STATUS: dict[str, str | None] = {
+    "coding": "coder",
+    "opening_pr": "coder",
+    "in_ci": "coder",
+    "fixing": "coder",
+    "testing": "tester",
+    "reviewing": "reviewer",
+    "escalated": "coder",
+    "approved_awaiting_merge": None,
+    "done": None,
+    "cancelled": None,
+}
+
+
+def _role_session_status(unit_state: WorkUnitState, role: str) -> dict[str, Any]:
+    """Per-role actionability digest for :func:`send_to_unit_async`.
+
+    Returns ``{"status": str, "actionable": bool}`` per the spec's
+    "Not-actionable delivery responses" section. Phase 2.5 ships a
+    *coarse* signal — non-empty ``session_id`` resolves to
+    ``actionable: True`` regardless of whether the worker session is
+    actually idle, terminated, or archived. The F-016-U-5 daemon will
+    refine this via the F-014 unit-health probe; this deferral is
+    documented in the PR description's ``## Spec satisfaction →
+    Deviations`` so a caller relying on the spec's four-case shape
+    knows the gap.
+
+    The return shape stays narrow on purpose: ``{status, actionable}``
+    only — no ``session_id`` field, because the diagnostics payload is
+    surfaced to the lead and leaking the worker session identifier
+    through an error-response surface is more than the docstring
+    contract promises.
+    """
+    sid = _resolve_session_id(unit_state, role)
+    if not sid:
+        return {"status": "no_session", "actionable": False}
+    # Phase 2.5 deferral: terminated / archived collapse to "idle" with
+    # actionable=True. The spec's four-case shape requires probing the
+    # backend's session-status surface; that lands in F-016-U-5.
+    return {"status": "idle", "actionable": True}
+
+
+def _role_diagnostics_payload(unit_state: WorkUnitState) -> dict[str, dict[str, Any]]:
+    """``{role: {status, actionable, ...}}`` for every worker role."""
+    return {
+        role: _role_session_status(unit_state, role) for role in ("coder", "tester", "reviewer")
+    }
+
+
+def _resolve_default_role(unit_state: WorkUnitState) -> str | None:
+    """Pick the default role for an unspecified ``send_to_unit_async`` call.
+
+    Returns one of ``"coder"`` / ``"tester"`` / ``"reviewer"`` per the
+    spec's routing table, or ``None`` when the current status has no
+    actionable role (terminal: ``approved_awaiting_merge`` / ``done`` /
+    ``cancelled``). The caller surfaces ``None`` as a structured error.
+    """
+    return _DEFAULT_ROLE_BY_STATUS.get(unit_state.status)
+
+
+@mcp.tool()
+def send_to_unit_async(unit_id: str, message: str, role: str = "") -> str:
+    """Submit a follow-up message to a worker session WITHOUT waiting for the reply.
+
+    Async counterpart to :func:`send_to_unit`. Per the spec, ``send_to_unit``
+    becomes a ~1s submit window once ``worker.resume_async`` is available:
+    the user-message event lands on the worker's queue, the per-unit
+    advance-lock is held during the submit so a Phase 3 daemon doesn't
+    race ``advance_state_machine`` on the same tick, and the worker's
+    response arrives later via the daemon's normal poll (or via
+    :func:`wait_unit` if the lead chooses to block).
+
+    Routing — when ``role`` is empty, the default is picked from the
+    unit's current ``WorkUnitState.status`` per the spec's routing table::
+
+        coding | in_ci | fixing | escalated -> coder
+        testing                              -> tester
+        reviewing                            -> reviewer
+        approved_awaiting_merge | done | cancelled -> ERROR (terminal)
+
+    The lead overrides explicitly when its intent diverges from the
+    current phase. No content heuristics, no auto-fallback to a
+    different role on delivery failure — silently sending to the wrong
+    role would corrupt intent worse than a structured error.
+
+    Returns JSON. Successful submit::
+
+        {
+          "delivered": true,
+          "unit_id": "...",
+          "role": "coder",
+          "session_id": "sess_abc...",
+          "advance_lock": "released"
+        }
+
+    Not-actionable delivery (per spec §"Not-actionable delivery responses")::
+
+        {
+          "delivered": false,
+          "reason": "<unit_terminal|unit_cancelled|no_session|no_default_role|...>",
+          "role_diagnostics": {
+              "coder":    {"status": "...", "actionable": <bool>},
+              "tester":   {"status": "...", "actionable": <bool>},
+              "reviewer": {"status": "...", "actionable": <bool>}
+          },
+          "next_steps": ["...", "..."]
+        }
+
+    Repo must be fresh-verified (call ``verify_repo(<url>)`` if blocked).
+    """
+    if err := ensure_verified_for_unit(unit_id):
+        return err
+
+    unit_state = state.get_unit_state(unit_id)
+    if not unit_state:
+        return f"ERROR: no state for unit {unit_id}"
+
+    # Terminal-status refusal (PR #59 Copilot finding 1). A unit in
+    # ``done`` / ``approved_awaiting_merge`` / ``cancelled`` must NOT
+    # receive new messages regardless of whether the caller passed an
+    # explicit ``role`` — burning an API call on a terminal unit is
+    # the exact failure mode the spec's routing table ("done | cancelled
+    # → error — unit is terminal", "approved_awaiting_merge → error —
+    # PR is done") guards against. The role-resolution short-circuit
+    # below only fires when ``role==""``, so without this gate an
+    # explicit ``role="coder"`` would slip past. ``escalated`` is
+    # intentionally NOT in this set — the spec routes escalated → coder
+    # so the lead can hand-hold the coder through triage.
+    if state.is_cancelled(unit_id):
+        return json.dumps(
+            {
+                "delivered": False,
+                "reason": "unit_cancelled",
+                "unit_id": unit_id,
+                "role_diagnostics": _role_diagnostics_payload(unit_state),
+                "next_steps": [
+                    "unit was cancelled via cancel_unit; spawn fresh or pick a different unit",
+                ],
+            },
+            indent=2,
+        )
+
+    if unit_state.status in ("done", "approved_awaiting_merge"):
+        return json.dumps(
+            {
+                "delivered": False,
+                "reason": "unit_terminal",
+                "unit_id": unit_id,
+                "status": unit_state.status,
+                "role_diagnostics": _role_diagnostics_payload(unit_state),
+                "next_steps": [
+                    f"unit is {unit_state.status!r}; no role can receive a message",
+                ],
+            },
+            indent=2,
+        )
+
+    if role == "":
+        default_role = _resolve_default_role(unit_state)
+        if default_role is None:
+            return json.dumps(
+                {
+                    "delivered": False,
+                    "reason": "no_default_role",
+                    "unit_id": unit_id,
+                    "status": unit_state.status,
+                    "role_diagnostics": _role_diagnostics_payload(unit_state),
+                    "next_steps": [
+                        "unit is in a terminal status; no role can receive a message",
+                    ],
+                },
+                indent=2,
+            )
+        role = default_role
+
+    if role not in ("coder", "tester", "reviewer"):
+        return f"ERROR: role must be coder|tester|reviewer, got {role!r}"
+
+    session_id = _resolve_session_id(unit_state, role)
+    if not session_id:
+        return json.dumps(
+            {
+                "delivered": False,
+                "reason": f"no_{role}_session",
+                "unit_id": unit_id,
+                "role": role,
+                "role_diagnostics": _role_diagnostics_payload(unit_state),
+                "next_steps": [
+                    f"{role} has not been spawned for {unit_id}; "
+                    "use spawn_unit / spawn_tester / spawn_reviewer first",
+                ],
+            },
+            indent=2,
+        )
+
+    # Hold the advance-lock for the ~1s submit window. Per spec the lock
+    # is unit-wide (not per-role) so a same-tick daemon doesn't advance
+    # the reviewer while the coder is mid-receive. The DB-side
+    # ``owner='lead'`` write makes the claim visible to the Phase 3
+    # daemon (separate process); the in-process RLock serializes
+    # concurrent leads in the same MCP server.
+    with state.lead_advance_lock(unit_id):
+        try:
+            worker = make_worker(role)
+            worker.resume_async(session_id, message)
+        except Exception as e:  # noqa: BLE001 — surface as orchestrator error
+            state.touch_unit(unit_id, error=str(e))
+            return json.dumps(
+                {
+                    "delivered": False,
+                    "reason": f"{role}_resume_async_error",
+                    "unit_id": unit_id,
+                    "role": role,
+                    "session_id": session_id,
+                    "error": str(e),
+                    "role_diagnostics": _role_diagnostics_payload(unit_state),
+                    "next_steps": [
+                        f"{role} session rejected the resume — check unit_history "
+                        f"for the worker's last messages, then retry or escalate",
+                    ],
+                },
+                indent=2,
+            )
+
+        # Audit row mirrors the synchronous ``send_to_unit`` path so the
+        # event log shows lead-issued messages whether the lead waited
+        # for the reply or not.
+        _record_manual_message(
+            unit_id=unit_id,
+            feature_id=unit_state.feature_id,
+            role=role,
+            session_id=session_id,
+            message=message,
+            cycle_number=unit_state.review_round,
+        )
+
+    return json.dumps(
+        {
+            "delivered": True,
+            "unit_id": unit_id,
+            "role": role,
+            "session_id": session_id,
+            "advance_lock": "released",
+        },
+        indent=2,
+    )
+
+
+# Statuses ``cancel_unit`` refuses to mutate. A merged (``done``) /
+# endorsed (``approved_awaiting_merge``) / escalated unit has a
+# meaningful terminal record the user does NOT want silently rewritten
+# to ``cancelled`` — flipping ``done → cancelled`` erases the merge
+# evidence the scheduler reads to satisfy downstream deps, flipping
+# ``approved_awaiting_merge → cancelled`` removes the pending-merge
+# indicator the user is waiting on, and flipping ``escalated``
+# overwrites the ``last_error`` triage anchor. The ``CANCELLED_UNIT_STATUSES``
+# member is the idempotent re-call path handled separately below.
+_CANCEL_REFUSED_STATUSES: frozenset[str] = TERMINAL_UNIT_STATUSES | READY_TO_MERGE_STATUSES
+
+
+def _archive_unit_sessions(unit_state: WorkUnitState) -> dict[str, str]:
+    """Best-effort archive every worker session associated with the unit.
+
+    Returns ``{role: outcome}`` where outcome is ``"archived"``,
+    ``"no_session"``, or ``"error: <exception>"``. Cancellation must
+    proceed even when a backend call raises (transient gh / Anthropic
+    outage shouldn't strand the unit in ``coding``); the caller decides
+    whether to surface partial failures to the user.
+    """
+    outcomes: dict[str, str] = {}
+    for role in ("coder", "tester", "reviewer"):
+        sid = _resolve_session_id(unit_state, role)
+        if not sid:
+            outcomes[role] = "no_session"
+            continue
+        try:
+            worker = make_worker(role)
+            worker.archive(sid)
+            outcomes[role] = "archived"
+        except Exception as e:  # noqa: BLE001 — proceed with cancel
+            outcomes[role] = f"error: {e}"
+    return outcomes
+
+
+@mcp.tool()
+def cancel_unit(unit_id: str) -> str:
+    """Sticky-cancel a unit: archive every worker session, mark ``cancelled``.
+
+    F-016 Phase 2.5 primitive. The unit's status is flipped to
+    ``cancelled`` and ``cancelled_at`` is stamped — both sticky: the
+    Phase 3 daemon reads ``cancelled_at`` on every tick and stops
+    driving the unit. Every role's worker session is best-effort
+    archived (a backend error does not block the cancel).
+
+    **Refuses terminal statuses** (PR #59 C1). A merged (``done``) /
+    endorsed (``approved_awaiting_merge``) / escalated unit is not
+    cancellable — ``cancel_unit`` is for halting *in-flight* work, and
+    silently rewriting a terminal status would erase the merge record
+    that downstream dep evaluation depends on, drop the
+    pending-merge indicator the user is waiting on, or overwrite the
+    ``last_error`` triage anchor on an escalation. Returns
+    ``outcome: refused`` without touching the unit or archiving
+    sessions; the caller surfaces this to the user.
+
+    Idempotent: re-calling on an already-cancelled unit returns
+    ``outcome: already_cancelled`` without re-archiving sessions.
+
+    **Serialized via** :func:`state.lead_advance_lock` (PR #59 M3).
+    The lock window covers the archive + status flip + audit row so
+    two concurrent ``cancel_unit`` calls double-archive only their
+    in-process serialization paths, and a Phase 3 daemon tick during
+    the window sees ``owner='lead'`` and defers. The audit event row
+    is dedupe-keyed per unit so an MCP retry that bypasses the lock
+    (different process) still writes one ``unit_cancelled`` row.
+
+    Downstream dep-evaluation treats a ``cancelled`` unit as not-done —
+    units depending on it stay blocked until the lead reshapes the
+    graph via :func:`update_unit_deps`. Spec § "cancel_unit archives
+    the worker session and marks the unit cancelled".
+
+    Repo must be fresh-verified (call ``verify_repo(<url>)`` if blocked).
+    """
+    if err := ensure_verified_for_unit(unit_id):
+        return err
+
+    # First-pass read for the early-refusal short-circuits. We re-read
+    # inside the lock below to close the TOCTOU on the status check —
+    # but the read outside is cheap and lets us skip locking entirely
+    # when the unit is already terminal / cancelled.
+    unit_state = state.get_unit_state(unit_id)
+    if not unit_state:
+        return f"ERROR: no state for unit {unit_id}"
+
+    if unit_state.status in _CANCEL_REFUSED_STATUSES:
+        return json.dumps(
+            {
+                "unit_id": unit_id,
+                "outcome": "refused",
+                "status": unit_state.status,
+                "reason": (
+                    f"unit is {unit_state.status!r}; cancel_unit refuses terminal "
+                    "statuses (merge record / endorsement / escalation must not "
+                    "be silently rewritten)"
+                ),
+            },
+            indent=2,
+        )
+
+    if unit_state.status in CANCELLED_UNIT_STATUSES:
+        return json.dumps(
+            {
+                "unit_id": unit_id,
+                "outcome": "already_cancelled",
+                "cancelled_at": unit_state.cancelled_at,
+            },
+            indent=2,
+        )
+
+    # Serialize against concurrent cancels + send_to_unit_async + the
+    # future Phase 3 daemon tick. Re-read the row inside the lock so
+    # the terminal-refuse + already-cancelled checks see whatever
+    # landed while we were waiting on the lock.
+    with state.lead_advance_lock(unit_id):
+        unit_state = state.get_unit_state(unit_id)
+        if not unit_state:
+            return f"ERROR: no state for unit {unit_id} (row vanished under lock)"
+        if unit_state.status in _CANCEL_REFUSED_STATUSES:
+            return json.dumps(
+                {
+                    "unit_id": unit_id,
+                    "outcome": "refused",
+                    "status": unit_state.status,
+                    "reason": (
+                        f"unit is {unit_state.status!r}; cancel_unit refuses terminal statuses"
+                    ),
+                },
+                indent=2,
+            )
+        if unit_state.status in CANCELLED_UNIT_STATUSES:
+            return json.dumps(
+                {
+                    "unit_id": unit_id,
+                    "outcome": "already_cancelled",
+                    "cancelled_at": unit_state.cancelled_at,
+                },
+                indent=2,
+            )
+
+        archive_outcomes = _archive_unit_sessions(unit_state)
+
+        if not state.cancel_unit(unit_id):
+            return f"ERROR: cancel_unit failed for {unit_id} (row missing)"
+
+        state.record_event(
+            unit_id,
+            unit_state.feature_id,
+            "unit_cancelled",
+            source="human",
+            cycle_number=unit_state.review_round,
+            summary="Unit cancelled via cancel_unit",
+            details=json.dumps({"archive_outcomes": archive_outcomes}),
+            # Dedupe per unit — a same-process retry that re-enters
+            # under the same lock would already short-circuit on
+            # ``status == cancelled``; this key catches the
+            # cross-process race (two MCP servers, MCP retry storm)
+            # where the lock can't serialize.
+            dedupe_key=f"{unit_id}|unit_cancelled",
+        )
+
+    refreshed = state.get_unit_state(unit_id)
+    return json.dumps(
+        {
+            "unit_id": unit_id,
+            "outcome": "cancelled",
+            "status": refreshed.status if refreshed else "cancelled",
+            "cancelled_at": refreshed.cancelled_at if refreshed else None,
+            "archive_outcomes": archive_outcomes,
+        },
+        indent=2,
+    )
 
 
 # Re-export for cycle_review's _emit_terminal (avoids circular import via observability)

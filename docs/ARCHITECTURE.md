@@ -349,7 +349,8 @@ structure under `orchestrator/` including subpackages such as `tools/`,
                                                   │ summary           │
                                                   │ details           │
                                                   │ session_id        │
-                                                  └───────────────────┘
+                                                  │ dedupe_key UNIQ?  │ ◄── F-016 Phase 0
+                                                  └───────────────────┘     (INSERT OR IGNORE)
 
                     ┌───────────────────┐
                     │ cached_resources  │ ◄── (role, prompt_hash) PK
@@ -461,6 +462,17 @@ ANY active state can transition to:
               ┌──────────┐
               │escalated │   (cap-3 hit, BLOCKED marker, no-marker emit,
               └──────────┘    or unexpected error). ntfy push fires.
+
+ANY active or pre-merge state can transition to:
+              ┌───────────┐
+              │ cancelled │   (sticky — user invoked `cancel_unit` to halt
+              └───────────┘   in-flight work. F-016 Phase 2.5.
+                              Worker sessions are archived; `cancelled_at`
+                              is stamped and downstream dep evaluation
+                              treats the unit as not-done. `cancel_unit`
+                              refuses terminal statuses, so `done`,
+                              `approved_awaiting_merge`, and `escalated`
+                              are NOT cancellable.)
 ```
 
 Where `cycle_review` runs `_tester_phase()` then `_copilot_phase()` then

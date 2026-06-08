@@ -282,6 +282,100 @@ class TestUltrareviewMigration:
             conn.close()
 
 
+class TestUnitEventsDedupeKeyMigration:
+    """F-016 Phase 0 — ``unit_events.dedupe_key`` must back-fill onto
+    pre-F-016 state.db files and the UNIQUE index must enforce
+    at-most-one row per non-null key.
+
+    Mirrors :class:`TestUltrareviewMigration`'s structure; the migration
+    helper is shaped the same way (PRAGMA-probe → ALTER → swallow
+    duplicate column) but additionally creates the partial-unique
+    index that powers ``INSERT OR IGNORE`` dedupe.
+    """
+
+    def test_migration_adds_column_to_pre_existing_events_table(self, monkeypatch, tmp_path):
+        db_path = tmp_path / "legacy.db"
+        monkeypatch.setattr("orchestrator.state.STATE_DB", db_path)
+
+        # Hand-build a pre-F-016 unit_events table (no dedupe_key).
+        with sqlite3.connect(db_path) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE features (
+                    id            TEXT PRIMARY KEY,
+                    title         TEXT NOT NULL,
+                    description   TEXT NOT NULL,
+                    repo_path     TEXT NOT NULL DEFAULT '',
+                    branch_prefix TEXT NOT NULL DEFAULT '',
+                    status        TEXT NOT NULL DEFAULT 'draft',
+                    created_at    TEXT NOT NULL
+                );
+                CREATE TABLE work_units (
+                    unit_id              TEXT PRIMARY KEY,
+                    feature_id           TEXT NOT NULL,
+                    status               TEXT NOT NULL DEFAULT 'pending',
+                    branch               TEXT NOT NULL DEFAULT '',
+                    pr_number            INTEGER,
+                    coder_session_id     TEXT NOT NULL DEFAULT '',
+                    tester_session_id    TEXT NOT NULL DEFAULT '',
+                    reviewer_session_id  TEXT NOT NULL DEFAULT '',
+                    review_round         INTEGER NOT NULL DEFAULT 0,
+                    last_activity        TEXT NOT NULL DEFAULT '',
+                    last_error           TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE unit_events (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    unit_id       TEXT NOT NULL,
+                    feature_id    TEXT NOT NULL,
+                    ts            TEXT NOT NULL,
+                    event_type    TEXT NOT NULL,
+                    source        TEXT NOT NULL DEFAULT 'orchestrator',
+                    cycle_number  INTEGER,
+                    summary       TEXT NOT NULL DEFAULT '',
+                    details       TEXT NOT NULL DEFAULT '',
+                    session_id    TEXT NOT NULL DEFAULT ''
+                );
+                """
+            )
+
+        # init_db() must add the column + index without touching existing rows.
+        state.init_db()
+
+        with sqlite3.connect(db_path) as conn:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(unit_events)").fetchall()}
+            indexes = {r[1] for r in conn.execute("PRAGMA index_list(unit_events)").fetchall()}
+        assert "dedupe_key" in cols
+        assert "idx_unit_events_dedupe_key" in indexes
+
+    def test_init_db_is_idempotent_after_dedupe_migration(self, monkeypatch, tmp_path):
+        db_path = tmp_path / "idem.db"
+        monkeypatch.setattr("orchestrator.state.STATE_DB", db_path)
+        state.init_db()
+        state.init_db()  # would raise "duplicate column name" if non-idempotent
+        with sqlite3.connect(db_path) as conn:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(unit_events)").fetchall()}
+        assert "dedupe_key" in cols
+
+    def test_unique_index_enforces_at_most_one_row_per_key(self, tmp_state_db):
+        """The whole point of Phase 0: a second INSERT OR IGNORE with
+        the same dedupe_key collapses to a no-op via the UNIQUE index."""
+        state.save_feature(Feature(id="F", title="t", description=""))
+        state.upsert_unit_state(WorkUnitState(unit_id="U1", feature_id="F", status="coding"))
+
+        with sqlite3.connect(tmp_state_db) as conn:
+            conn.execute(
+                "INSERT INTO unit_events (unit_id, feature_id, ts, event_type, dedupe_key) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("U1", "F", "2026-06-01T00:00:00Z", "t", "shared-key"),
+            )
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(
+                    "INSERT INTO unit_events (unit_id, feature_id, ts, event_type, dedupe_key) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    ("U1", "F", "2026-06-01T00:00:01Z", "t", "shared-key"),
+                )
+
+
 # --------------------------- plans ---------------------------
 
 
@@ -450,7 +544,50 @@ class TestEvents:
         assert s["event_counts_by_type"]["spawn_coder"] == 1
 
 
-# --------------------------- cached resources ---------------------------
+class TestEventDedupeKey:
+    """F-016 Phase 0 — ``dedupe_key`` makes terminal-marker recording
+    idempotent.
+
+    ``state.record_event`` writes an INSERT OR IGNORE row. When the key
+    is omitted (legacy callers) every event lands; when supplied, a
+    second call with the same key collapses to a no-op so the watcher
+    daemon re-scanning an idle session can't drift the audit log.
+    """
+
+    def _seed(self, tmp_state_db):
+        state.save_feature(Feature(id="F", title="t", description=""))
+        state.upsert_unit_state(WorkUnitState(unit_id="U1", feature_id="F", status="coding"))
+
+    def test_first_insert_returns_true(self, tmp_state_db):
+        self._seed(tmp_state_db)
+        inserted = state.record_event("U1", "F", "fix_pushed", dedupe_key="key-1", summary="first")
+        assert inserted is True
+        assert len(state.list_events("U1")) == 1
+
+    def test_duplicate_dedupe_key_collapses_to_no_op(self, tmp_state_db):
+        self._seed(tmp_state_db)
+        state.record_event("U1", "F", "fix_pushed", dedupe_key="key-1", summary="first")
+        second = state.record_event("U1", "F", "fix_pushed", dedupe_key="key-1", summary="DUP")
+        assert second is False
+        events = state.list_events("U1")
+        assert len(events) == 1
+        # Original row was preserved — duplicate did not overwrite.
+        assert events[0]["summary"] == "first"
+
+    def test_distinct_keys_each_insert(self, tmp_state_db):
+        self._seed(tmp_state_db)
+        assert state.record_event("U1", "F", "fix_pushed", dedupe_key="k-1") is True
+        assert state.record_event("U1", "F", "fix_pushed", dedupe_key="k-2") is True
+        assert len(state.list_events("U1")) == 2
+
+    def test_null_dedupe_keys_do_not_collide(self, tmp_state_db):
+        """The UNIQUE index treats NULL as distinct so non-marker callers
+        (``spawn_coder``, ``coder_resumed``, ``merged``) keep appending one
+        row per call."""
+        self._seed(tmp_state_db)
+        for _ in range(3):
+            assert state.record_event("U1", "F", "spawn_coder") is True
+        assert len(state.list_events("U1")) == 3
 
 
 class TestCachedResources:
@@ -657,3 +794,418 @@ class TestVerifiedRepoTTL:
         state.save_verified_repo(_passing_result())
         # 0-hour TTL → anything is stale
         assert state.get_fresh_verified_repo("https://github.com/owner/repo", ttl_hours=0) is None
+
+
+# --------------------------- F-016 Phase 2.5 ---------------------------
+
+
+def _seed_phase25_unit(unit_id: str = "U1", feature_id: str = "F1") -> None:
+    """Minimal feature + work_unit setup for the Phase 2.5 helpers."""
+    state.save_feature(Feature(id=feature_id, title="t", description="d", status="approved"))
+    state.upsert_unit_state(WorkUnitState(unit_id=unit_id, feature_id=feature_id, status="coding"))
+
+
+class TestLeadAdvanceLock:
+    def test_owner_set_under_lock_and_cleared_after(self, tmp_state_db):
+        _seed_phase25_unit()
+        assert state.has_active_advance_lock("U1") is False
+        with state.lead_advance_lock("U1"):
+            s = state.get_unit_state("U1")
+            assert s is not None and s.owner == state.LEAD_OWNER
+            assert state.has_active_advance_lock("U1") is True
+        s = state.get_unit_state("U1")
+        assert s is not None and s.owner == ""
+        assert state.has_active_advance_lock("U1") is False
+
+    def test_lock_is_reentrant_same_thread(self, tmp_state_db):
+        """RLock semantics — same thread can re-enter without deadlock.
+        Required for nested helper paths that hold the lock and then
+        call another helper that also takes it."""
+        _seed_phase25_unit()
+        with state.lead_advance_lock("U1"), state.lead_advance_lock("U1"):
+            assert state.has_active_advance_lock("U1") is True
+
+    def test_owner_cleared_on_exception(self, tmp_state_db):
+        _seed_phase25_unit()
+        with pytest.raises(ValueError), state.lead_advance_lock("U1"):
+            raise ValueError("boom")
+        s = state.get_unit_state("U1")
+        assert s is not None and s.owner == ""
+
+    def test_lock_uses_cas_does_not_clobber_daemon_claim(self, tmp_state_db):
+        """Reviewer PR #59 M2: ``lead_advance_lock`` MUST use the
+        ``claim_unit_owner`` CAS path so a daemon's prior
+        ``owner='daemon'`` claim is preserved across the lead's lock
+        window — not silently overwritten by a blind UPDATE. The
+        in-process RLock still serializes concurrent leads, but the
+        DB-side ``owner`` column remains the daemon's CAS slot."""
+        _seed_phase25_unit()
+        assert state.claim_unit_owner("U1", "daemon") is True
+        with state.lead_advance_lock("U1"):
+            s = state.get_unit_state("U1")
+            assert s is not None
+            # The lead's CAS swap should have FAILED (owner already
+            # held by the daemon), so the column still says 'daemon'.
+            assert s.owner == "daemon", f"lead must not overwrite daemon's owner; got {s.owner!r}"
+        # After the lead exits, the daemon's claim is still there.
+        s = state.get_unit_state("U1")
+        assert s is not None and s.owner == "daemon"
+
+    def test_lock_releases_rlock_even_if_db_write_fails(self, tmp_state_db, monkeypatch):
+        """Reviewer PR #59 M1: the per-unit ``threading.RLock`` MUST
+        be released even when the CAS cleanup raises (SQLite hiccup,
+        disk full, etc.). Otherwise the lock leaks and every
+        subsequent ``send_to_unit_async`` on the unit blocks forever."""
+        _seed_phase25_unit()
+        # Patch ``release_unit_owner`` to raise on the cleanup path —
+        # mimicking a transient SQLite OperationalError.
+        original_release = state.release_unit_owner
+
+        def boom(unit_id, *, expected_owner):
+            raise sqlite3.OperationalError("simulated db hiccup on release")
+
+        monkeypatch.setattr(state, "release_unit_owner", boom)
+        with pytest.raises(sqlite3.OperationalError), state.lead_advance_lock("U1"):
+            pass
+        # Restore so we can re-acquire — the test passes if this
+        # second acquire does NOT block.
+        monkeypatch.setattr(state, "release_unit_owner", original_release)
+        # Direct acquire of the underlying RLock with a short timeout
+        # would fail if the previous lock leaked.
+        lock = state._get_unit_advance_lock("U1")
+        acquired = lock.acquire(timeout=1.0)
+        try:
+            assert acquired is True, "RLock leaked — lead_advance_lock did not release on raise"
+        finally:
+            if acquired:
+                lock.release()
+
+
+class TestUnitOwnerCAS:
+    def test_claim_owner_succeeds_when_unowned(self, tmp_state_db):
+        _seed_phase25_unit()
+        assert state.claim_unit_owner("U1", "daemon") is True
+        assert state.get_unit_state("U1").owner == "daemon"
+
+    def test_claim_owner_fails_when_already_owned(self, tmp_state_db):
+        _seed_phase25_unit()
+        state.claim_unit_owner("U1", "daemon")
+        # A second claim with expected_owner="" must fail — somebody
+        # already holds it.
+        assert state.claim_unit_owner("U1", "lead") is False
+        assert state.get_unit_state("U1").owner == "daemon"
+
+    def test_release_owner_succeeds_when_holder_matches(self, tmp_state_db):
+        _seed_phase25_unit()
+        state.claim_unit_owner("U1", "daemon")
+        assert state.release_unit_owner("U1", expected_owner="daemon") is True
+        assert state.get_unit_state("U1").owner == ""
+
+    def test_release_owner_fails_when_holder_mismatch(self, tmp_state_db):
+        _seed_phase25_unit()
+        state.claim_unit_owner("U1", "daemon")
+        # Lead trying to release the daemon's claim — no-op.
+        assert state.release_unit_owner("U1", expected_owner="lead") is False
+        assert state.get_unit_state("U1").owner == "daemon"
+
+
+class TestCancelUnitState:
+    def test_cancel_flips_status_and_stamps(self, tmp_state_db):
+        _seed_phase25_unit()
+        assert state.cancel_unit("U1") is True
+        s = state.get_unit_state("U1")
+        assert s is not None
+        assert s.status == "cancelled"
+        assert s.cancelled_at is not None
+
+    def test_cancel_preserves_existing_cancelled_at(self, tmp_state_db):
+        """A second cancel must not overwrite ``cancelled_at`` — the
+        timestamp anchors when the user originally pulled the unit."""
+        _seed_phase25_unit()
+        state.cancel_unit("U1")
+        first_ts = state.get_unit_state("U1").cancelled_at
+        # Re-cancel.
+        state.cancel_unit("U1")
+        assert state.get_unit_state("U1").cancelled_at == first_ts
+
+    def test_cancel_missing_unit_returns_false(self, tmp_state_db):
+        assert state.cancel_unit("nope") is False
+
+    def test_cancel_clears_owner(self, tmp_state_db):
+        """Cancel must drop any active owner claim — otherwise a daemon
+        crash between claim + cancel could leave a stale owner forever."""
+        _seed_phase25_unit()
+        state.claim_unit_owner("U1", "daemon")
+        state.cancel_unit("U1")
+        assert state.get_unit_state("U1").owner == ""
+
+    def test_is_cancelled_predicate(self, tmp_state_db):
+        _seed_phase25_unit()
+        assert state.is_cancelled("U1") is False
+        state.cancel_unit("U1")
+        assert state.is_cancelled("U1") is True
+        # Missing unit returns False (not an error).
+        assert state.is_cancelled("nope") is False
+
+
+class TestUpdateUnitDepsState:
+    def _seed_plan(self) -> None:
+        state.save_feature(Feature(id="F", title="t", description="d", status="approved"))
+        state.save_plan(
+            "F",
+            [
+                WorkUnit(id="F-U-1", feature_id="F", title="u1", description=""),
+                WorkUnit(id="F-U-2", feature_id="F", title="u2", description=""),
+            ],
+        )
+        state.approve_plan("F")
+
+    def test_update_deps_persists_to_plan(self, tmp_state_db):
+        self._seed_plan()
+        state.update_unit_deps("F", "F-U-2", ["F-U-1"])
+        plan = state.get_plan("F")
+        assert plan is not None
+        u2 = next(u for u in plan.units if u.id == "F-U-2")
+        assert u2.depends_on == ["F-U-1"]
+
+    def test_update_deps_no_plan_raises(self, tmp_state_db):
+        with pytest.raises(ValueError, match="no plan"):
+            state.update_unit_deps("F-MISSING", "U1", [])
+
+    def test_update_deps_unknown_unit_raises(self, tmp_state_db):
+        self._seed_plan()
+        with pytest.raises(ValueError, match="not in plan"):
+            state.update_unit_deps("F", "F-U-99", [])
+
+    def test_update_deps_unknown_dep_raises(self, tmp_state_db):
+        self._seed_plan()
+        with pytest.raises(ValueError, match="unknown unit"):
+            state.update_unit_deps("F", "F-U-2", ["F-U-99"])
+
+
+class TestPhase25Migration:
+    """Pre-Phase-2.5 DBs (missing ``cancelled_at`` / ``owner`` columns)
+    must migrate on next ``init_db`` without losing rows."""
+
+    def test_adds_cancelled_at_and_owner_idempotently(self, tmp_state_db):
+        """``init_db`` from the fixture already added both columns;
+        re-running it must be a no-op (same shape, no ALTER errors)."""
+        import sqlite3 as _sql
+
+        def cols() -> set[str]:
+            with _sql.connect(tmp_state_db) as conn:
+                conn.row_factory = _sql.Row
+                return {r["name"] for r in conn.execute("PRAGMA table_info(work_units)")}
+
+        before = cols()
+        assert "cancelled_at" in before
+        assert "owner" in before
+        # Re-run init_db — idempotent.
+        state.init_db()
+        after = cols()
+        assert "cancelled_at" in after
+        assert "owner" in after
+
+
+# --------------------------- F-016 Phase 3: daemon_locks ---------------------------
+
+
+def _age_lock(state_db_path: str, age_seconds: float) -> None:
+    """Push ``daemon_locks.heartbeat_at`` back ``age_seconds`` for stale-takeover tests."""
+    aged = (datetime.now(UTC) - timedelta(seconds=age_seconds)).isoformat()
+    with sqlite3.connect(state.STATE_DB) as conn:
+        conn.execute(
+            "UPDATE daemon_locks SET heartbeat_at = ? WHERE state_db_path = ?",
+            (aged, state_db_path),
+        )
+        conn.commit()
+
+
+class TestDaemonLockClaim:
+    """``claim_daemon_lock`` — the workspace-scoped singleton primitive."""
+
+    PATH = "/abs/state.db"
+
+    def test_empty_table_claim_succeeds(self, tmp_state_db):
+        assert state.claim_daemon_lock(self.PATH, "h1") is True
+        row = state.get_daemon_lock(self.PATH)
+        assert row is not None
+        assert row["holder_id"] == "h1"
+
+    def test_fresh_holder_blocks_other(self, tmp_state_db):
+        state.claim_daemon_lock(self.PATH, "h1")
+        assert state.claim_daemon_lock(self.PATH, "h2") is False
+        # h1 still holds.
+        assert state.get_daemon_lock(self.PATH)["holder_id"] == "h1"
+
+    def test_own_holder_reclaim_is_idempotent_and_refreshes_heartbeat(self, tmp_state_db):
+        state.claim_daemon_lock(self.PATH, "h1")
+        before = state.get_daemon_lock(self.PATH)["heartbeat_at"]
+        time.sleep(0.01)
+        assert state.claim_daemon_lock(self.PATH, "h1") is True
+        after = state.get_daemon_lock(self.PATH)["heartbeat_at"]
+        # Same holder, but heartbeat refreshed.
+        assert after >= before
+
+    def test_own_holder_reclaim_preserves_started_at(self, tmp_state_db):
+        """``started_at`` is the daemon's process-start time and must NOT
+        be overwritten by a re-claim heartbeat (PR #61 Copilot 1).
+
+        A re-claim is just a cheap heartbeat refresh, not a "new daemon" —
+        ``daemon status`` / monitoring relies on ``now - started_at``
+        being the live daemon's uptime, not the time since the most
+        recent re-claim.
+        """
+        state.claim_daemon_lock(self.PATH, "h1")
+        original_started_at = state.get_daemon_lock(self.PATH)["started_at"]
+        # Sleep so a wall-clock comparison can detect an accidental
+        # overwrite even on coarse-grained clocks.
+        time.sleep(0.05)
+        assert state.claim_daemon_lock(self.PATH, "h1") is True
+        after = state.get_daemon_lock(self.PATH)
+        assert after["started_at"] == original_started_at, (
+            f"re-claim overwrote started_at: was {original_started_at!r}, "
+            f"now {after['started_at']!r}"
+        )
+        # heartbeat_at should still have moved forward as the docstring promises.
+        assert after["heartbeat_at"] >= original_started_at
+
+    def test_stale_heartbeat_allows_takeover(self, tmp_state_db):
+        state.claim_daemon_lock(self.PATH, "h1")
+        _age_lock(self.PATH, age_seconds=60)
+        assert state.claim_daemon_lock(self.PATH, "h2", stale_after_s=30) is True
+        assert state.get_daemon_lock(self.PATH)["holder_id"] == "h2"
+
+    def test_takeover_respects_stale_window(self, tmp_state_db):
+        """A heartbeat younger than ``stale_after_s`` blocks takeover."""
+        state.claim_daemon_lock(self.PATH, "h1")
+        _age_lock(self.PATH, age_seconds=5)
+        assert state.claim_daemon_lock(self.PATH, "h2", stale_after_s=30) is False
+        assert state.get_daemon_lock(self.PATH)["holder_id"] == "h1"
+
+    def test_distinct_paths_get_distinct_locks(self, tmp_state_db):
+        """Two workspaces (distinct ``state_db_path`` rows) coexist."""
+        assert state.claim_daemon_lock("/a/state.db", "h1") is True
+        assert state.claim_daemon_lock("/b/state.db", "h2") is True
+        assert state.get_daemon_lock("/a/state.db")["holder_id"] == "h1"
+        assert state.get_daemon_lock("/b/state.db")["holder_id"] == "h2"
+
+    def test_unparseable_heartbeat_treats_as_fresh(self, tmp_state_db):
+        """A row with a malformed timestamp must NOT auto-take-over — that
+        would let a corrupted clock cause a false takeover storm. The
+        helper treats unparseable as fresh and refuses."""
+        state.claim_daemon_lock(self.PATH, "h1")
+        with sqlite3.connect(state.STATE_DB) as conn:
+            conn.execute(
+                "UPDATE daemon_locks SET heartbeat_at = ? WHERE state_db_path = ?",
+                ("not-a-timestamp", self.PATH),
+            )
+            conn.commit()
+        assert state.claim_daemon_lock(self.PATH, "h2") is False
+
+
+class TestDaemonLockHeartbeat:
+    PATH = "/abs/state.db"
+
+    def test_heartbeat_succeeds_for_holder(self, tmp_state_db):
+        state.claim_daemon_lock(self.PATH, "h1")
+        before = state.get_daemon_lock(self.PATH)["heartbeat_at"]
+        time.sleep(0.01)
+        assert state.heartbeat_daemon_lock(self.PATH, "h1") is True
+        after = state.get_daemon_lock(self.PATH)["heartbeat_at"]
+        assert after > before
+
+    def test_heartbeat_fails_for_other(self, tmp_state_db):
+        state.claim_daemon_lock(self.PATH, "h1")
+        assert state.heartbeat_daemon_lock(self.PATH, "h2") is False
+
+    def test_heartbeat_fails_when_row_missing(self, tmp_state_db):
+        # No claim yet.
+        assert state.heartbeat_daemon_lock(self.PATH, "h1") is False
+
+
+class TestDaemonLockRelease:
+    PATH = "/abs/state.db"
+
+    def test_release_succeeds_for_holder_and_deletes_row(self, tmp_state_db):
+        state.claim_daemon_lock(self.PATH, "h1")
+        assert state.release_daemon_lock(self.PATH, "h1") is True
+        assert state.get_daemon_lock(self.PATH) is None
+
+    def test_release_fails_for_other(self, tmp_state_db):
+        state.claim_daemon_lock(self.PATH, "h1")
+        assert state.release_daemon_lock(self.PATH, "h2") is False
+        # h1 still owns.
+        assert state.get_daemon_lock(self.PATH)["holder_id"] == "h1"
+
+    def test_release_is_idempotent_on_missing_row(self, tmp_state_db):
+        # No claim — release returns False, doesn't raise.
+        assert state.release_daemon_lock(self.PATH, "h1") is False
+
+
+# --------------------------- F-016 Phase 3: list_active_units ---------------------------
+
+
+class TestListActiveUnits:
+    """``list_active_units`` returns rows in agent-driving + awaiting-merge
+    statuses; ``done`` / ``escalated`` / ``cancelled`` / ``pending`` are
+    excluded."""
+
+    def _seed_feature(self, fid: str = "F-A") -> None:
+        state.save_feature(Feature(id=fid, title="t", description="d"))
+
+    def _seed(self, unit_id: str, status: str, feature_id: str = "F-A") -> None:
+        state.upsert_unit_state(
+            WorkUnitState(unit_id=unit_id, feature_id=feature_id, status=status)
+        )
+
+    def test_includes_active_and_awaiting_merge(self, tmp_state_db):
+        self._seed_feature()
+        for s in (
+            "coding",
+            "testing",
+            "opening_pr",
+            "in_ci",
+            "reviewing",
+            "fixing",
+            "approved_awaiting_merge",
+        ):
+            self._seed(f"U-{s}", s)
+        ids = {u.unit_id for u in state.list_active_units()}
+        assert ids == {
+            "U-coding",
+            "U-testing",
+            "U-opening_pr",
+            "U-in_ci",
+            "U-reviewing",
+            "U-fixing",
+            "U-approved_awaiting_merge",
+        }
+
+    def test_excludes_terminal_and_cancelled_and_pending(self, tmp_state_db):
+        self._seed_feature()
+        for s in ("pending", "done", "escalated", "cancelled"):
+            self._seed(f"U-{s}", s)
+        assert state.list_active_units() == []
+
+    def test_ordered_by_last_activity(self, tmp_state_db):
+        self._seed_feature()
+        # Manually order: U-2 newer than U-1.
+        state.upsert_unit_state(
+            WorkUnitState(
+                unit_id="U-1",
+                feature_id="F-A",
+                status="coding",
+                last_activity="2024-01-01T00:00:00",
+            )
+        )
+        state.upsert_unit_state(
+            WorkUnitState(
+                unit_id="U-2",
+                feature_id="F-A",
+                status="coding",
+                last_activity="2024-01-02T00:00:00",
+            )
+        )
+        ordered = state.list_active_units()
+        assert [u.unit_id for u in ordered] == ["U-1", "U-2"]

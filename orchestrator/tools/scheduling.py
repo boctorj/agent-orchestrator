@@ -6,7 +6,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from orchestrator import state
-from orchestrator.models import READY_TO_MERGE_STATUSES
+from orchestrator.models import CANCELLED_UNIT_STATUSES, READY_TO_MERGE_STATUSES
 from orchestrator.tools import ensure_verified_for_feature, mcp
 from orchestrator.tools.execution import cycle_review, spawn_unit
 
@@ -41,10 +41,12 @@ def next_ready_units(feature_id: str) -> str:
     # Only 'done' counts as a satisfied dep — ``approved_awaiting_merge``
     # is explicitly excluded (F-009-U-4): a PR awaiting merge can still be
     # closed unmerged or rebased, so downstream work shouldn't start until
-    # the human's merge click has landed.
+    # the human's merge click has landed. ``cancelled`` (F-016 Phase 2.5)
+    # also doesn't satisfy a dep — per spec, "downstream dep-evaluation
+    # treats cancelled as not-done".
     done_ids = {uid for uid, s in unit_states.items() if s.status == "done"}
 
-    ready, blocked, in_flight, awaiting_merge = [], [], [], []
+    ready, blocked, in_flight, awaiting_merge, cancelled = [], [], [], [], []
 
     for unit in plan.units:
         if unit.id in unit_states:
@@ -55,6 +57,8 @@ def next_ready_units(feature_id: str) -> str:
                 blocked.append({"unit_id": unit.id, "reason": s.last_error or "escalated"})
             elif s.status in READY_TO_MERGE_STATUSES:
                 awaiting_merge.append({"unit_id": unit.id, "status": s.status})
+            elif s.status in CANCELLED_UNIT_STATUSES:
+                cancelled.append({"unit_id": unit.id, "cancelled_at": s.cancelled_at})
             else:
                 in_flight.append({"unit_id": unit.id, "status": s.status})
             continue
@@ -76,6 +80,7 @@ def next_ready_units(feature_id: str) -> str:
             "in_flight": in_flight,
             "awaiting_merge": awaiting_merge,
             "escalated": blocked,
+            "cancelled": cancelled,
             "total_ready": len(ready),
         },
         indent=2,
@@ -98,6 +103,7 @@ def next_ready_units_all() -> str:
         "in_flight": [],
         "awaiting_merge": [],
         "escalated": [],
+        "cancelled": [],
     }
     for f in state.list_features():
         if f.status not in ("approved", "in_progress"):
@@ -120,6 +126,7 @@ def next_ready_units_all() -> str:
             "total_in_flight": len(aggregated["in_flight"]),
             "total_awaiting_merge": len(aggregated["awaiting_merge"]),
             "total_escalated": len(aggregated["escalated"]),
+            "total_cancelled": len(aggregated["cancelled"]),
             **aggregated,
         },
         indent=2,

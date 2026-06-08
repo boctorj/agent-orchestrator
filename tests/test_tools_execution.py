@@ -623,6 +623,39 @@ class TestAddressReview:
         msg = execution.address_review("F-001-U-1", "tester", "fix")
         assert "ERROR resuming coder" in msg
 
+    def test_fix_message_carries_feature_spec_block(self, tmp_state_db, monkeypatch):
+        """F-006-U-6 review feedback (H1): address_review must pass the
+        feature spec text to ``compose_fix_task`` so the coder's
+        ``Re-read FEATURE SPEC on every resume`` rule has runtime backing.
+
+        Seeds a feature with an on-disk ``spec.md``, runs ``address_review``,
+        and inspects the resume message the FakeWorker received.
+        """
+        _seed_coded_unit()
+        instances = _install_fake_worker(monkeypatch, resume_response="FIX_PUSHED")
+        _stub_github(monkeypatch)
+
+        # Write a spec.md for F-001 alongside the tmp_state_db
+        from orchestrator import feature_spec
+
+        feature_spec.write_spec_if_missing("F-001", title="t", description="d")
+        spec_path = feature_spec.spec_path("F-001")
+        spec_path.write_text(
+            "# F-001: t\n\n## Acceptance\n- add(2, 3) returns 5\n",
+            encoding="utf-8",
+        )
+
+        execution.address_review("F-001-U-1", "tester", "test failed")
+
+        coder = instances["coder"]
+        assert coder.resume_calls, "FakeWorker.resume was not called"
+        _, msg = coder.resume_calls[0]
+        assert "## FEATURE SPEC" in msg, (
+            "address_review didn't inject ## FEATURE SPEC into the fix-loop "
+            "message; coder.md's 're-read on every resume' contract is unwired"
+        )
+        assert "add(2, 3) returns 5" in msg
+
 
 # --------------------------- send_to_unit ---------------------------
 
@@ -2984,3 +3017,760 @@ class TestCycleReviewRecoversOrphanedReviewerSession:
         assert "unexpected outcome: RAW" not in parsed["message"]
         # Positive assertion: cycle reached terminal success
         assert parsed["outcome"] == "approved_awaiting_merge"
+
+
+# --------------------------- F-016-U-3 phase commands ---------------------------
+
+
+class TestAdvanceToTester:
+    """``advance_to_tester`` runs GATE 1 (CI on coder push) + tester phase +
+    GATE 2 (CI on tester push). Idempotent on current ``WorkUnitState.status``:
+    a no-op when the unit is already past the tester boundary.
+    """
+
+    def test_happy_path_advances(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        monkeypatch.setattr(
+            execution,
+            "spawn_tester",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "TESTS_PASS"}),
+        )
+        _stub_github(monkeypatch)
+
+        out = execution.advance_to_tester("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "advanced"
+        assert parsed["next_action"] == "advance_to_reviewer"
+        assert parsed["unit_id"] == "F-001-U-1"
+        assert parsed["status"] == "in_ci"
+
+    def test_idempotent_on_status_past_tester(self, tmp_state_db, with_github_token):
+        """When status is already past the tester boundary, the phase command
+        is a no-op. Status-based idempotence is the Phase 3 daemon's primary
+        safety net (PROPOSAL § Phase 2)."""
+        _seed_coded_unit()
+        for past_status in ("reviewing", "fixing", "approved_awaiting_merge", "done"):
+            s = state.get_unit_state("F-001-U-1")
+            s.status = past_status
+            state.upsert_unit_state(s)
+
+            out = execution.advance_to_tester("F-001", "F-001-U-1")
+            parsed = json.loads(out)
+            assert parsed["outcome"] == "already_past", (
+                f"status={past_status} must be already_past for advance_to_tester"
+            )
+            assert parsed["status"] == past_status
+            assert parsed["next_action"] == "advance_to_reviewer"
+
+    def test_escalated_short_circuits(self, tmp_state_db, with_github_token):
+        _seed_coded_unit()
+        s = state.get_unit_state("F-001-U-1")
+        s.status = "escalated"
+        s.last_error = "previous cap-3 hit"
+        state.upsert_unit_state(s)
+
+        out = execution.advance_to_tester("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "escalated"
+        assert parsed["status"] == "escalated"
+
+    def test_no_unit_state_errors(self, tmp_state_db, with_github_token):
+        _setup_feature()
+        out = execution.advance_to_tester("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "not_ready"
+
+    def test_tester_blocked_escalates(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        monkeypatch.setattr(
+            execution,
+            "spawn_tester",
+            lambda f, u: "BLOCKED — tester for U: spec ambiguous",
+        )
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_escalation",
+            lambda *a, **k: True,
+        )
+
+        out = execution.advance_to_tester("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "escalated"
+
+
+class TestAdvanceToReviewer:
+    """``advance_to_reviewer`` runs Copilot (best-effort) + reviewer phase.
+    Idempotent: no-op when status is already at the terminal-success bucket
+    (``approved_awaiting_merge`` / ``done``).
+    """
+
+    def test_happy_path_advances(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        monkeypatch.setattr(
+            execution,
+            "spawn_reviewer",
+            lambda f, u: json.dumps(
+                {"unit_id": u, "outcome": "REVIEW_RECOMMEND_MERGE", "reason": "clean"}
+            ),
+        )
+        _stub_github(monkeypatch)
+
+        out = execution.advance_to_reviewer("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "advanced"
+        assert parsed["next_action"] == "advance_to_terminal"
+        assert parsed["reviewer_outcome"] == "REVIEW_RECOMMEND_MERGE"
+
+    def test_idempotent_on_status_past_reviewer(self, tmp_state_db, with_github_token):
+        _seed_coded_unit()
+        for past_status in ("approved_awaiting_merge", "done"):
+            s = state.get_unit_state("F-001-U-1")
+            s.status = past_status
+            state.upsert_unit_state(s)
+
+            out = execution.advance_to_reviewer("F-001", "F-001-U-1")
+            parsed = json.loads(out)
+            assert parsed["outcome"] == "already_past", (
+                f"status={past_status} must be already_past for advance_to_reviewer"
+            )
+            assert parsed["next_action"] == "advance_to_terminal"
+
+    def test_escalated_short_circuits(self, tmp_state_db, with_github_token):
+        _seed_coded_unit()
+        s = state.get_unit_state("F-001-U-1")
+        s.status = "escalated"
+        state.upsert_unit_state(s)
+
+        out = execution.advance_to_reviewer("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "escalated"
+
+    def test_reviewer_blocked_escalates(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        monkeypatch.setattr(
+            execution,
+            "spawn_reviewer",
+            lambda f, u: "BLOCKED — reviewer for U: cannot fetch PR",
+        )
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_escalation",
+            lambda *a, **k: True,
+        )
+
+        out = execution.advance_to_reviewer("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "escalated"
+
+
+class TestAdvanceToTerminal:
+    """``advance_to_terminal`` fires the F-007 ultrareview gate if enabled and
+    the most-recent reviewer marker was ``REVIEW_RECOMMEND_MERGE``, then emits
+    the final terminal (ntfy + cycle log + status flip). Idempotent on
+    ``status='done'`` only — ``approved_awaiting_merge`` is a transient
+    state set by the reviewer marker before this tool runs.
+    """
+
+    def test_happy_path_emits_terminal(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        state.record_event(
+            "F-001-U-1",
+            "F-001",
+            "reviewer_recommend_merge",
+            source="reviewer",
+            cycle_number=0,
+            summary="endorsed",
+        )
+        s = state.get_unit_state("F-001-U-1")
+        s.status = "approved_awaiting_merge"
+        state.upsert_unit_state(s)
+
+        _stub_github(monkeypatch)
+        push_calls: list = []
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_ready_to_merge",
+            lambda *a, **k: push_calls.append((a, k)) or True,
+        )
+
+        out = execution.advance_to_terminal("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "approved_awaiting_merge"
+        assert len(push_calls) == 1, "terminal must fire ready-to-merge push"
+
+    def test_idempotent_on_done(self, tmp_state_db, with_github_token):
+        _seed_coded_unit()
+        s = state.get_unit_state("F-001-U-1")
+        s.status = "done"
+        state.upsert_unit_state(s)
+
+        out = execution.advance_to_terminal("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "already_past"
+        assert parsed["status"] == "done"
+
+    def test_escalated_short_circuits(self, tmp_state_db, with_github_token):
+        _seed_coded_unit()
+        s = state.get_unit_state("F-001-U-1")
+        s.status = "escalated"
+        state.upsert_unit_state(s)
+
+        out = execution.advance_to_terminal("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "escalated"
+
+    def test_ultrareview_skipped_when_only_comment(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """REVIEW_COMMENT terminals must not trigger ultrareview, mirroring
+        cycle_review's "endorsement-only" gate (spec.md F-007)."""
+        _seed_coded_unit()
+        _enable_ultrareview()
+        state.record_event(
+            "F-001-U-1",
+            "F-001",
+            "reviewer_comment",
+            source="reviewer",
+            cycle_number=0,
+            summary="comment only",
+        )
+
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_ready_to_merge",
+            lambda *a, **k: True,
+        )
+        calls = _stub_ultrareview(monkeypatch, passed=True)
+
+        out = execution.advance_to_terminal("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "approved_awaiting_merge"
+        assert calls["trigger"] == [], "comment-only must not fire ultrareview"
+
+    def test_ultrareview_runs_after_recommend_merge(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        _seed_coded_unit()
+        _enable_ultrareview()
+        state.record_event(
+            "F-001-U-1",
+            "F-001",
+            "reviewer_recommend_merge",
+            source="reviewer",
+            cycle_number=0,
+            summary="endorsed",
+        )
+
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_ready_to_merge",
+            lambda *a, **k: True,
+        )
+        calls = _stub_ultrareview(monkeypatch, passed=True)
+
+        out = execution.advance_to_terminal("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "approved_awaiting_merge"
+        assert len(calls["trigger"]) == 1, "ultrareview must fire after RECOMMEND_MERGE"
+
+    def test_ultrareview_failure_escalates(self, tmp_state_db, with_github_token, monkeypatch):
+        _seed_coded_unit()
+        _enable_ultrareview()
+        state.record_event(
+            "F-001-U-1",
+            "F-001",
+            "reviewer_recommend_merge",
+            source="reviewer",
+            cycle_number=0,
+            summary="endorsed",
+        )
+
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_escalation",
+            lambda *a, **k: True,
+        )
+        _stub_ultrareview(monkeypatch, passed=False, findings=["bad thing"])
+
+        out = execution.advance_to_terminal("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "escalated"
+
+    def test_no_reviewer_marker_returns_not_ready(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """🔴 C1 regression guard (PR #58): without a reviewer endorsement
+        or comment marker for this unit, ``advance_to_terminal`` MUST refuse
+        — no status flip, no ntfy push. The daemon (F-016-U-5) will call
+        this speculatively on every poll; firing terminal on a unit still
+        in ``coding`` / ``testing`` / ``in_ci`` / ``reviewing`` would push
+        a false "ready to merge" notification to the human's phone.
+        """
+        _seed_coded_unit()  # status=in_ci, no reviewer events seeded
+        _stub_github(monkeypatch)
+        push_calls: list = []
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_ready_to_merge",
+            lambda *a, **k: push_calls.append((a, k)) or True,
+        )
+
+        out = execution.advance_to_terminal("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "not_ready"
+        # Negative side: must NOT flip status, must NOT push ntfy.
+        assert state.get_unit_state("F-001-U-1").status == "in_ci"
+        assert push_calls == []
+
+    def test_no_reviewer_marker_rejects_every_active_status(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """C1 corollary: not_ready holds for every non-terminal status when
+        no reviewer marker exists. Covers the full attack surface called
+        out in the review: ``coding``, ``testing``, ``in_ci``, ``reviewing``,
+        ``fixing`` all flow through the same `_emit_terminal` if not gated.
+        """
+        _seed_coded_unit()
+        _stub_github(monkeypatch)
+        push_calls: list = []
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_ready_to_merge",
+            lambda *a, **k: push_calls.append((a, k)) or True,
+        )
+
+        for from_status in ("coding", "testing", "in_ci", "reviewing", "fixing"):
+            s = state.get_unit_state("F-001-U-1")
+            s.status = from_status
+            state.upsert_unit_state(s)
+
+            out = execution.advance_to_terminal("F-001", "F-001-U-1")
+            parsed = json.loads(out)
+            assert parsed["outcome"] == "not_ready", from_status
+            assert state.get_unit_state("F-001-U-1").status == from_status
+        assert push_calls == [], "no ntfy push allowed without reviewer marker"
+
+    def test_daemon_re_tick_on_approved_awaiting_merge_does_not_re_push(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """🟠 H1 regression guard (PR #58): the F-016-U-5 daemon ticks
+        ``advance_to_terminal`` on every poll interval. A unit waiting
+        hours/days for the human merge must not collect one phone push per
+        poll — terminal emit is dedupe-keyed on the unit so the second
+        call is a no-op.
+        """
+        _seed_coded_unit()
+        state.record_event(
+            "F-001-U-1",
+            "F-001",
+            "reviewer_recommend_merge",
+            source="reviewer",
+            cycle_number=0,
+            summary="endorsed",
+        )
+        s = state.get_unit_state("F-001-U-1")
+        s.status = "approved_awaiting_merge"
+        state.upsert_unit_state(s)
+
+        _stub_github(monkeypatch)
+        push_calls: list = []
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_ready_to_merge",
+            lambda *a, **k: push_calls.append((a, k)) or True,
+        )
+
+        # First call: real terminal emit; ntfy fires once.
+        first = json.loads(execution.advance_to_terminal("F-001", "F-001-U-1"))
+        assert first["outcome"] == "approved_awaiting_merge"
+        assert len(push_calls) == 1, "first call must fire ready-to-merge push"
+
+        # Subsequent calls: dedupe short-circuits — no second push.
+        for _ in range(3):
+            second = json.loads(execution.advance_to_terminal("F-001", "F-001-U-1"))
+            assert second["outcome"] == "already_past", second
+        assert len(push_calls) == 1, "daemon re-ticks must not re-fire ntfy"
+
+    def test_cycle_review_double_call_does_not_re_push(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """H1 belt-and-suspenders: even if the lead accidentally calls
+        ``cycle_review`` twice on the same unit, the second call must not
+        re-push ntfy. Dedupe lives in ``_emit_terminal``, not in the
+        wrapper, so both entry points are protected.
+        """
+        _seed_coded_unit()
+        monkeypatch.setattr(
+            execution,
+            "spawn_tester",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "TESTS_PASS"}),
+        )
+        monkeypatch.setattr(
+            execution,
+            "spawn_reviewer",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "REVIEW_RECOMMEND_MERGE"}),
+        )
+        _stub_github(monkeypatch)
+        push_calls: list = []
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_ready_to_merge",
+            lambda *a, **k: push_calls.append((a, k)) or True,
+        )
+
+        execution.cycle_review("F-001", "F-001-U-1")
+        execution.cycle_review("F-001", "F-001-U-1")
+        assert len(push_calls) == 1, "second cycle_review must dedupe the ntfy push"
+
+
+class TestCycleReviewIsWrapper:
+    """cycle_review must produce equivalent terminal output and history when
+    expressed as the three-phase sequence — the refactor is observably a
+    no-op on the success path. Keeps the daemon's ``derive_next_action`` and
+    the lead's blocking call walking the same engine (spec § "No parallel
+    state machine").
+    """
+
+    def test_happy_path_history_carries_through_all_phases(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        _seed_coded_unit()
+        monkeypatch.setattr(
+            execution,
+            "spawn_tester",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "TESTS_PASS"}),
+        )
+        monkeypatch.setattr(
+            execution,
+            "spawn_reviewer",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "REVIEW_RECOMMEND_MERGE"}),
+        )
+        _stub_github(monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.ntfy.push_ready_to_merge",
+            lambda *a, **k: True,
+        )
+
+        out = execution.cycle_review("F-001", "F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "approved_awaiting_merge"
+        steps = [s.get("step") for s in parsed["history"]]
+        assert "tester" in steps
+        assert "copilot_review" in steps
+        assert "reviewer" in steps
+
+
+# --------------------------- F-016 Phase 2.5: send_to_unit_async ---------
+
+
+class TestSendToUnitAsync:
+    """Coder-side coverage of the async submit path. Spec-acceptance
+    cases live in ``tests/test_f016_u4_tester.py``; this class pins the
+    coder-implementation contract: structured shape, error handling,
+    and audit row."""
+
+    def test_bad_role(self, tmp_state_db):
+        _setup_feature()
+        state.upsert_unit_state(
+            WorkUnitState(unit_id="F-001-U-1", feature_id="F-001", status="coding")
+        )
+        out = execution.send_to_unit_async("F-001-U-1", "hi", role="hacker")
+        assert "ERROR" in out and "role must be" in out
+
+    def test_no_state(self, tmp_state_db):
+        out = execution.send_to_unit_async("nope", "hi")
+        assert "ERROR" in out and "no state for" in out
+
+    def test_audit_row_written_on_success(self, tmp_state_db, monkeypatch):
+        _seed_coded_unit()
+
+        class AsyncWorker:
+            def __init__(self, role):
+                self.role = role
+                self.async_calls = []
+
+            def resume_async(self, sid, msg):
+                self.async_calls.append((sid, msg))
+
+        monkeypatch.setattr("orchestrator.tools.execution.make_worker", AsyncWorker)
+        out = execution.send_to_unit_async("F-001-U-1", "carry on", role="coder")
+        parsed = json.loads(out)
+        assert parsed["delivered"] is True
+        events = state.list_events("F-001-U-1")
+        manual_msgs = [e for e in events if e["event_type"] == "coder_manual_message"]
+        assert len(manual_msgs) == 1
+        assert "carry on" in manual_msgs[0]["details"]
+
+    def test_resume_async_error_returns_structured_error(self, tmp_state_db, monkeypatch):
+        _seed_coded_unit()
+
+        class BlowUp:
+            def __init__(self, role):
+                pass
+
+            def resume_async(self, *a, **k):
+                raise RuntimeError("network down")
+
+        monkeypatch.setattr("orchestrator.tools.execution.make_worker", BlowUp)
+        out = execution.send_to_unit_async("F-001-U-1", "hi", role="coder")
+        parsed = json.loads(out)
+        assert parsed["delivered"] is False
+        assert parsed["reason"] == "coder_resume_async_error"
+        assert "network down" in parsed["error"]
+        # PR #59 Copilot finding 3: the resume_async error response must
+        # carry role_diagnostics + next_steps so the shape matches every
+        # other not-actionable branch — a lead surfacing this to the
+        # user shouldn't have to special-case the network-error
+        # branch's structured payload.
+        assert "role_diagnostics" in parsed
+        assert "next_steps" in parsed
+        # The error must still release the advance lock (the
+        # ``with state.lead_advance_lock`` block guarantees this).
+        assert state.has_active_advance_lock("F-001-U-1") is False
+
+
+# --------------------------- F-016 Phase 2.5: cancel_unit ---------------
+
+
+class TestCancelUnitTool:
+    def test_no_state(self, tmp_state_db):
+        out = execution.cancel_unit("nope")
+        assert "ERROR" in out and "no state for" in out
+
+    def test_flips_status_and_records_event(self, tmp_state_db, monkeypatch):
+        _seed_coded_unit()
+
+        class Recorder:
+            def __init__(self, role):
+                self.role = role
+                self.archived = []
+
+            def archive(self, sid):
+                self.archived.append(sid)
+
+        monkeypatch.setattr("orchestrator.tools.execution.make_worker", Recorder)
+        out = execution.cancel_unit("F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "cancelled"
+        assert parsed["status"] == "cancelled"
+        events = state.list_events("F-001-U-1")
+        assert any(e["event_type"] == "unit_cancelled" for e in events)
+
+    def test_idempotent_second_call(self, tmp_state_db, monkeypatch):
+        _seed_coded_unit()
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.make_worker",
+            lambda role: type("W", (), {"archive": lambda self, sid: None})(),
+        )
+        execution.cancel_unit("F-001-U-1")
+        out2 = execution.cancel_unit("F-001-U-1")
+        parsed = json.loads(out2)
+        assert parsed["outcome"] == "already_cancelled"
+
+
+# --------------------------- F-016 Phase 2.5: cancel terminal-refuse + lock ---
+
+
+class TestCancelUnitRefusesTerminalStatuses:
+    """Reviewer PR #59 C1: ``cancel_unit`` MUST NOT silently rewrite a
+    terminal status. A merged ``done`` unit's status is the scheduler's
+    dep-satisfaction anchor; an ``approved_awaiting_merge`` row is the
+    user's ready-to-merge indicator; an ``escalated`` row holds the
+    triage error. Cancelling any of them silently breaks invariants and
+    permanently strands downstream units.
+    """
+
+    def _setup(self, status: str, monkeypatch) -> None:
+        _seed_coded_unit()
+        # The seed leaves status="in_ci"; flip to the terminal we want.
+        state.touch_unit("F-001-U-1", status=status)
+        # No archive calls expected — assert via a counter-recording worker.
+        self.archive_calls: list[tuple[str, str]] = []
+
+        def factory(role: str):
+            self_ref = self
+
+            class _W:
+                def archive(self, sid):
+                    self_ref.archive_calls.append((role, sid))
+
+            return _W()
+
+        monkeypatch.setattr("orchestrator.tools.execution.make_worker", factory)
+
+    def test_done_status_refused(self, tmp_state_db, monkeypatch):
+        self._setup("done", monkeypatch)
+        out = execution.cancel_unit("F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "refused"
+        assert parsed["status"] == "done"
+        # Row unchanged.
+        s = state.get_unit_state("F-001-U-1")
+        assert s is not None
+        assert s.status == "done"
+        assert s.cancelled_at is None
+        # No sessions archived (no API burn).
+        assert self.archive_calls == []
+
+    def test_approved_awaiting_merge_refused(self, tmp_state_db, monkeypatch):
+        self._setup("approved_awaiting_merge", monkeypatch)
+        out = execution.cancel_unit("F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "refused"
+        s = state.get_unit_state("F-001-U-1")
+        assert s is not None and s.status == "approved_awaiting_merge"
+        assert self.archive_calls == []
+
+    def test_escalated_refused(self, tmp_state_db, monkeypatch):
+        self._setup("escalated", monkeypatch)
+        # Preserve a last_error so we can prove it's untouched.
+        state.touch_unit("F-001-U-1", error="cap-3 hit on reviewer changes")
+        out = execution.cancel_unit("F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "refused"
+        s = state.get_unit_state("F-001-U-1")
+        assert s is not None
+        assert s.status == "escalated"
+        assert s.last_error == "cap-3 hit on reviewer changes"
+        assert self.archive_calls == []
+
+    def test_downstream_dep_not_blocked_by_refused_cancel(self, tmp_state_db, monkeypatch):
+        """The C1 reproducer: a ``done`` unit must remain the scheduler's
+        dep-satisfaction anchor even after a fat-fingered ``cancel_unit``."""
+        from orchestrator.tools import scheduling
+
+        state.save_feature(
+            Feature(
+                id="F-DEP",
+                title="t",
+                description="d",
+                repo_path="https://github.com/o/r",
+                status="approved",
+            )
+        )
+        state.save_plan(
+            "F-DEP",
+            [
+                WorkUnit(id="F-DEP-U-1", feature_id="F-DEP", title="u1", description=""),
+                WorkUnit(
+                    id="F-DEP-U-2",
+                    feature_id="F-DEP",
+                    title="u2",
+                    description="",
+                    depends_on=["F-DEP-U-1"],
+                ),
+            ],
+        )
+        state.approve_plan("F-DEP")
+        state.upsert_unit_state(
+            WorkUnitState(unit_id="F-DEP-U-1", feature_id="F-DEP", status="done")
+        )
+        # Before: U-2 is ready (U-1 is done).
+        ready_before = json.loads(scheduling.next_ready_units("F-DEP"))
+        assert {u["unit_id"] for u in ready_before["ready_to_spawn"]} == {"F-DEP-U-2"}
+        # Cancel U-1 (which is done).
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.make_worker",
+            lambda role: type("W", (), {"archive": lambda self, sid: None})(),
+        )
+        execution.cancel_unit("F-DEP-U-1")
+        # After: U-2 is STILL ready (the refused cancel left U-1 as done).
+        ready_after = json.loads(scheduling.next_ready_units("F-DEP"))
+        assert {u["unit_id"] for u in ready_after["ready_to_spawn"]} == {"F-DEP-U-2"}, (
+            f"refused cancel must leave the done-anchor intact; got {ready_after}"
+        )
+
+
+class TestCancelUnitTakesAdvanceLock:
+    """Reviewer PR #59 M3: ``cancel_unit`` must hold ``lead_advance_lock``
+    around the side-effecting block so a concurrent Phase 3 daemon tick
+    and concurrent cancels can't race the archive + audit-event writes.
+    """
+
+    def test_lock_is_held_during_archive_body(self, tmp_state_db, monkeypatch):
+        """While ``cancel_unit``'s archive runs, the per-unit advance-lock
+        must be held — the daemon-visible signal
+        (:func:`state.has_active_advance_lock`) must be True for the
+        entire body. This is the contract the spec § Phase 2.5 needs:
+        a daemon tick that lands mid-archive sees ``owner='lead'`` and
+        defers; a concurrent ``cancel_unit`` blocks on the RLock until
+        the first finishes (and then short-circuits at the
+        ``already_cancelled`` check).
+
+        Replaces an earlier threading-based test that proved the same
+        contract but leaked background threads on slow Windows CI when
+        ``Thread.join(5)`` timed out before the workers finished —
+        leaked threads continued issuing SQLite ops against the
+        tmp_state_db file, blocking the touch_unit calls in
+        subsequent tests (PR #59 windows-3.12 deadlock). The
+        lock-observability probe pins the same invariant without
+        spawning a thread.
+        """
+        observed: dict[str, list[bool]] = {"under_lock": []}
+
+        def factory(role: str):
+            class _W:
+                def archive(self, sid: str) -> None:  # noqa: ARG002
+                    # Probe the daemon's view from inside the lock:
+                    # has_active_advance_lock reads ``owner`` from
+                    # state.db; True means the CAS claim landed and
+                    # the daemon (separate process) would defer.
+                    observed["under_lock"].append(state.has_active_advance_lock("F-001-U-1"))
+
+            return _W()
+
+        _seed_coded_unit()
+        monkeypatch.setattr("orchestrator.tools.execution.make_worker", factory)
+
+        # Before cancel: lock is not held.
+        assert state.has_active_advance_lock("F-001-U-1") is False
+
+        out = execution.cancel_unit("F-001-U-1")
+        parsed = json.loads(out)
+        assert parsed["outcome"] == "cancelled"
+
+        # The archive callback ran inside the with state.lead_advance_lock
+        # block, so the daemon-visible signal must have been True at the
+        # observation point. Without the lock wrapping, the probe would
+        # see False and the daemon would race the cancel's state writes.
+        assert observed["under_lock"] == [True], (
+            f"cancel_unit must hold lead_advance_lock during archive (PR #59 M3); got {observed}"
+        )
+
+        # After cancel: lock released.
+        assert state.has_active_advance_lock("F-001-U-1") is False
+
+    def test_unit_cancelled_event_is_dedupe_keyed(self, tmp_state_db, monkeypatch):
+        """The ``unit_cancelled`` audit row must carry a dedupe_key so
+        a cross-process MCP retry that bypasses the in-process lock
+        still produces one row."""
+        _seed_coded_unit()
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.make_worker",
+            lambda role: type("W", (), {"archive": lambda self, sid: None})(),
+        )
+        execution.cancel_unit("F-001-U-1")
+        rows = [e for e in state.list_events("F-001-U-1") if e["event_type"] == "unit_cancelled"]
+        assert len(rows) == 1
+        assert rows[0]["dedupe_key"], "unit_cancelled event row must carry a dedupe_key"
+
+    def test_sequential_double_cancel_archives_once(self, tmp_state_db, monkeypatch):
+        """Idempotent re-call: a second ``cancel_unit`` (sequential,
+        same process) must short-circuit on the ``already_cancelled``
+        check inside the lock and NOT re-invoke ``_archive_unit_sessions``.
+        Together with the dedupe-key test above this covers the
+        ``cancel_unit`` contract that the deleted threading test was
+        proving — a per-unit archive call lands exactly once."""
+        _seed_coded_unit()
+        archive_calls: list[str] = []
+
+        def factory(role: str):
+            class _W:
+                def archive(self, sid: str) -> None:
+                    archive_calls.append(f"{role}:{sid}")
+
+            return _W()
+
+        monkeypatch.setattr("orchestrator.tools.execution.make_worker", factory)
+        first = execution.cancel_unit("F-001-U-1")
+        second = execution.cancel_unit("F-001-U-1")
+        assert json.loads(first)["outcome"] == "cancelled"
+        assert json.loads(second)["outcome"] == "already_cancelled"
+        assert archive_calls == ["coder:sesn-c"], (
+            f"archive must land exactly once across the two calls; got {archive_calls}"
+        )
