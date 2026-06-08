@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from orchestrator import state
 from orchestrator.models import CANCELLED_UNIT_STATUSES, READY_TO_MERGE_STATUSES
 from orchestrator.tools import ensure_verified_for_feature, mcp
-from orchestrator.tools.execution import cycle_review, spawn_unit
+from orchestrator.tools.execution import cycle_review_blocking, spawn_unit
 
 
 @mcp.tool()
@@ -164,7 +164,14 @@ def _run_one(feature_id: str, unit_id: str) -> dict:
         }
 
     try:
-        cycle_result = cycle_review(feature_id, unit_id)
+        # Phase 4 default-flip aware: thread-pool callers always want
+        # blocking semantics, so route through the explicit blocking
+        # variant. Otherwise an NTFY-configured workspace would have
+        # every parallel job return ≤2 s with the daemon doing the
+        # real work — the pool would "finish" while the units were
+        # still in flight, breaking the JSON shape downstream consumers
+        # (parallel_units / parallel_units_global response) expect.
+        cycle_result = cycle_review_blocking(feature_id, unit_id)
         cy = json.loads(cycle_result)
     except Exception as e:  # noqa: BLE001
         return {

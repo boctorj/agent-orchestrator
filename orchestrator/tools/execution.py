@@ -11,6 +11,8 @@ from __future__ import annotations
 import contextlib
 import json
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Literal
 
 from orchestrator import ci_wait, cycle_log, feature_spec, github, ntfy, state, ultrareview
@@ -2919,42 +2921,357 @@ def advance_to_terminal(feature_id: str, unit_id: str) -> str:
     return _emit_terminal(ctx, "approved_awaiting_merge", _TERMINAL_SUCCESS_MSG)
 
 
+_CYCLE_REVIEW_NTFY_NUDGE = (
+    "NTFY_TOPIC unset → cycle_review stayed blocking. "
+    "Set NTFY_TOPIC in .env (free, no account; see README § ntfy push) "
+    "to enable non-blocking daemon-driven mode by default, or call "
+    "cycle_review_async() explicitly to opt in regardless."
+)
+"""One-line nudge appended to the blocking ``cycle_review`` output when
+``NTFY_TOPIC`` is unset. Proposal § Phase 4 calls for a "one-time setup
+nudge"; emitting it on every call is fine because the runtime lead
+persona is responsible for deduping (and surfacing it only once per
+session). Without ntfy, a silent ≤1s async return would be worse UX
+than today's blocking flow — the user has no feedback channel to learn
+the work finished — so we stay blocking and tell them how to switch."""
+
+
+_CYCLE_REVIEW_DAEMON_DOWN_NUDGE = (
+    "NTFY_TOPIC is set but the watcher daemon is not running — "
+    "cycle_review stayed blocking. Start the daemon with "
+    "`orchestrator daemon start` (and ORCH_DAEMON_DRIVE=true in .env) "
+    "to enable non-blocking mode, or call cycle_review_async() "
+    "explicitly once the daemon is up."
+)
+"""Peer to :data:`_CYCLE_REVIEW_NTFY_NUDGE` for the Risk-R1 fallback:
+``NTFY_TOPIC`` is set but the workspace's ``daemon_locks`` row is
+missing or stale. Surfaces the same ``nudge`` JSON field; the lead
+persona dedupes per session. Hoisted to module scope so tests can
+reference it by name and so the two nudges are visibly peers in the
+source — both are one-time setup hints, both consumed via the same
+field, and both kept off the per-call hot path."""
+
+
+_CYCLE_REVIEW_DAEMON_INVALID_HEARTBEAT_NUDGE = (
+    "NTFY_TOPIC is set but this workspace's daemon_locks row has a "
+    "malformed heartbeat_at — `orchestrator daemon start` will NOT be "
+    "able to claim it (state.claim_daemon_lock refuses takeover when "
+    "heartbeat_at can't be parsed; see the row via "
+    "`orchestrator daemon status`). Delete the corrupted lock row "
+    'manually (`sqlite3 state.db "DELETE FROM daemon_locks WHERE '
+    "state_db_path = '<path>';\"`) then run `orchestrator daemon "
+    "start` to enable non-blocking mode, or call cycle_review_async() "
+    "once the new daemon is up. cycle_review stayed blocking for now."
+)
+"""Variant of :data:`_CYCLE_REVIEW_DAEMON_DOWN_NUDGE` for the
+``invalid_heartbeat`` :func:`_daemon_health` branch. The generic
+"start the daemon" advice doesn't work for this case:
+:func:`~orchestrator.state.claim_daemon_lock` deliberately refuses
+takeover when ``heartbeat_at`` is unparseable (line ~1203 in
+``state.py``: "a corrupted ``heartbeat_at`` (clock skew, disk
+corruption, hand-edit) must not silently let a new daemon snipe the
+active row"). So this nudge tells the operator the manual recovery
+step — delete the row — instead of suggesting a command that will
+silently fail to claim the lock."""
+
+
+_CYCLE_REVIEW_ASYNC_HANDOFF_MSG = (
+    "Handed off to the watcher daemon. The daemon will observe markers "
+    "from existing worker sessions and apply F-014 PR-merge transitions "
+    "(in_ci → done once the human merges, escalation on conflict/CI "
+    "drift). Spawning the next-phase worker (tester after coder, "
+    "reviewer after tester) is NOT yet driven by the daemon — that "
+    "ships with F-016-U-7. Until then, advance the unit through testing "
+    "/ reviewing with advance_to_tester / advance_to_reviewer / "
+    "advance_to_terminal (or call cycle_review_blocking for the full "
+    "pipeline)."
+)
+"""Honest description of what the F-016-U-5 watcher daemon actually
+delivers on a successful ``cycle_review_async`` handoff. PR #64 reviewer
+H1: the original message claimed the daemon would "drive the unit to
+terminal and ntfy will push on completion", but the U-5 daemon
+(:mod:`orchestrator.daemon`) only observes existing sessions
+(:func:`~orchestrator.daemon._scan_role`) and applies F-014 actions via
+:func:`orchestrator.tools.health._apply_action`; it does not call
+:func:`spawn_tester` / :func:`spawn_reviewer` / the ``advance_to_*``
+phase commands. End-to-end drive ships with U-7's
+``orchestrator/cycle/phases.py`` extraction. Tell the truth here so a
+user who reads the response on a unit stuck in ``in_ci`` knows the
+right next step."""
+
+
+def _daemon_down_nudge_for(daemon_info: dict[str, Any]) -> str:
+    """Pick the right ``daemon-down`` nudge for ``daemon_info["reason"]``.
+
+    The two nudges differ on the recovery instruction:
+      * ``invalid_heartbeat`` → manual recovery (delete the corrupted
+        ``daemon_locks`` row) because
+        :func:`~orchestrator.state.claim_daemon_lock` refuses to take
+        over a row it can't parse, so ``orchestrator daemon start``
+        alone won't succeed.
+      * Every other ``not_running`` reason (``no_lock_holder``,
+        ``stale_heartbeat``) → the default "start the daemon"
+        instruction, which works because either there's no row to
+        contend with or the existing row is stale enough that
+        ``claim_daemon_lock`` will reclaim it.
+
+    Reviewer (Copilot) flag: the original single nudge promised "start
+    the daemon" guidance that fails silently in the ``invalid_heartbeat``
+    case; pick at the call-site instead of patching the constants.
+    """
+    if daemon_info.get("reason") == "invalid_heartbeat":
+        return _CYCLE_REVIEW_DAEMON_INVALID_HEARTBEAT_NUDGE
+    return _CYCLE_REVIEW_DAEMON_DOWN_NUDGE
+
+
+def _daemon_health() -> dict[str, Any]:
+    """Snapshot of the workspace daemon lock state.
+
+    Reads the ``daemon_locks`` row for the resolved ``state.STATE_DB`` path
+    and reports whether the holder's heartbeat is fresh enough to count
+    as "alive". The cutoff matches the daemon's own takeover threshold
+    (:data:`orchestrator.state.DEFAULT_DAEMON_LOCK_STALE_AFTER_S`, default
+    30 s) — past that window
+    :func:`~orchestrator.state.claim_daemon_lock` will let a new instance
+    steal the row, so we'd be wrong to claim the holder is still ticking.
+
+    The shape is the JSON-friendly object embedded in
+    :func:`cycle_review_async`'s response: ``running`` is a bool, the
+    other fields are surfaced verbatim from ``daemon_locks`` so the
+    lead persona can show the operator who owns the workspace and when
+    they last heartbeat.
+    """
+    path = str(Path(state.STATE_DB).resolve())
+    row = state.get_daemon_lock(path)
+    if row is None:
+        return {"running": False, "reason": "no_lock_holder"}
+
+    raw_heartbeat = row.get("heartbeat_at", "")
+    age_s: float | None
+    try:
+        hb = datetime.fromisoformat(raw_heartbeat)
+        if hb.tzinfo is None:
+            hb = hb.replace(tzinfo=UTC)
+        age_s = (datetime.now(UTC) - hb).total_seconds()
+        running = age_s <= state.DEFAULT_DAEMON_LOCK_STALE_AFTER_S
+        reason = "fresh_heartbeat" if running else "stale_heartbeat"
+    except (TypeError, ValueError):
+        # Corrupted heartbeat_at — treat the row as not-running rather
+        # than crash the dispatcher. Same conservative posture
+        # ``claim_daemon_lock`` takes for its takeover decision.
+        age_s = None
+        running = False
+        reason = "invalid_heartbeat"
+
+    return {
+        "running": running,
+        "reason": reason,
+        "holder_id": row.get("holder_id"),
+        "heartbeat_at": raw_heartbeat,
+        "heartbeat_age_s": age_s,
+        "state_db_path": path,
+    }
+
+
 @mcp.tool()
-def cycle_review(feature_id: str, unit_id: str) -> str:
-    """Convenience wrapper: ``advance_to_tester`` → ``advance_to_reviewer``
-    → ``advance_to_terminal``, sharing one ``CycleContext`` so history,
-    ntfy push, and cycle-log finalize happen exactly once.
+def cycle_review_async(feature_id: str, unit_id: str) -> str:
+    """F-016 Phase 4 — daemon-driven cycle review. Returns in ≤2s.
 
-    The post-spawn loop:
-      tester → (if BUG: address_review → tester) → Copilot review →
-      our reviewer → (if CHANGES: address_review → reviewer) → optional
-      ultrareview gate (if feature.ultrareview_enabled) → terminal.
+    Handoff to the watcher daemon: validates the unit is actionable and
+    the daemon is alive, then returns immediately. The daemon's poll
+    loop (see :mod:`orchestrator.daemon`) picks the unit up on its next
+    tick — ``list_active_units`` already returns every row this tool
+    needs to drive, so no further enqueue step is required.
 
-    Cap = CAP_3 shared cycles across tester-bugs and reviewer-changes.
-    On cap hit or any BLOCKED: marks escalated, returns summary.
-    BLOCKS until terminal (success or escalation). Typically 5-20+ minutes.
+    Proposal § "Phase 4 acceptance": ``cycle_review`` p95 latency < 2 s.
+    This path performs no worker waits, no full F-014 PR probe, and no
+    ``_run_*_advance`` calls — that work belongs to the daemon.
 
-    Repo must be fresh-verified (call `verify_repo(<url>)` if blocked).
+    What the F-016-U-5 daemon actually drives once it picks the unit
+    up is narrower than the proposal's end-state: marker observation +
+    F-014 PR-merge transitions only. Spawning the next-phase worker
+    (tester after coder, reviewer after tester) ships in U-7. The
+    response's ``message`` field
+    (:data:`_CYCLE_REVIEW_ASYNC_HANDOFF_MSG`) spells this out so a
+    user whose unit sits in ``in_ci`` after the handoff knows the
+    right next step is ``advance_to_tester`` /
+    ``cycle_review_blocking``.
 
-    Re-entry recovery: if a previous ``cycle_review`` call died mid-phase
-    (typically a network timeout) leaving the unit with a non-empty
-    ``tester_session_id`` or ``reviewer_session_id`` but no terminal marker
-    recorded, the initial ``_tester_phase`` / ``_reviewer_phase`` call on
-    re-entry resumes the existing session (asking it to re-emit its
-    verdict) rather than spawning a fresh one. See
-    ``docs/STATE-MACHINE-AUDIT.md``
-    § "Stale-session recovery at tester/reviewer re-entry".
+    Returns JSON with:
+      * ``delivered`` (bool) — true iff the handoff was accepted.
+      * ``mode`` — ``"async_daemon"`` on success.
+      * ``daemon`` — :func:`_daemon_health` snapshot.
+      * ``status`` / ``pr_number`` — current unit state.
+      * ``reason`` / ``next_steps`` — populated when ``delivered`` is
+        false so the lead persona can either redirect the user or fall
+        back to :func:`cycle_review_blocking`.
 
-    Why a shared ``CycleContext`` rather than three nested MCP calls: the
-    three ``_run_*_advance`` helpers are the engine, the MCP tools are
-    thin wrappers around them with their own idempotence checks. Sharing
-    one ctx keeps history contiguous and lets ``_emit_terminal`` fire
-    exactly once with the full timeline — spec § "No parallel state
-    machine" makes the engine the contract, not the MCP-call topology.
+    Repo must be fresh-verified (call ``verify_repo(<url>)`` if blocked).
     """
     if err := ensure_verified_for_feature(feature_id):
         return err
+    return _cycle_review_async_impl(feature_id, unit_id, daemon_info=None)
 
+
+def _cycle_review_async_impl(
+    feature_id: str,
+    unit_id: str,
+    *,
+    daemon_info: dict[str, Any] | None,
+) -> str:
+    """Body of :func:`cycle_review_async`, parameterized on a pre-computed
+    daemon snapshot.
+
+    The dispatcher (:func:`cycle_review`) already reads daemon health to
+    decide async vs. blocking; passing the snapshot through avoids a
+    second SQLite round-trip on the ≤2 s p95 path and closes a TOCTOU
+    window where the dispatcher and the async tool could disagree about
+    whether the daemon is alive (PR #64 reviewer M1).
+
+    Direct callers of :func:`cycle_review_async` pass ``daemon_info=None``
+    so the helper reads the snapshot itself; the verification gate
+    short-circuit lives in the public wrapper, not here, so the
+    dispatcher's gate (run once at its own entry) isn't repeated for
+    every dispatch.
+    """
+    unit_state = state.get_unit_state(unit_id)
+    if unit_state is None:
+        return json.dumps(
+            {
+                "unit_id": unit_id,
+                "delivered": False,
+                "reason": "unit_not_found",
+                "next_steps": [
+                    f"No state for {unit_id}. Spawn the unit first via "
+                    f"spawn_unit_async('{feature_id}', '{unit_id}').",
+                ],
+            },
+            indent=2,
+        )
+
+    if unit_state.status in TERMINAL_UNIT_STATUSES or unit_state.status in CANCELLED_UNIT_STATUSES:
+        return json.dumps(
+            {
+                "unit_id": unit_id,
+                "delivered": False,
+                "reason": "unit_terminal",
+                "status": unit_state.status,
+                "next_steps": [
+                    f"Unit is already in terminal state {unit_state.status!r}; "
+                    f"no work for the daemon to drive.",
+                ],
+            },
+            indent=2,
+        )
+
+    if daemon_info is None:
+        daemon_info = _daemon_health()
+    if not daemon_info["running"]:
+        # Pick recovery guidance by daemon reason. The default ("start
+        # the daemon") doesn't work when ``heartbeat_at`` is corrupted
+        # — :func:`~orchestrator.state.claim_daemon_lock` refuses
+        # takeover in that case, so an operator who follows the generic
+        # instruction will see a silent claim failure. Branch here so
+        # the ``invalid_heartbeat`` path gets the manual-recovery hint
+        # while the common cases keep today's guidance (Copilot
+        # finding).
+        if daemon_info.get("reason") == "invalid_heartbeat":
+            next_steps = [
+                "This workspace's daemon_locks row has a malformed "
+                "heartbeat_at — `orchestrator daemon start` will NOT "
+                "be able to claim it (state.claim_daemon_lock refuses "
+                "takeover on unparseable heartbeats). Delete the "
+                "corrupted row manually (e.g. `sqlite3 state.db "
+                '"DELETE FROM daemon_locks WHERE state_db_path = '
+                "'<path>';\"`) then start the daemon, or call "
+                "cycle_review_blocking() as a fallback for this unit.",
+            ]
+        else:
+            next_steps = [
+                "The watcher daemon is not running for this workspace. "
+                "Start it with `orchestrator daemon start` (and set "
+                "ORCH_DAEMON_DRIVE=true in .env), or call "
+                "cycle_review_blocking() as a fallback for this unit.",
+            ]
+        return json.dumps(
+            {
+                "unit_id": unit_id,
+                "delivered": False,
+                "reason": "daemon_not_running",
+                "status": unit_state.status,
+                "daemon": daemon_info,
+                "next_steps": next_steps,
+            },
+            indent=2,
+        )
+
+    # Handoff accepted. The unit is in an active or awaiting-merge status
+    # that ``state.list_active_units`` already returns to the daemon's
+    # per-tick walk — no additional enqueue is required. Worst case
+    # ``poll_interval_s`` (5 s default) until the daemon observes it.
+    return json.dumps(
+        {
+            "unit_id": unit_id,
+            "delivered": True,
+            "mode": "async_daemon",
+            "status": unit_state.status,
+            "pr_number": unit_state.pr_number,
+            "daemon": daemon_info,
+            "message": _CYCLE_REVIEW_ASYNC_HANDOFF_MSG,
+        },
+        indent=2,
+    )
+
+
+@mcp.tool()
+def cycle_review_blocking(feature_id: str, unit_id: str) -> str:
+    """F-016 Phase 4 — explicit blocking cycle review. Today's pre-Phase-4
+    behavior; always available regardless of ``NTFY_TOPIC``.
+
+    Runs the full ``advance_to_tester`` → ``advance_to_reviewer`` →
+    ``advance_to_terminal`` pipeline through the shared
+    ``_run_tester_advance`` / ``_run_reviewer_advance`` /
+    ``_run_terminal_advance`` helpers — the same engine the phase
+    commands call, so the transition table lives in exactly one place
+    (spec § "No parallel state machine": "``cycle_review_blocking`` and
+    the daemon call the *same* ``derive_next_action`` + ``execute``
+    engine"). One shared ``CycleContext`` keeps history contiguous and
+    lets ``_emit_terminal`` fire exactly once with the full timeline.
+
+    BLOCKS for 5–20+ minutes. Cap = ``CAP_3`` shared cycles across
+    tester-bugs and reviewer-changes; on cap hit or any BLOCKED the unit
+    is marked escalated and the summary is returned.
+
+    Use this to opt OUT of the Phase 4 default flip — calling it directly
+    runs the blocking path even when ``NTFY_TOPIC`` is set and the
+    dispatcher would otherwise route to :func:`cycle_review_async`.
+    Re-entry recovery (resume an in-flight tester / reviewer session
+    rather than cold-spawn) follows the same rules as the pre-Phase-4
+    ``cycle_review`` — see ``docs/STATE-MACHINE-AUDIT.md``
+    § "Stale-session recovery at tester/reviewer re-entry".
+
+    Repo must be fresh-verified (call ``verify_repo(<url>)`` if blocked).
+    """
+    if err := ensure_verified_for_feature(feature_id):
+        return err
+    return _cycle_review_blocking_impl(feature_id, unit_id)
+
+
+def _cycle_review_blocking_impl(feature_id: str, unit_id: str) -> str:
+    """Engine body of :func:`cycle_review_blocking` — assumes verified.
+
+    Always returns the JSON string ``_emit_terminal`` produces (success
+    OR escalation). The verification gate lives in the public
+    :func:`cycle_review_blocking` wrapper so direct MCP callers keep the
+    gate; the dispatcher calls this impl directly because it has already
+    verified at its own entry, avoiding a redundant SQLite read (PR #64
+    reviewer M2).
+
+    Side benefit: the dispatcher can now treat the return value as
+    guaranteed JSON, so attaching the ``nudge`` field never has to wrap
+    a non-JSON ``ERROR: …`` string with the unrelated NTFY hint —
+    closes the original M2 bug at its source.
+    """
     ctx = CycleContext(feature_id=feature_id, unit_id=unit_id, history=[])
 
     ok, msg = _run_tester_advance(ctx)
@@ -2970,6 +3287,88 @@ def cycle_review(feature_id: str, unit_id: str) -> str:
         return _emit_terminal(ctx, "escalated", msg or "ultrareview phase failed")
 
     return _emit_terminal(ctx, "approved_awaiting_merge", _TERMINAL_SUCCESS_MSG)
+
+
+@mcp.tool()
+def cycle_review(feature_id: str, unit_id: str) -> str:
+    """F-016 Phase 4 dispatcher — picks async vs. blocking by ``NTFY_TOPIC``.
+
+    * ``NTFY_TOPIC`` set AND the watcher daemon is running →
+      delegates to :func:`cycle_review_async`. Returns in ≤2 s; the
+      daemon takes the unit on its next tick.
+    * ``NTFY_TOPIC`` set but the daemon is NOT running → falls back to
+      :func:`cycle_review_blocking` and attaches the matching
+      daemon-down nudge picked by :func:`_daemon_down_nudge_for` —
+      :data:`_CYCLE_REVIEW_DAEMON_DOWN_NUDGE` for the common cases
+      (no row / stale heartbeat) and
+      :data:`_CYCLE_REVIEW_DAEMON_INVALID_HEARTBEAT_NUDGE` for the
+      corrupted-row case where ``orchestrator daemon start`` cannot
+      claim the lock and the operator must delete the row manually.
+      Without a live daemon, async would silently strand the unit
+      (Risk R1 in the proposal); blocking is the safer default until
+      the operator recovers the daemon.
+    * ``NTFY_TOPIC`` unset → delegates to :func:`cycle_review_blocking`
+      and attaches :data:`_CYCLE_REVIEW_NTFY_NUDGE`. Without a feedback
+      channel a silent ≤1 s async return is worse UX than today's
+      blocking flow — the user can't learn the work finished. Spec
+      § "Decisions": "Default-flip gated on ``NTFY_TOPIC``".
+
+    To opt out of the env-derived default, call
+    :func:`cycle_review_async` or :func:`cycle_review_blocking`
+    directly — both stay available regardless of ``NTFY_TOPIC`` or
+    daemon state (proposal § "Tool semantics change (additive)").
+
+    The post-spawn loop (blocking path):
+      tester → (if BUG: address_review → tester) → Copilot review →
+      our reviewer → (if CHANGES: address_review → reviewer) → optional
+      ultrareview gate (if feature.ultrareview_enabled) → terminal.
+
+    Repo must be fresh-verified (call ``verify_repo(<url>)`` if blocked).
+    Verification is checked here at the dispatcher entry so the ERROR
+    short-circuits before any nudge-prepend logic — otherwise the
+    blocking variant's non-JSON ``ERROR: target repo … not verified``
+    string would land underneath the NTFY nudge and confuse the user
+    about which message is the actual blocker (PR #64 reviewer M2).
+    """
+    if err := ensure_verified_for_feature(feature_id):
+        return err
+
+    ntfy_set = ntfy.is_configured()
+    # Single ``_daemon_health`` round-trip per dispatcher entry, both for
+    # latency (two SQLite reads on the ≤2 s p95 path is wasteful) and to
+    # close the TOCTOU window: the cached snapshot decides BOTH the
+    # async-vs-blocking branch and what the lead persona reports — they
+    # can't disagree if they share one row read (PR #64 reviewer M1).
+    daemon_info = _daemon_health() if ntfy_set else None
+
+    if ntfy_set and daemon_info is not None and daemon_info["running"]:
+        return _cycle_review_async_impl(feature_id, unit_id, daemon_info=daemon_info)
+
+    # Blocking path. Pick the nudge based on WHY we're here so the lead
+    # persona surfaces the right hint:
+    #   * ntfy unset       → "set NTFY_TOPIC to enable non-blocking mode"
+    #   * daemon not alive → start-the-daemon, or for the corrupted
+    #     ``invalid_heartbeat`` case the manual delete-the-row recovery
+    #     (claim_daemon_lock refuses takeover on unparseable heartbeats,
+    #     so "start the daemon" alone would fail silently — Copilot
+    #     finding).
+    # Both are one-time setup nudges, not per-call noise.
+    if ntfy_set:
+        assert daemon_info is not None  # invariant of the ntfy_set branch above
+        nudge = _daemon_down_nudge_for(daemon_info)
+    else:
+        nudge = _CYCLE_REVIEW_NTFY_NUDGE
+
+    # Call the impl directly (skipping the redundant verify gate; we
+    # already verified at the dispatcher entry, PR #64 reviewer M2).
+    # The impl is guaranteed to return JSON from ``_emit_terminal``, so
+    # the dispatcher can attach ``nudge`` unconditionally — no risk of
+    # the original M2 bug class where the NTFY hint piggybacked on an
+    # unrelated ``ERROR: target repo … not verified`` string.
+    blocking_result = _cycle_review_blocking_impl(feature_id, unit_id)
+    parsed = json.loads(blocking_result)
+    parsed["nudge"] = nudge
+    return json.dumps(parsed, indent=2)
 
 
 # --------------------------- send_to_unit (low-level) ---------------------------
