@@ -197,6 +197,68 @@ class TestTldrFormatPinning:
             assert sub in md
         assert md.count(TLDR_PLACEHOLDER) == len(TLDR_SUBHEADINGS)
 
+    def test_prefix_collision_does_not_match_canonical_subheading(self, tmp_state_db: Path) -> None:
+        """Strict canonical-heading match (Copilot PR #63 review).
+
+        ``### What shippedness`` shares a prefix with ``### What shipped`` —
+        a naive ``[^\\n]*`` trailing match would mirror its body into the
+        cycle log and violate the spec § Open questions "strict naming"
+        invariant. Pin the strict behaviour so a future loosening of the
+        regex flunks here."""
+        _seed_unit()
+        body = (
+            "## TL;DR\n\n"
+            "### What shippedness\nIMPOSTER-MARKER-MUST-NOT-MIRROR\n\n"
+            "### Downstream contract\nCANONICAL-DOWNSTREAM-MARKER\n\n"
+            "### Decisions worth knowing\nCANONICAL-DECISIONS-MARKER\n"
+        )
+        md = render_cycle_log(
+            "F-017-U-1",
+            pr_info={"body": body, "headRefOid": "abc"},
+            review_threads=[],
+        )
+        # Slice the rendered TL;DR section so the verbatim PR body block
+        # (which legitimately echoes the imposter marker downstream)
+        # doesn't false-positive the assertion. The TL;DR section ends
+        # at the next ``## `` heading — `_render_pr_description`.
+        tldr_start = md.find(TLDR_HEADING)
+        assert tldr_start != -1
+        tldr_end = md.find("\n## ", tldr_start + len(TLDR_HEADING))
+        tldr_section = md[tldr_start:tldr_end]
+        # The imposter sub-section body must not be mirrored under
+        # ``### What shipped`` — and since the canonical heading is
+        # absent from the PR body, the renderer falls back to TBD.
+        assert "IMPOSTER-MARKER-MUST-NOT-MIRROR" not in tldr_section
+        # The canonical ``### What shipped`` heading is still emitted —
+        # grep-stability — but with the TBD placeholder under it.
+        assert "### What shipped" in tldr_section
+        assert TLDR_PLACEHOLDER in tldr_section
+        # The two well-named sub-sections still mirror correctly so the
+        # bug fix doesn't regress the happy path for adjacent headings.
+        assert "CANONICAL-DOWNSTREAM-MARKER" in tldr_section
+        assert "CANONICAL-DECISIONS-MARKER" in tldr_section
+
+    def test_trailing_whitespace_after_canonical_heading_still_matches(
+        self, tmp_state_db: Path
+    ) -> None:
+        """A trailing space / tab on the heading line is benign (editors
+        often add them) and must not break the strict-match contract."""
+        _seed_unit()
+        body = (
+            "## TL;DR\n\n"
+            "### What shipped   \nTRAILING-SPACE-MARKER\n\n"
+            "### Downstream contract\t\nTRAILING-TAB-MARKER\n\n"
+            "### Decisions worth knowing\nDECISIONS-MARKER\n"
+        )
+        md = render_cycle_log(
+            "F-017-U-1",
+            pr_info={"body": body, "headRefOid": "abc"},
+            review_threads=[],
+        )
+        assert "TRAILING-SPACE-MARKER" in md
+        assert "TRAILING-TAB-MARKER" in md
+        assert "DECISIONS-MARKER" in md
+
 
 # --------------------------- 2. cycle_log_summary preserved ---------------------------
 

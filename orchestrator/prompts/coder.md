@@ -184,7 +184,7 @@ normal, build from the unit description alone in that case.
    PR body must include:
    - **Unit ID** (e.g. F-001-U-1)
    - **`## TL;DR`** section near the top — three required H3 sub-sections
-     the orchestrator mirrors verbatim into `features/F-XXX/<unit_id>.md`
+     the orchestrator mirrors verbatim into `features/F-XXX/U-N.md`
      and injects into downstream worker prompts. Keep each to a few
      lines; this is the predecessor-contract surface a future
      coder/tester/reviewer reads first. Format:

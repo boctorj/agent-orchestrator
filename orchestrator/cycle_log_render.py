@@ -159,10 +159,13 @@ def _extract_tldr_subsections(pr_body: str) -> dict[str, str]:
     if not pr_body:
         return found
     for name in TLDR_SUBHEADINGS:
-        # ``^<name>[^\n]*\n`` anchors on the heading line; we tolerate
-        # trailing text on the same line (e.g. an editor-added space) so
-        # an exact-match miss is the heading wording itself, not whitespace.
-        pattern = rf"^{re.escape(name)}[^\n]*\n(?P<content>.*?)(?=^#{{1,}}\s|\Z)"
+        # Strict canonical-heading match: only spaces/tabs may follow the
+        # canonical text on the heading line. Without that anchor, the
+        # extractor would silently match prefix collisions like
+        # ``### What shippedness`` and mirror the wrong content
+        # (Copilot PR #63 review). Sub-section body then runs to the next
+        # markdown heading at any level, or EOF.
+        pattern = rf"^{re.escape(name)}[ \t]*\n(?P<content>.*?)(?=^#{{1,}}\s|\Z)"
         m = re.search(pattern, pr_body, re.MULTILINE | re.DOTALL)
         if m:
             found[name] = m.group("content").strip()
