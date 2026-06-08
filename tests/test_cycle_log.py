@@ -476,6 +476,69 @@ class TestRenderCycleLog:
         assert "### Cycle 0 — ultrareview: STARTED" in md
         assert "### Cycle 0 — ultrareview: PASSED" in md
 
+    def test_ultrareview_fix_cycle_events_render_with_dynamic_n(self, tmp_state_db: Path) -> None:
+        # F-007-U-4 regression (recurrence of U-3's H1 pattern): the renderer
+        # historically used a static ``_EVENT_HEADINGS.get(event_type)``
+        # lookup that silently dropped every ``ultrareview_fix_cycle_N``
+        # event, where N is the shared CAP_3 cycle number. The fix routes
+        # the lookup through ``_heading_for`` to resolve the dynamic prefix.
+        #
+        # A committed cycle log for a unit that escalated after running
+        # through ultrareview fix cycles must surface every fix-cycle event
+        # (with its summary) so a reader can attribute the interleaved
+        # `fix_pushed` events to ultrareview vs reviewer-changes vs CI-fix —
+        # the distinction the event was added to make legible.
+        _seed(
+            status="escalated",
+            events=[
+                {
+                    "event_type": "reviewer_recommend_merge",
+                    "cycle_number": 0,
+                    "summary": "endorsed",
+                },
+                {
+                    "event_type": "ultrareview_started",
+                    "source": "ultrareview",
+                    "cycle_number": 0,
+                    "summary": "firing /ultrareview",
+                },
+                {
+                    "event_type": "ultrareview_failed",
+                    "source": "ultrareview",
+                    "cycle_number": 0,
+                    "summary": "ultrareview failed with 2 findings",
+                },
+                {
+                    "event_type": "ultrareview_fix_cycle_1",
+                    "source": "ultrareview",
+                    "cycle_number": 1,
+                    "summary": "coder fix cycle 1 for 2 ultrareview finding(s)",
+                },
+                {
+                    "event_type": "fix_pushed",
+                    "cycle_number": 1,
+                    "summary": "fix pushed",
+                },
+                {
+                    "event_type": "ultrareview_fix_cycle_2",
+                    "source": "ultrareview",
+                    "cycle_number": 2,
+                    "summary": "coder fix cycle 2 for 1 ultrareview finding(s)",
+                },
+            ],
+        )
+        md = cycle_log.render_cycle_log("F-007-U-2", pr_info={}, review_threads=[])
+        assert "### Cycle 1 — ultrareview: fix cycle 1" in md, (
+            "ultrareview_fix_cycle_1 must surface in the rendered markdown — "
+            "without it, the committed log can't attribute the interleaved "
+            "coder fix events to ultrareview vs reviewer-changes vs CI-fix"
+        )
+        assert "### Cycle 2 — ultrareview: fix cycle 2" in md
+        assert "coder fix cycle 1 for 2 ultrareview finding(s)" in md, (
+            "fix-cycle event summary must reach the rendered markdown — "
+            "the cycle-log is the on-disk record of the audit trail"
+        )
+
 
 # --------------------------- writing ---------------------------
 

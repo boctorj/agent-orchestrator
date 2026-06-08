@@ -427,7 +427,7 @@ def compose_fix_task(
     feature_spec_text: str = "",
     predecessor_logs: list[tuple[str, str]] | None = None,
 ) -> str:
-    """Resume message for the coder fix-loop (tester / reviewer / ci / human source).
+    """Resume message for the coder fix-loop (tester / reviewer / ci / human / ultrareview source).
 
     Re-injecting the spec + predecessor blocks on every resume is the contract
     documented in ``features/F-006/spec.md`` § Constraints (*"Worker-prompt
@@ -435,10 +435,61 @@ def compose_fix_task(
     every resume to pick up mid-cycle spec edits"*) and reflected by
     ``prompts/coder.md``'s "Re-read FEATURE SPEC on every resume" rule.
     Empty kwargs drop their block, keeping pre-F-006 call sites valid.
+
+    F-007-U-4: ``source='ultrareview'`` uses a variant guidance block
+    anchoring the coder on "reviewer already endorsed, fix without scope
+    creep" and a FEEDBACK label matching the no-inline-anchors contract
+    (same shape as ``'ci'``).
     """
     context = _render_context_blocks(
         feature_spec_text=feature_spec_text, predecessor_logs=predecessor_logs
     )
+
+    # F-007-U-4: ultrareview runs *after* our reviewer endorsed via
+    # REVIEW_RECOMMEND_MERGE, so the coder has already taken a victory lap.
+    # The variant prompt anchors them on "final-mile issues, fix without
+    # scope creep" — no broad refactor, no new abstractions, just the
+    # narrow patches the audit named. Findings have no inline anchors (the
+    # ultrareview CLI returns a JSON list, not PR review comments), so the
+    # FEEDBACK above is the full source of truth — symmetric to `ci`.
+    if source == "ultrareview":
+        guidance = (
+            "Our reviewer already endorsed this PR via REVIEW_RECOMMEND_MERGE, "
+            "but the optional `/ultrareview` meta-audit caught these final-mile "
+            "issues. Fix them WITHOUT scope creep — no refactors, no new "
+            "abstractions, no opportunistic cleanups. Address ONLY the findings "
+            "listed above; anything else is out-of-scope for this cycle and "
+            "should go to the PR body's 'Decisions/deviations' section.\n\n"
+            "Ultrareview findings have no inline PR-comment anchors (the audit "
+            "is delivered as a structured JSON list, not a `gh pr review`), so "
+            "the FEEDBACK above is the full source of truth — same shape as "
+            "`ci`. Post one bottom-of-PR comment summarizing what you changed "
+            "per finding (which file / what fix), then push."
+        )
+    else:
+        guidance = (
+            f"Follow the source-specific fix-loop flow in your system prompt "
+            f"(`## When resumed with feedback`). For `reviewer` / `tester` / "
+            f"`human` sources, the source of truth is the inline review "
+            f"comments on PR #{pr_number} — fetch them, address each in code, "
+            f"then **reply inline** to each thread with what you did. For "
+            f"`ci`, the FEEDBACK above is the full context (no inline anchors "
+            f"possible)."
+        )
+
+    # FEEDBACK label has to match the actual source-of-truth contract: for
+    # tester / reviewer / human, the inline review threads on the PR ARE the
+    # source of truth and FEEDBACK is just the orchestrator's tag pointing
+    # there; for ci / ultrareview, there are no inline anchors so FEEDBACK
+    # IS the full source of truth. Using the "actionable detail lives in
+    # PR comments" label on the latter group misleads the coder into
+    # fetching threads that don't exist for the cycle (and the variant
+    # guidance directly contradicts it — Copilot review on PR #51).
+    if source in ("ci", "ultrareview"):
+        feedback_label = "FEEDBACK (full context — no inline review threads for this source)"
+    else:
+        feedback_label = "FEEDBACK (orchestrator summary — actionable detail lives in PR comments)"
+
     return f"""You have feedback to address on your existing work for unit {unit.id}.
 
 REPO_URL:  {feature.repo_path}
@@ -446,15 +497,10 @@ BRANCH:    {branch} (your branch, already checked out from your previous turn)
 PR_NUMBER: {pr_number}
 SOURCE:    {source}
 
-FEEDBACK (orchestrator summary — actionable detail lives in PR comments):
+{feedback_label}:
 {feedback}
 
-{context}Follow the source-specific fix-loop flow in your system prompt
-(`## When resumed with feedback`). For `reviewer` / `tester` / `human`
-sources, the source of truth is the inline review comments on PR #{pr_number} —
-fetch them, address each in code, then **reply inline** to each thread with
-what you did. For `ci`, the FEEDBACK above is the full context (no inline
-anchors possible).
+{context}{guidance}
 
 End your response with `FIX_PUSHED` on its own line, OR a structured
 `BLOCKED:` line if you couldn't apply the fix.

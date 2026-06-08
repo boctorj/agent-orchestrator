@@ -1413,31 +1413,62 @@ class TestCycleReviewUltrareviewGate:
         assert "ultrareview_passed" in types
         assert "ultrareview_failed" not in types
 
-    def test_flag_on_fails_escalates_with_findings(
+    def test_flag_on_persistent_fail_escalates_at_cap_3_with_findings(
         self, tmp_state_db, with_github_token, monkeypatch
     ):
-        """Flag on + ultrareview FAIL → escalation (initial impl; U-4 adds the
-        fix-loop). ``ultrareview_failed`` event carries the findings list.
+        """Flag on + persistent ultrareview FAIL → the U-4 FAIL fix-loop runs
+        until the shared CAP_3 budget hits, then escalates with the last
+        verdict's findings in the message + on every ``ultrareview_failed``
+        event. (U-3 escalated on the first FAIL; U-4 routes through
+        ``address_review(source='ultrareview', ...)`` first.)
         """
         self._seed_for_reviewer_recommend(monkeypatch)
         _enable_ultrareview()
         findings = ["src/x.py:42 — leaks fd on retry", "src/y.py:7 — off-by-one"]
         calls = _stub_ultrareview(monkeypatch, passed=False, findings=findings)
 
+        # Coder always FIX_PUSHES; ultrareview always FAILs → cap-3 escalation.
+        # Stub address_review at module bind so we don't need a real worker.
+        def fake_address_review(uid, src, fb):
+            round_num = state.increment_review_round(uid)
+            return json.dumps(
+                {"unit_id": uid, "cycle": round_num, "outcome": "FIX_PUSHED", "summary": "ok"}
+            )
+
+        monkeypatch.setattr(execution, "address_review", fake_address_review)
+
         out = execution.cycle_review("F-001", "F-001-U-1")
         parsed = json.loads(out)
         assert parsed["outcome"] == "escalated"
+        # Source attribution must survive the escalation message — preserved
+        # from the U-3 baseline. A refactor that swaps the wording (e.g. to
+        # "meta-audit cap-3 hit") would silently strip ultrareview from the
+        # ntfy push body and the dashboard escalation digest.
         assert "ultrareview" in parsed["message"].lower()
+        # Cap-3 escalation message must surface the unresolved findings so
+        # the human reading the ntfy push sees what ultrareview still flagged.
         for f in findings:
-            assert f in parsed["message"], "escalation message must surface findings"
+            assert f in parsed["message"], "cap-3 escalation must surface findings"
 
-        assert len(calls["trigger"]) == 1
+        # ultrareview fired exactly CAP_3+1 times: the initial verdict + one
+        # re-run per fix cycle (CAP_3 fixes). A weaker `>= 2` assertion would
+        # silently let a regression that runs the loop just once through.
+        from orchestrator.tools import CAP_3
+
+        assert len(calls["trigger"]) == CAP_3 + 1, (
+            f"fix loop must re-run ultrareview once per fix cycle (expected "
+            f"{CAP_3 + 1} trigger calls, got {len(calls['trigger'])})"
+        )
 
         events = state.list_events("F-001-U-1")
         types = [e["event_type"] for e in events]
         assert "ultrareview_started" in types
         assert "ultrareview_failed" in types
         assert "ultrareview_passed" not in types
+        # The fix-loop event type lands on each iteration.
+        assert any(t.startswith("ultrareview_fix_cycle_") for t in types), (
+            "fix-loop must emit ultrareview_fix_cycle_N events"
+        )
         failed_evt = next(e for e in events if e["event_type"] == "ultrareview_failed")
         for f in findings:
             assert f in failed_evt["details"], "findings must land in event.details"

@@ -56,8 +56,11 @@ gate that refuses to spawn against repos without branch protection.
   `gh pr review`. Returns `REVIEW_APPROVED` / `REVIEW_REQUEST_CHANGES` /
   `REVIEW_COMMENT` / `BLOCKED`. BLOCKS minutes. **Same CI-red refusal.**
 - `address_review(unit_id, source, feedback)` — resume coder to address
-  feedback from `tester`|`reviewer`|`ci`|`human`. Increments cycle counter.
-  BLOCKS minutes. Use `source='ci'` when forwarding a CI failure manually.
+  feedback from `tester`|`reviewer`|`ci`|`human`|`ultrareview`. Increments
+  cycle counter. BLOCKS minutes. Use `source='ci'` when forwarding a CI
+  failure manually; `source='ultrareview'` is normally driven by
+  `cycle_review` itself (F-007-U-4 fix-loop), available here for manual
+  re-runs after a human reads the meta-audit findings.
 - `cycle_review(feature_id, unit_id)` — **one-call automation:** wait CI →
   tester → fix-loop → wait CI → **request GitHub Copilot review + wait** →
   reviewer → fix-loop → wait CI → (if the feature row's
@@ -66,8 +69,11 @@ gate that refuses to spawn against repos without branch protection.
   CI-fail fixes). BLOCKS for **5-20+ minutes** plus up to 5 min waiting
   for Copilot, plus a few minutes for ultrareview when enabled. Use
   this for the normal post-spawn path. The ultrareview gate (F-007)
-  invokes the `/ultrareview` skill on the PASS path; a failed audit
-  escalates the unit.
+  invokes the `/ultrareview` skill on the PASS path; a FAIL verdict
+  posts the structured findings as a PR comment and routes the coder
+  through `address_review(source='ultrareview', ...)` for a fix-loop
+  that re-runs ultrareview (not the reviewer agent) until PASS or the
+  shared cap-3 hits. Cap hit → escalate with full ultrareview history.
 
   **CI-green gate at every hand-off:** the orchestrator waits for CI
   to settle (success-only conclusion on every check_run) before each

@@ -214,12 +214,12 @@ normal, build from the unit description alone in that case.
 ## When resumed with feedback (fix-loop)
 
 The orchestrator will resume you (same session, same `/workspace/repo`)
-when tester / reviewer / CI / human leave feedback. Your task message
-will include:
+when tester / reviewer / CI / human / ultrareview leave feedback. Your
+task message will include:
 
 ```
 PR_NUMBER: <N>
-SOURCE:    reviewer | tester | ci | human
+SOURCE:    reviewer | tester | ci | human | ultrareview
 FEEDBACK:  <orchestrator's one-line summary>
 ```
 
@@ -327,6 +327,40 @@ git -c user.email=agent@orchestrator -c user.name="orchestrator-coder" \
   commit -m "ci: <one-line>"
 git push origin <branch_name>
 ```
+
+End with `FIX_PUSHED`.
+
+### `SOURCE: ultrareview` — no inline replies, fix without scope creep
+
+The optional F-007 ultrareview gate fires *after* the reviewer has
+already emitted `REVIEW_RECOMMEND_MERGE` — your earlier work has been
+endorsed. Ultrareview is Anthropic's multi-agent cloud bug-hunter; it
+runs over the full PR and emits a structured JSON list of findings (no
+inline PR-comment anchors, because the audit isn't a `gh pr review`).
+
+The FEEDBACK text is the full source of truth — same shape as `ci`. The
+orchestrator has already posted a meta-audit PR comment listing the
+findings; you do **not** need to fetch inline review threads.
+
+The defining constraint: **fix without scope creep**. The reviewer
+already endorsed the broader design; opportunistic refactors,
+new abstractions, or "while I'm in here" cleanups would invalidate that
+endorsement for no reason. Address ONLY the findings listed in FEEDBACK.
+
+```sh
+git fetch origin && git merge --ff-only origin/<branch_name>
+# ... apply the narrow patches the audit named ...
+git add <changed files>
+git -c user.email=agent@orchestrator -c user.name="orchestrator-coder" \
+  commit -m "ultrareview: <one-line>"
+git push origin <branch_name>
+```
+
+Post one bottom-of-PR comment summarizing what you changed per finding
+(which file / what fix), then end with `FIX_PUSHED`. Anything you
+*didn't* fix (disagreed, out of scope) goes in that comment too — the
+audit doesn't track resolution status the way an inline review thread
+does, so the comment is the human-visible record of what you decided.
 
 End with `FIX_PUSHED`.
 

@@ -494,6 +494,27 @@ setups (App-for-coder + PAT-for-reviewer) are tracked in `BACKLOG.md`
 as an option for teams that explicitly want bot-only approval flows,
 but they are not the recommended path.
 
+### Optional ultrareview gate (F-007)
+
+Load-bearing features can opt in to an extra pre-merge pass with
+`load_feature(..., ultrareview_enabled=True)`. After the reviewer agent
+emits `REVIEW_RECOMMEND_MERGE`, `cycle_review` fires Anthropic's
+`/ultrareview` (a multi-agent cloud bug-hunter) as a final audit. The
+flag is **per-feature opt-in** because each run has measurable token
+cost — not worth it on every change, valuable on the risky ones.
+
+- **Ultrareview PASS** → `approved_awaiting_merge` (today's behaviour).
+- **Ultrareview FAIL** → the structured findings post as a PR comment so
+  the human sees the meta-audit, then the coder addresses them via
+  `address_review(source='ultrareview', ...)` ("reviewer already endorsed,
+  fix the listed findings without scope creep"). After CI green, the gate
+  re-runs ultrareview (not the reviewer — endorsement already happened).
+- The loop shares the same **cap-3 budget** as tester-bug and reviewer-
+  change fixes. Cap hit → escalation with the full ultrareview history.
+
+The gate **fails closed** on wrapper errors / unparseable verdict output:
+if we can't read what ultrareview emitted, the PR does not merge.
+
 ## Troubleshooting
 
 See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for a thorough list of
