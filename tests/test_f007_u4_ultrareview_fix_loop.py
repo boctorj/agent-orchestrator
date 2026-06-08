@@ -463,6 +463,49 @@ class TestUltrareviewPRCommentMetaAudit:
             "PASS path must NOT post the meta-audit comment — that's only for the FAIL fix-loop"
         )
 
+    def test_pr_comment_uses_forward_looking_wording(self):
+        """The PR comment posts *before* ``address_review`` runs, so it must
+        not assert present-tense action the coder hasn't taken yet — a
+        BLOCKED coder or cap-3 exhaustion would leave a stale, factually-
+        wrong claim on the PR timeline. (Copilot review on PR #51.)
+
+        Direct-call the formatter rather than going through ``cycle_review``
+        so the assertion holds regardless of which call site uses the
+        helper. Pins both directions: present-tense "is addressing" is
+        absent, and the forward-looking shape (orchestrator will / attempt /
+        route / escalates if) is present.
+        """
+        body = execution._format_ultrareview_pr_comment(
+            ["src/a.py:1 — leak", "src/b.py:7 — race"], cycle=1
+        )
+
+        # Negative assertions: any present-tense claim about coder action
+        # the orchestrator can't yet guarantee.
+        forbidden = (
+            "coder is addressing them now",
+            "the coder is addressing",
+            "addressing them now",
+        )
+        for phrase in forbidden:
+            assert phrase not in body.lower(), (
+                f"meta-audit comment must NOT make present-tense claims "
+                f"about coder action it can't yet guarantee; found {phrase!r}"
+            )
+
+        # Positive assertion: the comment must signal what happens on
+        # BLOCKED / cap-3 (the failure modes the present-tense wording
+        # ignored). Look for one of the forward-looking shapes.
+        forward_looking_signals = (
+            "will now route",
+            "will attempt",
+            "escalates",
+            "if the coder blocks",
+        )
+        assert any(s in body.lower() for s in forward_looking_signals), (
+            "meta-audit comment must use forward-looking framing — one of: "
+            f"{forward_looking_signals}"
+        )
+
 
 # --------------------------- ultrareview_fix_cycle_N events ---------------------------
 
