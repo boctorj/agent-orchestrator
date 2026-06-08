@@ -2806,6 +2806,29 @@ source — both are one-time setup hints, both consumed via the same
 field, and both kept off the per-call hot path."""
 
 
+_CYCLE_REVIEW_DAEMON_INVALID_HEARTBEAT_NUDGE = (
+    "NTFY_TOPIC is set but this workspace's daemon_locks row has a "
+    "malformed heartbeat_at — `orchestrator daemon start` will NOT be "
+    "able to claim it (state.claim_daemon_lock refuses takeover when "
+    "heartbeat_at can't be parsed; see the row via "
+    "`orchestrator daemon status`). Delete the corrupted lock row "
+    'manually (`sqlite3 state.db "DELETE FROM daemon_locks WHERE '
+    "state_db_path = '<path>';\"`) then run `orchestrator daemon "
+    "start` to enable non-blocking mode, or call cycle_review_async() "
+    "once the new daemon is up. cycle_review stayed blocking for now."
+)
+"""Variant of :data:`_CYCLE_REVIEW_DAEMON_DOWN_NUDGE` for the
+``invalid_heartbeat`` :func:`_daemon_health` branch. The generic
+"start the daemon" advice doesn't work for this case:
+:func:`~orchestrator.state.claim_daemon_lock` deliberately refuses
+takeover when ``heartbeat_at`` is unparseable (line ~1203 in
+``state.py``: "a corrupted ``heartbeat_at`` (clock skew, disk
+corruption, hand-edit) must not silently let a new daemon snipe the
+active row"). So this nudge tells the operator the manual recovery
+step — delete the row — instead of suggesting a command that will
+silently fail to claim the lock."""
+
+
 _CYCLE_REVIEW_ASYNC_HANDOFF_MSG = (
     "Handed off to the watcher daemon. The daemon will observe markers "
     "from existing worker sessions and apply F-014 PR-merge transitions "
@@ -2829,6 +2852,30 @@ phase commands. End-to-end drive ships with U-7's
 ``orchestrator/cycle/phases.py`` extraction. Tell the truth here so a
 user who reads the response on a unit stuck in ``in_ci`` knows the
 right next step."""
+
+
+def _daemon_down_nudge_for(daemon_info: dict[str, Any]) -> str:
+    """Pick the right ``daemon-down`` nudge for ``daemon_info["reason"]``.
+
+    The two nudges differ on the recovery instruction:
+      * ``invalid_heartbeat`` → manual recovery (delete the corrupted
+        ``daemon_locks`` row) because
+        :func:`~orchestrator.state.claim_daemon_lock` refuses to take
+        over a row it can't parse, so ``orchestrator daemon start``
+        alone won't succeed.
+      * Every other ``not_running`` reason (``no_lock_holder``,
+        ``stale_heartbeat``) → the default "start the daemon"
+        instruction, which works because either there's no row to
+        contend with or the existing row is stale enough that
+        ``claim_daemon_lock`` will reclaim it.
+
+    Reviewer (Copilot) flag: the original single nudge promised "start
+    the daemon" guidance that fails silently in the ``invalid_heartbeat``
+    case; pick at the call-site instead of patching the constants.
+    """
+    if daemon_info.get("reason") == "invalid_heartbeat":
+        return _CYCLE_REVIEW_DAEMON_INVALID_HEARTBEAT_NUDGE
+    return _CYCLE_REVIEW_DAEMON_DOWN_NUDGE
 
 
 def _daemon_health() -> dict[str, Any]:
@@ -2974,6 +3021,32 @@ def _cycle_review_async_impl(
     if daemon_info is None:
         daemon_info = _daemon_health()
     if not daemon_info["running"]:
+        # Pick recovery guidance by daemon reason. The default ("start
+        # the daemon") doesn't work when ``heartbeat_at`` is corrupted
+        # — :func:`~orchestrator.state.claim_daemon_lock` refuses
+        # takeover in that case, so an operator who follows the generic
+        # instruction will see a silent claim failure. Branch here so
+        # the ``invalid_heartbeat`` path gets the manual-recovery hint
+        # while the common cases keep today's guidance (Copilot
+        # finding).
+        if daemon_info.get("reason") == "invalid_heartbeat":
+            next_steps = [
+                "This workspace's daemon_locks row has a malformed "
+                "heartbeat_at — `orchestrator daemon start` will NOT "
+                "be able to claim it (state.claim_daemon_lock refuses "
+                "takeover on unparseable heartbeats). Delete the "
+                "corrupted row manually (e.g. `sqlite3 state.db "
+                '"DELETE FROM daemon_locks WHERE state_db_path = '
+                "'<path>';\"`) then start the daemon, or call "
+                "cycle_review_blocking() as a fallback for this unit.",
+            ]
+        else:
+            next_steps = [
+                "The watcher daemon is not running for this workspace. "
+                "Start it with `orchestrator daemon start` (and set "
+                "ORCH_DAEMON_DRIVE=true in .env), or call "
+                "cycle_review_blocking() as a fallback for this unit.",
+            ]
         return json.dumps(
             {
                 "unit_id": unit_id,
@@ -2981,12 +3054,7 @@ def _cycle_review_async_impl(
                 "reason": "daemon_not_running",
                 "status": unit_state.status,
                 "daemon": daemon_info,
-                "next_steps": [
-                    "The watcher daemon is not running for this workspace. "
-                    "Start it with `orchestrator daemon start` (and set "
-                    "ORCH_DAEMON_DRIVE=true in .env), or call "
-                    "cycle_review_blocking() as a fallback for this unit.",
-                ],
+                "next_steps": next_steps,
             },
             indent=2,
         )
@@ -3083,10 +3151,16 @@ def cycle_review(feature_id: str, unit_id: str) -> str:
       delegates to :func:`cycle_review_async`. Returns in ≤2 s; the
       daemon takes the unit on its next tick.
     * ``NTFY_TOPIC`` set but the daemon is NOT running → falls back to
-      :func:`cycle_review_blocking` and attaches
-      :data:`_CYCLE_REVIEW_DAEMON_DOWN_NUDGE`. Without a live daemon,
-      async would silently strand the unit (Risk R1 in the proposal);
-      blocking is the safer default until the operator starts the daemon.
+      :func:`cycle_review_blocking` and attaches the matching
+      daemon-down nudge picked by :func:`_daemon_down_nudge_for` —
+      :data:`_CYCLE_REVIEW_DAEMON_DOWN_NUDGE` for the common cases
+      (no row / stale heartbeat) and
+      :data:`_CYCLE_REVIEW_DAEMON_INVALID_HEARTBEAT_NUDGE` for the
+      corrupted-row case where ``orchestrator daemon start`` cannot
+      claim the lock and the operator must delete the row manually.
+      Without a live daemon, async would silently strand the unit
+      (Risk R1 in the proposal); blocking is the safer default until
+      the operator recovers the daemon.
     * ``NTFY_TOPIC`` unset → delegates to :func:`cycle_review_blocking`
       and attaches :data:`_CYCLE_REVIEW_NTFY_NUDGE`. Without a feedback
       channel a silent ≤1 s async return is worse UX than today's
@@ -3127,9 +3201,17 @@ def cycle_review(feature_id: str, unit_id: str) -> str:
     # Blocking path. Pick the nudge based on WHY we're here so the lead
     # persona surfaces the right hint:
     #   * ntfy unset       → "set NTFY_TOPIC to enable non-blocking mode"
-    #   * daemon not alive → "start the daemon to use non-blocking mode"
+    #   * daemon not alive → start-the-daemon, or for the corrupted
+    #     ``invalid_heartbeat`` case the manual delete-the-row recovery
+    #     (claim_daemon_lock refuses takeover on unparseable heartbeats,
+    #     so "start the daemon" alone would fail silently — Copilot
+    #     finding).
     # Both are one-time setup nudges, not per-call noise.
-    nudge = _CYCLE_REVIEW_DAEMON_DOWN_NUDGE if ntfy_set else _CYCLE_REVIEW_NTFY_NUDGE
+    if ntfy_set:
+        assert daemon_info is not None  # invariant of the ntfy_set branch above
+        nudge = _daemon_down_nudge_for(daemon_info)
+    else:
+        nudge = _CYCLE_REVIEW_NTFY_NUDGE
 
     # Call the impl directly (skipping the redundant verify gate; we
     # already verified at the dispatcher entry, PR #64 reviewer M2).

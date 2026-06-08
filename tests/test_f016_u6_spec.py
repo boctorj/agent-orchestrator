@@ -132,6 +132,26 @@ def _seed_daemon_lock(holder_id="test-holder", *, heartbeat_age_s: float = 0.0) 
             )
 
 
+def _seed_corrupted_daemon_lock(holder_id: str = "test-holder") -> None:
+    """Write a ``daemon_locks`` row whose ``heartbeat_at`` is unparseable.
+
+    Mirrors the production failure mode the Copilot finding points at:
+    ``state.claim_daemon_lock`` refuses takeover on rows it can't parse
+    (line ~1203 in state.py: "a corrupted heartbeat_at … must not
+    silently let a new daemon snipe the active row"), so an operator
+    who follows the generic "start the daemon" guidance will see a
+    silent claim failure and the unit stays stranded."""
+    from pathlib import Path
+
+    path = str(Path(state.STATE_DB).resolve())
+    state.claim_daemon_lock(path, holder_id)
+    with state._connect() as conn:
+        conn.execute(
+            "UPDATE daemon_locks SET heartbeat_at = ? WHERE state_db_path = ?",
+            ("NOT-AN-ISO-TIMESTAMP", path),
+        )
+
+
 def _stub_github(monkeypatch):
     """Patch github.* helpers to no-op stubs."""
     monkeypatch.setattr("orchestrator.tools.execution.safe_amend_pr_body", lambda *a, **k: "")
@@ -759,3 +779,208 @@ class TestNudgesAreModuleConstants:
         _stub_github(monkeypatch)
         out = execution.cycle_review("F-001", "F-016-U-6-T")
         assert "SENTINEL daemon-down nudge for reviewer M3 lockdown" in out
+
+
+# --------------------------- Copilot (PR #64) invalid_heartbeat guidance ---------------------------
+
+
+class TestInvalidHeartbeatGuidance:
+    """Copilot finding on PR #64: when ``_daemon_health()`` returns
+    ``reason="invalid_heartbeat"`` (the workspace's ``daemon_locks`` row
+    has a malformed ``heartbeat_at``), the generic "start the daemon"
+    nudge AND the equivalent ``next_steps`` entry in the
+    ``daemon_not_running`` async response both lead the operator down a
+    silent-fail path: :func:`state.claim_daemon_lock` deliberately
+    refuses takeover when the heartbeat can't be parsed (line ~1203 in
+    state.py: "a corrupted ``heartbeat_at`` … must not silently let a
+    new daemon snipe the active row"), so ``orchestrator daemon start``
+    alone will not recover.
+
+    Manual recovery — delete the corrupted row — must be in the user-
+    visible guidance for the ``invalid_heartbeat`` branch. The common
+    cases (``no_lock_holder``, ``stale_heartbeat``) keep today's
+    "start the daemon" guidance because those rows ARE takeoverable."""
+
+    def test_invalid_heartbeat_reason_surfaces_in_daemon_health(self, tmp_state_db):
+        """Sanity check that the fixture and ``_daemon_health`` agree
+        on the failure mode this test class is about — without this,
+        a fixture regression would silently invalidate the rest."""
+        _seed_corrupted_daemon_lock()
+        info = execution._daemon_health()
+        assert info["running"] is False
+        assert info["reason"] == "invalid_heartbeat", (
+            f"fixture seed produced reason={info.get('reason')!r}; expected "
+            f"'invalid_heartbeat'. The downstream tests rely on this branch."
+        )
+
+    def test_dispatcher_nudge_calls_out_manual_recovery_on_invalid_heartbeat(
+        self, tmp_state_db, with_github_token, monkeypatch, with_ntfy_topic
+    ):
+        """NTFY+invalid-heartbeat path: dispatcher falls back to blocking
+        and attaches the invalid-heartbeat nudge, which must mention
+        deleting the ``daemon_locks`` row instead of (or in addition to)
+        ``daemon start``. Without the manual recovery callout, the
+        operator follows guidance that silently fails."""
+        _seed_coded_unit()
+        _seed_corrupted_daemon_lock()
+        monkeypatch.setattr(
+            execution,
+            "spawn_tester",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "TESTS_PASS", "session_id": "t"}),
+        )
+        monkeypatch.setattr(
+            execution,
+            "spawn_reviewer",
+            lambda f, u: json.dumps(
+                {"unit_id": u, "outcome": "REVIEW_RECOMMEND_MERGE", "session_id": "r"}
+            ),
+        )
+        _stub_github(monkeypatch)
+        out = execution.cycle_review("F-001", "F-016-U-6-T")
+        parsed = json.loads(out)
+        nudge = parsed.get("nudge", "").lower()
+        assert "daemon_locks" in nudge or "delete" in nudge, (
+            f"invalid-heartbeat nudge must point at manual recovery (delete "
+            f"the daemon_locks row); got nudge={parsed.get('nudge')!r}"
+        )
+        assert "heartbeat" in nudge, (
+            f"invalid-heartbeat nudge should name the failure mode so the "
+            f"operator knows why `daemon start` is not the right next step; "
+            f"got nudge={parsed.get('nudge')!r}"
+        )
+
+    def test_dispatcher_default_nudge_unchanged_for_no_lock_holder(
+        self, tmp_state_db, with_github_token, monkeypatch, with_ntfy_topic
+    ):
+        """Reviewer constraint: 'Keep the existing guidance for other
+        reasons unchanged.' The no-lock-holder daemon-down path must
+        still emit the default ``_CYCLE_REVIEW_DAEMON_DOWN_NUDGE``
+        verbatim; the dispatcher must not collapse the two branches."""
+        _seed_coded_unit()
+        # No daemon_locks row seeded → reason="no_lock_holder".
+        monkeypatch.setattr(
+            execution,
+            "spawn_tester",
+            lambda f, u: json.dumps({"unit_id": u, "outcome": "TESTS_PASS", "session_id": "t"}),
+        )
+        monkeypatch.setattr(
+            execution,
+            "spawn_reviewer",
+            lambda f, u: json.dumps(
+                {"unit_id": u, "outcome": "REVIEW_RECOMMEND_MERGE", "session_id": "r"}
+            ),
+        )
+        _stub_github(monkeypatch)
+        out = execution.cycle_review("F-001", "F-016-U-6-T")
+        parsed = json.loads(out)
+        assert parsed.get("nudge") == execution._CYCLE_REVIEW_DAEMON_DOWN_NUDGE, (
+            "no-lock-holder dispatcher path did not surface the default "
+            "daemon-down nudge verbatim; the invalid_heartbeat branch is "
+            "supposed to be the ONLY change."
+        )
+
+    def test_async_impl_next_steps_calls_out_manual_recovery_on_invalid_heartbeat(
+        self, tmp_state_db, with_github_token
+    ):
+        """Direct ``cycle_review_async`` call on an invalid-heartbeat
+        workspace: the ``daemon_not_running`` response's ``next_steps``
+        must mention the manual recovery (delete the daemon_locks row).
+        Same Copilot finding as the nudge, applied to the async tool's
+        machine-readable guidance shape."""
+        _seed_coded_unit()
+        _seed_corrupted_daemon_lock()
+        out = execution.cycle_review_async("F-001", "F-016-U-6-T")
+        parsed = json.loads(out)
+        assert parsed["delivered"] is False
+        assert parsed["reason"] == "daemon_not_running"
+        next_steps_text = " ".join(parsed.get("next_steps") or []).lower()
+        assert "daemon_locks" in next_steps_text or "delete" in next_steps_text, (
+            f"invalid_heartbeat next_steps must mention deleting the "
+            f"daemon_locks row; got: {parsed.get('next_steps')!r}"
+        )
+        assert "heartbeat" in next_steps_text, (
+            f"invalid_heartbeat next_steps should name the failure mode; "
+            f"got: {parsed.get('next_steps')!r}"
+        )
+
+    def test_async_impl_next_steps_unchanged_for_no_lock_holder(
+        self, tmp_state_db, with_github_token
+    ):
+        """Boundary: the no-lock-holder branch keeps today's guidance.
+        Pins the 'other reasons unchanged' constraint at the async
+        tool's response shape."""
+        _seed_coded_unit()
+        # No daemon_locks row seeded → reason="no_lock_holder".
+        out = execution.cycle_review_async("F-001", "F-016-U-6-T")
+        parsed = json.loads(out)
+        next_steps_text = " ".join(parsed.get("next_steps") or []).lower()
+        assert "daemon start" in next_steps_text, (
+            f"no_lock_holder branch should still surface the 'start the "
+            f"daemon' guidance; got: {parsed.get('next_steps')!r}"
+        )
+        # The no-lock-holder hint must NOT carry the invalid-heartbeat
+        # manual-recovery hint; that would confuse the operator about
+        # which row they need to delete (there is no row).
+        assert "daemon_locks" not in next_steps_text, (
+            f"no_lock_holder branch incorrectly mentions deleting the "
+            f"daemon_locks row (there's nothing to delete); got: "
+            f"{parsed.get('next_steps')!r}"
+        )
+
+    def test_async_impl_next_steps_unchanged_for_stale_heartbeat(
+        self, tmp_state_db, with_github_token
+    ):
+        """Stale heartbeat is the other ``running=False`` branch
+        ``claim_daemon_lock`` CAN take over. The 'start the daemon'
+        guidance applies as before."""
+        _seed_coded_unit()
+        _seed_daemon_lock(heartbeat_age_s=state.DEFAULT_DAEMON_LOCK_STALE_AFTER_S + 10)
+        out = execution.cycle_review_async("F-001", "F-016-U-6-T")
+        parsed = json.loads(out)
+        next_steps_text = " ".join(parsed.get("next_steps") or []).lower()
+        assert "daemon start" in next_steps_text, (
+            f"stale_heartbeat branch should still surface the 'start the "
+            f"daemon' guidance; got: {parsed.get('next_steps')!r}"
+        )
+        assert "daemon_locks" not in next_steps_text, (
+            f"stale_heartbeat branch must not point at manual row deletion "
+            f"— claim_daemon_lock can take this row over; got: "
+            f"{parsed.get('next_steps')!r}"
+        )
+
+    def test_daemon_down_nudge_for_helper_branches_on_reason(self):
+        """Direct unit test on :func:`_daemon_down_nudge_for` — the
+        helper that the dispatcher calls. Pins the contract independent
+        of the dispatcher's other branches so a future refactor that
+        moves the call-site can't accidentally drop the
+        invalid-heartbeat fork."""
+        assert execution._daemon_down_nudge_for({"reason": "invalid_heartbeat"}) == (
+            execution._CYCLE_REVIEW_DAEMON_INVALID_HEARTBEAT_NUDGE
+        )
+        assert execution._daemon_down_nudge_for({"reason": "no_lock_holder"}) == (
+            execution._CYCLE_REVIEW_DAEMON_DOWN_NUDGE
+        )
+        assert execution._daemon_down_nudge_for({"reason": "stale_heartbeat"}) == (
+            execution._CYCLE_REVIEW_DAEMON_DOWN_NUDGE
+        )
+        # Unknown / missing reason falls through to the default — a
+        # future _daemon_health() variant won't crash the dispatcher.
+        assert execution._daemon_down_nudge_for({}) == execution._CYCLE_REVIEW_DAEMON_DOWN_NUDGE
+        assert execution._daemon_down_nudge_for({"reason": "future_unknown"}) == (
+            execution._CYCLE_REVIEW_DAEMON_DOWN_NUDGE
+        )
+
+    def test_invalid_heartbeat_nudge_constant_is_distinct_and_documents_recovery(self):
+        """The new nudge must live at module scope (peer to its sibling
+        constants) and must actually contain the manual-recovery hint —
+        a future edit that silently swaps the body for a copy of the
+        common-case nudge would break the fix."""
+        assert hasattr(execution, "_CYCLE_REVIEW_DAEMON_INVALID_HEARTBEAT_NUDGE")
+        nudge = execution._CYCLE_REVIEW_DAEMON_INVALID_HEARTBEAT_NUDGE
+        assert nudge != execution._CYCLE_REVIEW_DAEMON_DOWN_NUDGE, (
+            "invalid-heartbeat nudge must differ from the common-case "
+            "daemon-down nudge; otherwise the branch is a no-op."
+        )
+        lowered = nudge.lower()
+        assert "daemon_locks" in lowered or "delete" in lowered
+        assert "heartbeat" in lowered
