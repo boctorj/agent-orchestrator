@@ -46,7 +46,6 @@ from orchestrator.health import Action, Decision
 from orchestrator.models import Feature, WorkUnit, WorkUnitState
 from orchestrator.tools import CAP_3, execution
 
-
 # --------------------------- shared fixtures / helpers ---------------------------
 
 
@@ -285,9 +284,7 @@ class TestRepeatedConflictLoopIteration:
         monkeypatch.setattr(execution, "address_review", fake_address_review)
         _stub_github(monkeypatch)
 
-        ctx = execution.CycleContext(
-            feature_id="F-018", unit_id="F-018-U-1", history=[]
-        )
+        ctx = execution.CycleContext(feature_id="F-018", unit_id="F-018-U-1", history=[])
         ok, msg = execution._conflict_fix_loop(ctx, "pre-tester")
         assert ok is True, (
             f"loop must succeed once probe finally returns clean; got ok={ok} msg={msg!r}"
@@ -334,14 +331,13 @@ class TestRepeatedConflictLoopIteration:
         monkeypatch.setattr(
             execution,
             "address_review",
-            lambda uid, src, fb: dispatched.append((uid, src, fb))
-            or json.dumps({"outcome": "FIX_PUSHED"}),
+            lambda uid, src, fb: (
+                dispatched.append((uid, src, fb)) or json.dumps({"outcome": "FIX_PUSHED"})
+            ),
         )
         _stub_github(monkeypatch)
 
-        ctx = execution.CycleContext(
-            feature_id="F-018", unit_id="F-018-U-1", history=[]
-        )
+        ctx = execution.CycleContext(feature_id="F-018", unit_id="F-018-U-1", history=[])
         ok, msg = execution._conflict_fix_loop(ctx, "pre-tester")
         assert ok is True, f"happy path must succeed; got ok={ok} msg={msg!r}"
         assert len(dispatched) == 1
@@ -410,9 +406,7 @@ class TestDaemonAuditTrail:
     digest reads these events; dropping the audit trail blinds them.
     """
 
-    def test_daemon_dispatch_emits_coder_resumed_with_merge_source(
-        self, tmp_state_db, monkeypatch
-    ):
+    def test_daemon_dispatch_emits_coder_resumed_with_merge_source(self, tmp_state_db, monkeypatch):
         unit = _seed_awaiting_merge()
         worker = _CapturingWorker()
         monkeypatch.setattr("orchestrator.daemon.make_worker", lambda _role: worker)
