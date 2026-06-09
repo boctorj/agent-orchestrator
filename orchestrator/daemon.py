@@ -74,7 +74,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
-from orchestrator import markers, state
+from orchestrator import markers, stale_marker, state
 from orchestrator.health import Action, Decision, HealthReport, ShadowDecision
 from orchestrator.markers import MarkerSpec
 from orchestrator.models import (
@@ -83,7 +83,7 @@ from orchestrator.models import (
     TERMINAL_UNIT_STATUSES,
     WorkUnitState,
 )
-from orchestrator.tools import CAP_3, compose_fix_task
+from orchestrator.tools import CAP_3, compose_fix_task, compose_reviewer_delta_task
 from orchestrator.workers import make_worker
 from orchestrator.workers.base import Worker
 
@@ -594,15 +594,19 @@ def _dispatch_conflict_fix(unit: WorkUnitState, conflict_files: list[str]) -> bo
     human must decide whether to land a sibling first, rebase manually,
     or take over.
 
-    Pre-conditions checked before any mutation:
+    Pre-conditions and mutation ordering:
 
       * ``coder_session_id`` is set (no coder → can't resume; daemon
-        records an escalation event so the lead notices on the next
-        ``unit_history`` read).
+        logs + returns False so the next tick re-derives).
       * ``pr_number`` is set + feature row + plan row + unit row exist
         (compose_fix_task requires them).
-      * Owner CAS is grabbed so the lead's ``send_to_unit_async`` window
-        doesn't race the transition flip + resume submit.
+      * Owner CAS is grabbed before ANY state mutation — both the
+        cap-3 escalation event/transition and the
+        increment+transition+resume-async path live inside the CAS
+        block so an unlanded escalation (lead holds the lock, CAS
+        fails) does NOT leave a stray ``conflict_rebase_diverging``
+        audit row, and a re-tick under contention does not duplicate
+        rows (PR #66 H2).
 
     Idempotence: the per-unit CAS ensures only one daemon instance (or
     tick) lands the transition + dispatch. A daemon re-tick on the same
@@ -632,36 +636,13 @@ def _dispatch_conflict_fix(unit: WorkUnitState, conflict_files: list[str]) -> bo
         )
         return False
 
-    attempts = unit.conflict_fix_attempts
-    if attempts >= CAP_3:
-        state.record_event(
-            unit.unit_id,
-            unit.feature_id,
-            "conflict_rebase_diverging",
-            source="orchestrator",
-            cycle_number=attempts,
-            summary=f"cap-{CAP_3} on conflict-fix attempts (daemon-detected)",
-            details=json.dumps(
-                {
-                    "reason": "conflict_rebase_diverging",
-                    "conflict_files": list(conflict_files),
-                }
-            ),
-        )
-        if state.claim_unit_owner(unit.unit_id, DAEMON_OWNER, expected_owner=""):
-            try:
-                state.touch_unit(
-                    unit.unit_id,
-                    status="escalated",
-                    error=(
-                        f"BLOCKED [conflict_rebase_diverging]: "
-                        f"cap-{CAP_3} rebase attempts on approved_awaiting_merge unit"
-                    ),
-                )
-            finally:
-                state.release_unit_owner(unit.unit_id, expected_owner=DAEMON_OWNER)
-        return False
-
+    # CAS BEFORE any mutation. Both the cap-3 escalation branch and the
+    # dispatch-with-CI-fix branch live under one owner claim so a lead
+    # holding ``send_to_unit_async`` blocks BOTH paths (PR #66 H2: the
+    # original cap-3 ``record_event`` lived outside the CAS, so a
+    # contended tick still wrote the audit row even though the escalation
+    # itself never landed — and re-ticked under continued contention
+    # would write another row each poll until the lead released).
     if not state.claim_unit_owner(unit.unit_id, DAEMON_OWNER, expected_owner=""):
         return False
     try:
@@ -677,11 +658,42 @@ def _dispatch_conflict_fix(unit: WorkUnitState, conflict_files: list[str]) -> bo
         if latest.pr_number is None:
             return False
 
-        new_attempts = state.increment_conflict_fix_attempts(unit.unit_id)
-        state.touch_unit(unit.unit_id, status="fixing")
+        attempts = latest.conflict_fix_attempts
+        if attempts >= CAP_3:
+            state.record_event(
+                latest.unit_id,
+                latest.feature_id,
+                "conflict_rebase_diverging",
+                source="orchestrator",
+                cycle_number=attempts,
+                summary=f"cap-{CAP_3} on conflict-fix attempts (daemon-detected)",
+                details=json.dumps(
+                    {
+                        "reason": "conflict_rebase_diverging",
+                        "conflict_files": list(conflict_files),
+                    }
+                ),
+                # Per-staleness-window dedupe key. A re-tick under
+                # cancelled / lock-contention races would otherwise
+                # collapse to no-op via INSERT OR IGNORE, even if this
+                # branch were ever entered outside the CAS again.
+                dedupe_key=f"conflict_rebase_diverging:{latest.unit_id}:{attempts}",
+            )
+            state.touch_unit(
+                latest.unit_id,
+                status="escalated",
+                error=(
+                    f"BLOCKED [conflict_rebase_diverging]: "
+                    f"cap-{CAP_3} rebase attempts on approved_awaiting_merge unit"
+                ),
+            )
+            return False
+
+        new_attempts = state.increment_conflict_fix_attempts(latest.unit_id)
+        state.touch_unit(latest.unit_id, status="fixing")
         state.record_event(
-            unit.unit_id,
-            unit.feature_id,
+            latest.unit_id,
+            latest.feature_id,
             "coder_resumed",
             source="merge",
             cycle_number=latest.review_round,
@@ -730,6 +742,181 @@ def _dispatch_conflict_fix(unit: WorkUnitState, conflict_files: list[str]) -> bo
         state.release_unit_owner(unit.unit_id, expected_owner=DAEMON_OWNER)
 
 
+# --------------------------- F-018 stale-marker delta-review dispatch ---------------------------
+
+
+def _latest_event_summary(unit_id: str, event_types: frozenset[str]) -> str:
+    """Most-recent ``summary`` value for events whose type is in ``event_types``.
+
+    Returns ``""`` when no matching event exists — :func:`compose_reviewer_delta_task`
+    has a "(none recorded)" / "(no summary)" fallback for empty inputs so the
+    delta prompt is still well-formed.
+    """
+    for event in reversed(state.list_events(unit_id)):
+        if event.get("event_type") in event_types:
+            return event.get("summary", "") or ""
+    return ""
+
+
+def _dispatch_delta_review_if_stale(unit: WorkUnitState) -> bool:
+    """F-018 Stage 4 — autonomous loop closure via the F-016 Phase 2.5 stale-marker rule.
+
+    After a daemon-dispatched conflict-fix (or any other coder push the
+    daemon observes), the unit progresses ``fixing → in_ci`` once
+    ``_apply_marker_transition`` picks up the coder's ``FIX_PUSHED``.
+    The reviewer's prior marker is now stale relative to the new PR
+    head — F-014's mergeable probe alone won't drive the unit forward,
+    and the marker source-status fence in :data:`_MARKER_SOURCE_STATUSES`
+    refuses to re-fire ``REVIEW_RECOMMEND_MERGE`` from ``in_ci``.
+
+    This helper composes
+    :func:`~orchestrator.stale_marker.detect_stale_reviewer_marker`
+    with a submit-only :meth:`~orchestrator.workers.base.Worker.resume_async`
+    against the reviewer session to autonomously close the recovery
+    loop: the reviewer reassesses the new SHA via the existing F-013
+    delta-review prompt (:func:`~orchestrator.tools.compose_reviewer_delta_task`)
+    and emits a fresh terminal marker on a subsequent tick — the same
+    ``REVIEW_RECOMMEND_MERGE`` / ``REVIEW_COMMENT`` markers
+    :func:`_apply_marker_transition` already drives.
+
+    Spec § Acceptance 4: "After the rebase clears conflicts, the
+    reviewer phase resumes via the existing delta-review path on the
+    new SHA." Without this Stage, a daemon-driven rebase strands at
+    ``in_ci`` until a human re-calls ``cycle_review`` — defeating the
+    purpose of the daemon trigger (PR #66 H1).
+
+    Pre-conditions and ordering (mirrors :func:`_dispatch_conflict_fix`):
+
+      * ``status == 'in_ci'`` — the coder's push has landed and CI has
+        had a chance to settle; nothing else is in flight on this unit.
+      * ``reviewer_session_id`` is set — we can only ``resume_async``
+        an existing session. A unit that has never seen the reviewer
+        phase has no stale marker by definition.
+      * ``pr_number`` is set + feature/plan rows exist —
+        :func:`compose_reviewer_delta_task` requires them.
+      * Owner CAS is grabbed before ANY mutation so a lead's
+        ``send_to_unit_async`` window doesn't race the in_ci → reviewing
+        transition + delta-prompt submit.
+
+    Idempotence: F-016 Phase 2.5's ``reviewer_stale_marker_pending_delta``
+    audit row dedupes per-staleness-window (the event_ids of the prior
+    reviewer marker + the later coder push together form the dedupe
+    key). A re-tick that observes the same staleness window dedupes to
+    the existing row, and the ``status='reviewing'`` flip is gated by
+    the status guard above so a second tick under contention is a no-op.
+
+    Best-effort head_sha fetch: ``prior_sha`` is unavailable today
+    (per :mod:`~orchestrator.stale_marker` § "Phase 2.5 ships the
+    classifier uncomposed because no caller persists head_sha on
+    reviewer-marker events"). The delta prompt's
+    "(unknown — diff from your last reviewed state)" fallback handles
+    the absence; ``current_sha`` is best-effort via
+    :func:`~orchestrator.github.get_pr_state`.
+    """
+    if unit.status != "in_ci":
+        return False
+    if not unit.reviewer_session_id or not unit.pr_number:
+        return False
+
+    detection = stale_marker.detect_stale_reviewer_marker(unit.unit_id)
+    if detection["case"] != "stale":
+        return False
+
+    feature = state.get_feature(unit.feature_id)
+    plan = state.get_plan(unit.feature_id)
+    if feature is None or plan is None:
+        logger.info(
+            "daemon: delta-review dispatch skipped for %s — missing feature/plan",
+            unit.unit_id,
+        )
+        return False
+    work_unit = next((u for u in plan.units if u.id == unit.unit_id), None)
+    if work_unit is None:
+        logger.info(
+            "daemon: delta-review dispatch skipped for %s — unit not in plan",
+            unit.unit_id,
+        )
+        return False
+
+    if not state.claim_unit_owner(unit.unit_id, DAEMON_OWNER, expected_owner=""):
+        return False
+    try:
+        latest = state.get_unit_state(unit.unit_id)
+        if latest is None or latest.cancelled_at is not None:
+            return False
+        if latest.status != "in_ci":
+            # State moved underneath us — a peer tick or the lead got
+            # there first. The next tick re-derives.
+            return False
+        if not latest.reviewer_session_id or latest.pr_number is None:
+            return False
+
+        # Best-effort current_sha for the delta range. The lazy import
+        # mirrors :func:`_dispatch_conflict_fix` — `orchestrator.github`
+        # is light, but the helper modules used downstream
+        # (`feature_spec` / `cycle_log`) decorate at import time.
+        from orchestrator import cycle_log, feature_spec, github  # noqa: PLC0415
+
+        current_sha = ""
+        try:
+            pr_state = github.get_pr_state(feature.repo_path, latest.pr_number)
+            current_sha = pr_state.get("head_sha") or ""
+        except Exception:  # noqa: BLE001 — delta prompt has a fallback
+            logger.exception("daemon: get_pr_state failed for %s; using empty SHA", unit.unit_id)
+
+        prior_findings = _latest_event_summary(
+            latest.unit_id, stale_marker.REVIEWER_TERMINAL_EVENT_TYPES
+        )
+        fix_summary = _latest_event_summary(latest.unit_id, stale_marker.CODER_PUSH_EVENT_TYPES)
+
+        # Record the stale-marker audit row BEFORE the transition + submit
+        # so an operator reading the timeline sees the daemon's intent
+        # before any state moves. Dedupe key is per-staleness-window (the
+        # two event_ids) so a re-tick under the same window no-ops.
+        stale_marker.record_stale_marker_pending_delta(
+            latest.unit_id,
+            latest.feature_id,
+            reviewer_event_id=detection["reviewer_marker_id"],
+            later_push_event_id=detection["later_coder_push_id"],
+            reviewer_event_type=detection["reviewer_marker_event_type"],
+            later_push_event_type=detection["later_coder_push_event_type"],
+        )
+
+        delta_msg = compose_reviewer_delta_task(
+            feature=feature,
+            unit=work_unit,
+            pr_number=latest.pr_number,
+            prior_sha="",  # not persisted on reviewer-marker events today
+            current_sha=current_sha,
+            prior_findings=prior_findings,
+            fix_summary=fix_summary,
+            feature_spec_text=feature_spec.read_spec(feature.id),
+            predecessor_logs=[
+                (dep_id, cycle_log.cycle_log_summary(dep_id)) for dep_id in work_unit.depends_on
+            ],
+        )
+
+        state.touch_unit(latest.unit_id, status="reviewing")
+        state.record_event(
+            latest.unit_id,
+            latest.feature_id,
+            "reviewer_resumed_for_delta",
+            source="orchestrator",
+            cycle_number=latest.review_round,
+            summary=(f"daemon delta re-review on new SHA (?..{current_sha[:8] or '?'})"),
+            session_id=latest.reviewer_session_id,
+        )
+        try:
+            worker = _cached_worker("reviewer")
+            worker.resume_async(latest.reviewer_session_id, delta_msg)
+        except Exception:  # noqa: BLE001 — log + escalation via the next tick
+            logger.exception("daemon: delta-review resume_async failed for %s", unit.unit_id)
+            return False
+        return True
+    finally:
+        state.release_unit_owner(unit.unit_id, expected_owner=DAEMON_OWNER)
+
+
 # --------------------------- reconciler ---------------------------
 
 
@@ -759,10 +946,18 @@ def reconcile_unit(unit_id: str) -> None:
     F-018: when the F-014 probe surfaces a ``pr_conflict_detected``
     event AND the unit is currently in ``approved_awaiting_merge`` (i.e.
     a sibling unit merged while this PR sat awaiting human merge), the
-    daemon transitions the unit back to ``fixing`` and dispatches a
-    rebase request to the coder via the same ``address_review('merge', …)``
-    machinery ``cycle_review``'s gate uses — see
-    :func:`_dispatch_conflict_fix`.
+    daemon transitions the unit back to ``fixing`` and submits a rebase
+    request to the coder via :meth:`~orchestrator.workers.base.Worker.resume_async`
+    (submit-only — distinct from ``cycle_review``'s synchronous
+    ``address_review('merge', …)`` because the daemon tick can't block
+    on the coder's multi-minute rebase). See :func:`_dispatch_conflict_fix`.
+
+    F-018 Stage 4 closes the loop autonomously after the coder's
+    rebase: when status is ``in_ci`` AND a stale reviewer marker is
+    detected (reviewer endorsed on a SHA earlier than the latest
+    coder push, per F-016 Phase 2.5's classifier), the daemon submits
+    a delta-review prompt to the reviewer session via
+    ``resume_async``. See :func:`_dispatch_delta_review_if_stale`.
     """
     unit = state.get_unit_state(unit_id)
     if unit is None:
@@ -818,15 +1013,29 @@ def reconcile_unit(unit_id: str) -> None:
     # fires only when the unit is currently parked awaiting human merge
     # — for an active unit the gate inside ``cycle_review`` already
     # handles the same case synchronously.
-    if conflict_action is None:
-        return
-    unit = state.get_unit_state(unit_id) or unit
+    if conflict_action is not None:
+        unit = state.get_unit_state(unit_id) or unit
+        if not _is_actionable(unit):
+            return
+        if unit.status in READY_TO_MERGE_STATUSES:
+            files_raw = conflict_action.payload.get("conflict_files") or []
+            _dispatch_conflict_fix(unit, list(files_raw))
+            # Re-read after the dispatch so Stage 4 sees the fixing flip
+            # (or stays put when the dispatch was a no-op).
+            unit = state.get_unit_state(unit_id) or unit
+            if not _is_actionable(unit):
+                return
+
+    # Stage 4 (F-018): autonomous loop closure. After Stage 1 picked up
+    # the coder's FIX_PUSHED (post-rebase) → status flipped to in_ci, the
+    # reviewer's prior endorsement is stale relative to the new SHA.
+    # F-016 Phase 2.5's classifier detects it; this Stage submits the
+    # delta-review prompt to the reviewer session so the unit can reach
+    # ``approved_awaiting_merge`` on the rebased HEAD without lead
+    # re-engagement. Spec § Acceptance 4. PR #66 H1.
     if not _is_actionable(unit):
         return
-    if unit.status not in READY_TO_MERGE_STATUSES:
-        return
-    files_raw = conflict_action.payload.get("conflict_files") or []
-    _dispatch_conflict_fix(unit, list(files_raw))
+    _dispatch_delta_review_if_stale(unit)
 
 
 def _is_actionable(unit: WorkUnitState) -> bool:

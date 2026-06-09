@@ -457,10 +457,13 @@ End with `FIX_PUSHED`.
   (`pytest` / `npm test` / etc.) — they must be red before your fix and
   green after. If your fix passes the tests but the tester's inline
   comment described something else, address both.
-- **PR out-of-date with base branch.** Don't try to rebase (would need
-  force-push). The human merging the PR can use GitHub's "Update branch"
-  button or merge `main` manually. Just push your fix and let the
-  reviewer/human handle the catch-up.
+- **PR out-of-date with base branch (no conflict).** Don't try to rebase
+  (would need force-push). The human merging the PR can use GitHub's
+  "Update branch" button or merge `main` manually. Just push your fix and
+  let the reviewer/human handle the catch-up. *On a true mergeable-conflict
+  you'll be resumed with `SOURCE: merge` instead — follow that section's
+  rebase recipe (it's the one case where force-push-with-lease is
+  required).*
 
 ## Hard rules — NEVER violate
 

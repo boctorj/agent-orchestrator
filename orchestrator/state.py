@@ -457,13 +457,22 @@ def approve_plan(feature_id: str) -> str:
 def upsert_unit_state(unit: WorkUnitState) -> None:
     """Insert or update the ``work_units`` row for ``unit``.
 
-    ``cancelled_at`` and ``owner`` (F-016 Phase 2.5) are intentionally NOT
-    overwritten on UPDATE — they are managed via the dedicated
-    :func:`cancel_unit` / :func:`lead_advance_lock` helpers and a stray
-    ``upsert_unit_state`` call from somewhere else in the codebase (which
-    constructs a fresh :class:`WorkUnitState` from the model defaults) must
-    not silently clear a sticky cancel or break the daemon's CAS. To
-    deliberately change either column, use the dedicated helper or run a
+    **Columns managed via dedicated helpers, never overwritten by upsert:**
+
+      * ``cancelled_at`` and ``owner`` (F-016 Phase 2.5) — managed via
+        :func:`cancel_unit` / :func:`lead_advance_lock` /
+        :func:`claim_unit_owner`.
+      * ``conflict_fix_attempts`` (F-018) — managed via
+        :func:`increment_conflict_fix_attempts`. The column has
+        ``DEFAULT 0`` so a fresh INSERT picks up zero; the UPDATE list
+        omits it so a stray upsert (with a default-zero ``WorkUnitState``)
+        does not silently reset a unit mid-rebase-loop back to zero.
+
+    A stray ``upsert_unit_state`` call from elsewhere in the codebase
+    (which constructs a fresh :class:`WorkUnitState` from the model
+    defaults) must not silently clear a sticky cancel, break the
+    daemon's CAS, or reset the conflict counter. To deliberately
+    change any of these columns, use the dedicated helper or run a
     direct SQL UPDATE.
     """
     if not unit.last_activity:
@@ -930,6 +939,12 @@ def _state_to_dict(s: WorkUnitState) -> dict:
         "branch": s.branch,
         "pr_number": s.pr_number,
         "review_round": s.review_round,
+        # F-018: the mechanical-rebase retry counter is independent of
+        # ``review_round`` and capped at 3; surfacing it here makes
+        # ``unit_summary(unit_id)`` show "N of 3 conflict-fix retries
+        # consumed" so an operator can spot a unit mid-rebase-loop
+        # without reading ``unit_history`` (PR #66 M1).
+        "conflict_fix_attempts": s.conflict_fix_attempts,
         "last_activity": s.last_activity,
         "last_error": s.last_error,
         "has_coder_session": bool(s.coder_session_id),

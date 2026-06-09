@@ -543,6 +543,25 @@ class TestEvents:
         assert s["event_counts_by_type"]["spawn_tester"] == 2
         assert s["event_counts_by_type"]["spawn_coder"] == 1
 
+    def test_summarize_unit_surfaces_conflict_fix_attempts(self, tmp_state_db):
+        """PR #66 M1: ``conflict_fix_attempts`` must appear in the
+        ``current_state`` digest of ``summarize_unit`` so the
+        ``unit_summary`` MCP tool surfaces the counter to operators.
+        Otherwise a unit consuming N of 3 conflict-fix retries looks
+        identical to a clean unit in chat.
+        """
+        state.save_feature(Feature(id="F", title="t", description=""))
+        state.upsert_unit_state(WorkUnitState(unit_id="U1", feature_id="F", status="fixing"))
+        state.increment_conflict_fix_attempts("U1")
+        state.increment_conflict_fix_attempts("U1")
+        s = state.summarize_unit("U1")
+        assert "conflict_fix_attempts" in s["current_state"]
+        assert s["current_state"]["conflict_fix_attempts"] == 2
+        # ``review_round`` (the existing cap-3 budget) stays separately
+        # visible — the two counters are independent and the digest
+        # surfaces both.
+        assert s["current_state"]["review_round"] == 0
+
 
 class TestEventDedupeKey:
     """F-016 Phase 0 — ``dedupe_key`` makes terminal-marker recording

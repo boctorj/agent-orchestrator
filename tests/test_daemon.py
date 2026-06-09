@@ -1192,3 +1192,392 @@ class TestDaemonConflictFixDispatch:
         result = daemon._dispatch_conflict_fix(unit, ["a.py"])
         assert result is False
         assert worker.resume_calls == []
+
+    def test_cap_3_audit_event_lands_under_owner_cas_only(self, tmp_state_db, monkeypatch):
+        """PR #66 H2: the ``conflict_rebase_diverging`` audit row must
+        land ONLY when the owner CAS lands, so a contended tick (lead
+        holds ``send_to_unit_async``) does NOT leave a stray audit row
+        for an escalation that never took effect — and a re-tick under
+        continued contention does not duplicate rows.
+        """
+        unit = _seed_awaiting_merge(conflict_attempts=3)
+        worker = _RecordingWorker()
+        monkeypatch.setattr("orchestrator.daemon.make_worker", lambda _r: worker)
+        monkeypatch.setattr(
+            daemon, "_probe_and_decide_unit", lambda _u: [_conflict_action(["x.py"])]
+        )
+
+        # Lead holds the owner lock; daemon's CAS will fail.
+        assert state.claim_unit_owner(unit.unit_id, state.LEAD_OWNER, expected_owner="") is True
+        try:
+            daemon.reconcile_unit(unit.unit_id)
+            # No audit row landed (contended → CAS fails before mutation).
+            events = state.list_events(unit.unit_id)
+            assert not any(e["event_type"] == "conflict_rebase_diverging" for e in events), (
+                "audit row must NOT land while the owner CAS is held by the lead (PR #66 H2)"
+            )
+            # Status unchanged.
+            got = state.get_unit_state(unit.unit_id)
+            assert got is not None
+            assert got.status == "approved_awaiting_merge"
+
+            # Re-tick under continued contention must also no-op (no duplicate row).
+            daemon.reconcile_unit(unit.unit_id)
+            events = state.list_events(unit.unit_id)
+            assert not any(e["event_type"] == "conflict_rebase_diverging" for e in events)
+        finally:
+            state.release_unit_owner(unit.unit_id, expected_owner=state.LEAD_OWNER)
+
+        # Once the lead releases, the daemon's next tick lands the escalation.
+        daemon.reconcile_unit(unit.unit_id)
+        events = state.list_events(unit.unit_id)
+        rows = [e for e in events if e["event_type"] == "conflict_rebase_diverging"]
+        assert len(rows) == 1, (
+            f"escalation must land exactly once after the lock releases; got {len(rows)}"
+        )
+        got = state.get_unit_state(unit.unit_id)
+        assert got is not None
+        assert got.status == "escalated"
+
+
+def _seed_awaiting_delta(
+    *,
+    unit_id: str = "U-DR",
+    feature_id: str = "F-DR",
+    review_round: int = 0,
+) -> WorkUnitState:
+    """Seed a unit in ``in_ci`` with a prior reviewer marker + later coder push.
+
+    Mirrors the daemon's view after Stage 1 picks up FIX_PUSHED from a
+    rebase: ``status='in_ci'``, both reviewer + coder sessions on
+    record, an earlier ``reviewer_recommend_merge`` event, and a later
+    ``fix_pushed`` event. Returns the resulting state row.
+    """
+    from orchestrator.models import WorkUnit
+
+    state.save_feature(
+        Feature(
+            id=feature_id,
+            title="t",
+            description="d",
+            repo_path="https://github.com/o/r",
+            status="approved",
+        )
+    )
+    state.save_plan(
+        feature_id,
+        [WorkUnit(id=unit_id, feature_id=feature_id, title="u", description="d")],
+    )
+    state.approve_plan(feature_id)
+    state.upsert_unit_state(
+        WorkUnitState(
+            unit_id=unit_id,
+            feature_id=feature_id,
+            status="in_ci",
+            branch="feat/x",
+            pr_number=11,
+            coder_session_id="sc",
+            reviewer_session_id="sr",
+            review_round=review_round,
+        )
+    )
+    # Earlier reviewer endorsement.
+    state.record_event(
+        unit_id,
+        feature_id,
+        "reviewer_recommend_merge",
+        source="reviewer",
+        cycle_number=review_round,
+        summary="endorsed at SHA-A",
+        details="no issues",
+        dedupe_key=f"reviewer_recommend_merge:{unit_id}:initial",
+    )
+    # Later coder push (the rebase). The classifier's "ts > reviewer_ts"
+    # rule works on string compare of ISO-8601 timestamps, so a tiny
+    # sleep ensures ordering on coarse-grained clocks (Windows).
+    import time as _time
+
+    _time.sleep(0.01)
+    state.record_event(
+        unit_id,
+        feature_id,
+        "fix_pushed",
+        source="coder",
+        cycle_number=review_round,
+        summary="rebased on main; resolved sibling.py",
+        details="",
+        dedupe_key=f"fix_pushed:{unit_id}:rebase",
+    )
+    return state.get_unit_state(unit_id)  # type: ignore[return-value]
+
+
+class TestDaemonDeltaReviewDispatch:
+    """F-018 Stage 4 — autonomous loop closure after a daemon-dispatched rebase.
+
+    The daemon must autonomously re-engage the reviewer on the new SHA
+    when its prior marker is stale relative to a later coder push. Without
+    this stage, a unit dispatched by the daemon's conflict-fix trigger
+    strands at ``in_ci`` until a human re-runs ``cycle_review`` (PR #66
+    H1, spec § Acceptance 4).
+    """
+
+    def test_stale_marker_in_in_ci_dispatches_delta_review(self, tmp_state_db, monkeypatch):
+        unit = _seed_awaiting_delta()
+        worker = _RecordingWorker()
+        monkeypatch.setattr("orchestrator.daemon.make_worker", lambda _r: worker)
+        monkeypatch.setattr(daemon, "_probe_and_decide_unit", lambda _u: [])
+        # Stub get_pr_state — best-effort current_sha lookup
+        monkeypatch.setattr(
+            "orchestrator.github.get_pr_state",
+            lambda url, pr: {"head_sha": "rebasedsha"},
+        )
+
+        daemon.reconcile_unit(unit.unit_id)
+
+        # Status flipped to reviewing (the daemon transitioned in_ci → reviewing).
+        got = state.get_unit_state(unit.unit_id)
+        assert got is not None
+        assert got.status == "reviewing"
+        # Reviewer was resumed asynchronously with the delta prompt.
+        assert len(worker.resume_calls) == 1
+        sid, msg = worker.resume_calls[0]
+        assert sid == "sr"
+        assert "DELTA RE-REVIEW" in msg
+        # Audit trail: stale-marker event + the resumed-for-delta event.
+        events = state.list_events(unit.unit_id)
+        assert any(e["event_type"] == "reviewer_stale_marker_pending_delta" for e in events)
+        assert any(e["event_type"] == "reviewer_resumed_for_delta" for e in events)
+
+    def test_no_dispatch_when_status_is_not_in_ci(self, tmp_state_db, monkeypatch):
+        """Stage 4 fires only when the coder's FIX_PUSHED has bumped the
+        unit into ``in_ci``. A unit still in ``fixing`` or already
+        ``reviewing`` is mid-flight; the daemon must not race it."""
+        unit = _seed_awaiting_delta()
+        state.touch_unit(unit.unit_id, status="fixing")
+        worker = _RecordingWorker()
+        monkeypatch.setattr("orchestrator.daemon.make_worker", lambda _r: worker)
+        monkeypatch.setattr(daemon, "_probe_and_decide_unit", lambda _u: [])
+
+        daemon.reconcile_unit(unit.unit_id)
+
+        got = state.get_unit_state(unit.unit_id)
+        assert got is not None
+        assert got.status == "fixing"
+        assert worker.resume_calls == []
+
+    def test_no_dispatch_when_no_reviewer_session(self, tmp_state_db, monkeypatch):
+        """A unit that has never seen the reviewer phase has no marker to
+        be stale relative to. No dispatch."""
+        unit = _seed_awaiting_delta()
+        # Clear the reviewer session id by upserting (won't reset
+        # conflict_fix_attempts thanks to the upsert exception list).
+        cur = state.get_unit_state(unit.unit_id)
+        assert cur is not None
+        cur.reviewer_session_id = ""
+        state.upsert_unit_state(cur)
+        worker = _RecordingWorker()
+        monkeypatch.setattr("orchestrator.daemon.make_worker", lambda _r: worker)
+        monkeypatch.setattr(daemon, "_probe_and_decide_unit", lambda _u: [])
+
+        daemon.reconcile_unit(unit.unit_id)
+
+        got = state.get_unit_state(unit.unit_id)
+        assert got is not None
+        assert got.status == "in_ci"
+        assert worker.resume_calls == []
+
+    def test_no_dispatch_when_marker_not_stale(self, tmp_state_db, monkeypatch):
+        """No reviewer marker has been emitted yet, OR the reviewer is the
+        most recent event — the classifier returns ``case='valid'`` /
+        ``'not_emitted'`` and the daemon does NOT dispatch."""
+        unit = _seed_awaiting_delta()
+        # Reverse the order: drop the coder-push event so only the
+        # reviewer marker remains. The classifier will return 'valid'.
+        from orchestrator import state as _state
+
+        with _state._connect() as conn:
+            conn.execute(
+                "DELETE FROM unit_events WHERE unit_id = ? AND event_type = ?",
+                (unit.unit_id, "fix_pushed"),
+            )
+
+        worker = _RecordingWorker()
+        monkeypatch.setattr("orchestrator.daemon.make_worker", lambda _r: worker)
+        monkeypatch.setattr(daemon, "_probe_and_decide_unit", lambda _u: [])
+
+        daemon.reconcile_unit(unit.unit_id)
+
+        got = state.get_unit_state(unit.unit_id)
+        assert got is not None
+        assert got.status == "in_ci"
+        assert worker.resume_calls == []
+
+    def test_daemon_end_to_end_autonomous_loop_closure(self, tmp_state_db, monkeypatch):
+        """PR #66 H1, spec § Acceptance 4 + 5 — the daemon path closes the
+        loop autonomously after a rebase.
+
+        Simulated flow:
+          1. Unit in ``approved_awaiting_merge`` with a prior reviewer
+             endorsement.
+          2. Daemon tick 1: pr_conflict_detected → Stage 3 dispatches
+             rebase to coder, status flips to ``fixing``,
+             ``conflict_fix_attempts=1``.
+          3. Coder rebases + emits FIX_PUSHED; the next tick's Stage 1
+             picks up the marker → status flips ``fixing → in_ci``.
+          4. Daemon tick 2: clean mergeable probe → Stage 4 detects the
+             stale reviewer marker (later coder push) → submits a
+             delta-review prompt to the reviewer session, status flips
+             ``in_ci → reviewing``.
+          5. Reviewer emits REVIEW_RECOMMEND_MERGE on the new SHA;
+             daemon tick 3's Stage 1 picks it up → status flips
+             ``reviewing → approved_awaiting_merge``.
+
+        Pin only the load-bearing outcomes: the unit reaches
+        ``approved_awaiting_merge`` again without lead re-engagement,
+        and the audit timeline carries the expected events in the
+        expected order.
+        """
+        import time as _time
+
+        from orchestrator.models import WorkUnit
+
+        state.save_feature(
+            Feature(
+                id="F-E2E",
+                title="t",
+                description="d",
+                repo_path="https://github.com/o/r",
+                status="approved",
+            )
+        )
+        state.save_plan(
+            "F-E2E", [WorkUnit(id="U-E2E", feature_id="F-E2E", title="u", description="d")]
+        )
+        state.approve_plan("F-E2E")
+        state.upsert_unit_state(
+            WorkUnitState(
+                unit_id="U-E2E",
+                feature_id="F-E2E",
+                status="approved_awaiting_merge",
+                branch="feat/x",
+                pr_number=42,
+                coder_session_id="sc",
+                reviewer_session_id="sr",
+            )
+        )
+        # Prior reviewer endorsement (pre-conflict).
+        state.record_event(
+            "U-E2E",
+            "F-E2E",
+            "reviewer_recommend_merge",
+            source="reviewer",
+            cycle_number=0,
+            summary="endorsed at original SHA",
+            dedupe_key="reviewer_recommend_merge:U-E2E:initial",
+        )
+
+        # ---------- Tick 1: conflict detected → conflict-fix dispatch ----------
+        tail_returns: dict[str, _FakeTailResult] = {
+            "sc": _FakeTailResult(),
+            "sr": _FakeTailResult(),
+        }
+
+        class _CapturingWorker:
+            def __init__(self, role: str) -> None:
+                self.role = role
+                self.resume_calls: list[tuple[str, str]] = []
+
+            def resume_async(self, sid: str, msg: str) -> None:
+                self.resume_calls.append((sid, msg))
+
+            def tail_messages(self, sid: str, *, limit: int = 50):  # noqa: ARG002
+                return tail_returns.get(sid, _FakeTailResult())
+
+        coder_worker = _CapturingWorker("coder")
+        reviewer_worker = _CapturingWorker("reviewer")
+        tester_worker = _CapturingWorker("tester")
+
+        def _make_worker(role: str):
+            return {"coder": coder_worker, "reviewer": reviewer_worker, "tester": tester_worker}[
+                role
+            ]
+
+        monkeypatch.setattr("orchestrator.daemon.make_worker", _make_worker)
+        monkeypatch.setattr(
+            "orchestrator.github.get_pr_state",
+            lambda url, pr: {"head_sha": "rebased"},
+        )
+        # Probe surfaces a conflict on tick 1, clean afterwards.
+        probe_calls = {"n": 0}
+
+        def _fake_probe(_unit):
+            probe_calls["n"] += 1
+            if probe_calls["n"] == 1:
+                return [_conflict_action(["sibling.py"])]
+            return []
+
+        monkeypatch.setattr(daemon, "_probe_and_decide_unit", _fake_probe)
+
+        daemon.reconcile_unit("U-E2E")
+
+        got = state.get_unit_state("U-E2E")
+        assert got is not None
+        assert got.status == "fixing", "tick 1: conflict dispatch flipped status to fixing"
+        assert got.conflict_fix_attempts == 1
+        assert len(coder_worker.resume_calls) == 1
+
+        # ---------- Simulate the coder's FIX_PUSHED on the rebased HEAD ----------
+        _time.sleep(0.01)  # ensure ts ordering on coarse-grained clocks
+        tail_returns["sc"] = _FakeTailResult(
+            status="idle",
+            messages=[
+                {"ts": "2026-06-09T00:00:00", "role": "agent", "text": "rebased\nFIX_PUSHED"}
+            ],
+        )
+
+        # ---------- Tick 2: Stage 1 picks up FIX_PUSHED → in_ci;
+        #               Stage 4 detects stale reviewer marker → delta dispatch ----------
+        daemon.reconcile_unit("U-E2E")
+
+        got = state.get_unit_state("U-E2E")
+        assert got is not None
+        assert got.status == "reviewing", (
+            f"tick 2: Stage 4 must transition in_ci → reviewing autonomously; got {got.status}"
+        )
+        assert len(reviewer_worker.resume_calls) == 1
+        delta_msg = reviewer_worker.resume_calls[0][1]
+        assert "DELTA RE-REVIEW" in delta_msg
+
+        # ---------- Simulate the reviewer's REVIEW_RECOMMEND_MERGE on the new SHA ----------
+        _time.sleep(0.01)
+        tail_returns["sr"] = _FakeTailResult(
+            status="idle",
+            messages=[
+                {
+                    "ts": "2026-06-09T00:00:01",
+                    "role": "agent",
+                    "text": "all prior issues resolved\nREVIEW_RECOMMEND_MERGE: clean on rebased HEAD",
+                }
+            ],
+        )
+        # Clear the coder tail so its persistent FIX_PUSHED does not
+        # bounce the unit back to in_ci on this tick (test isolation —
+        # the production source-status fence still allows the legitimate
+        # fixing → in_ci transition, but our seeded tail keeps re-firing).
+        tail_returns["sc"] = _FakeTailResult()
+
+        # ---------- Tick 3: Stage 1 picks up REVIEW_RECOMMEND_MERGE
+        #               → approved_awaiting_merge ----------
+        daemon.reconcile_unit("U-E2E")
+
+        got = state.get_unit_state("U-E2E")
+        assert got is not None
+        assert got.status == "approved_awaiting_merge", (
+            f"tick 3: reviewer endorsement on the rebased HEAD must land the unit "
+            f"at approved_awaiting_merge autonomously (spec § Acceptance 4, 5; "
+            f"PR #66 H1); got {got.status}"
+        )
+        # review_round still untouched — no quality fix happened, only the
+        # mechanical rebase. conflict_fix_attempts captured the one rebase round.
+        assert got.review_round == 0
+        assert got.conflict_fix_attempts == 1

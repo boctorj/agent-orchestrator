@@ -195,3 +195,27 @@ class TestMergeSourceFixGuidance:
         rule the ultrareview section uses."""
         section = self._merge_section(coder_prompt)
         assert "scope" in section.lower()
+
+    def test_pr_out_of_date_edge_case_carves_out_merge_source(self, coder_prompt):
+        """PR #66 M3: the ``PR out-of-date with base branch`` edge case
+        in ``### Edge cases`` says "don't try to rebase" — which would
+        flatly contradict the SOURCE: merge section's 50-line rebase
+        recipe if it didn't carry an explicit carve-out pointing back
+        at SOURCE: merge for the true-conflict case.
+        """
+        # Anchor on the edge-case bullet's heading.
+        idx = coder_prompt.find("PR out-of-date with base branch")
+        assert idx > -1, "PR out-of-date edge case bullet missing"
+        # The bullet's body must say "no conflict" — the carve-out
+        # rule that scopes "don't rebase" to the non-conflict case — and
+        # reference SOURCE: merge so an agent reading both sections
+        # knows which one to follow.
+        bullet = coder_prompt[idx : idx + 600]
+        assert "no conflict" in bullet.lower(), (
+            "the edge case bullet must scope itself to the non-conflict "
+            "case so it doesn't contradict the SOURCE: merge rebase recipe"
+        )
+        assert "SOURCE: merge" in bullet, (
+            "the edge case bullet must point at the SOURCE: merge section "
+            "for the true-conflict case"
+        )
