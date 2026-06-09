@@ -113,6 +113,10 @@ class WorkUnitState:
     last_error: str = ""
     cancelled_at: str | None = None
     owner: str = ""
+    # F-018: mechanical rebase retries kept separate from ``review_round`` so a
+    # sibling-merge-induced conflict does not consume the quality cap-3 budget.
+    # Capped independently at :data:`orchestrator.tools.CAP_3`.
+    conflict_fix_attempts: int = 0
 
 
 # --------------------------- repo verification ---------------------------

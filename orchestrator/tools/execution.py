@@ -891,7 +891,7 @@ def _format_reviewer_marker_response(
 
 @mcp.tool()
 def address_review(unit_id: str, source: str, feedback: str) -> str:
-    """Resume the coder session to address feedback (from tester/reviewer/ci/human/ultrareview).
+    """Resume the coder session to address feedback (from tester/reviewer/ci/human/ultrareview/merge).
 
     **Idempotent on any status with a ``coder_session_id``, EXCEPT ``done``.**
     The session_id is the source of truth — as long as ``coder_session_id``
@@ -907,13 +907,28 @@ def address_review(unit_id: str, source: str, feedback: str) -> str:
     ``done`` but is deliberately *not* refused here — that's the audit
     Gap-C contract.
 
-    Increments review_round. BLOCKS for minutes.
-    Returns coder's response — should end with FIX_PUSHED or BLOCKED.
+    F-018: ``source='merge'`` is the conflict-fix variant — dispatched by
+    ``cycle_review``'s mergeable gate and the daemon's
+    ``approved_awaiting_merge`` → ``fixing`` transition when
+    ``inspect_unit_health`` reports ``pr_conflict_detected``. The coder
+    rebases against main and force-pushes; the orchestrator's
+    ``conflict_fix_attempts`` counter (capped at 3) is bumped separately
+    from ``review_round`` since a mechanical rebase is not a quality
+    failure. The caller (``_conflict_fix_loop`` / daemon
+    ``_dispatch_conflict_fix``) bumps ``conflict_fix_attempts`` *before*
+    invoking this; ``address_review`` itself skips the ``review_round``
+    bump on the merge source so the two counters stay independent
+    (spec § Acceptance 7 — "a conflict-fix cycle does not increment
+    cap-3").
+
+    Increments review_round (except for ``source='merge'`` — see above).
+    BLOCKS for minutes. Returns coder's response — should end with
+    FIX_PUSHED or BLOCKED.
 
     Repo must be fresh-verified (call ``verify_repo(<url>)`` if blocked).
     """
-    if source not in ("tester", "reviewer", "ci", "human", "ultrareview"):
-        return f"ERROR: source must be tester|reviewer|ci|human|ultrareview, got {source!r}"
+    if source not in ("tester", "reviewer", "ci", "human", "ultrareview", "merge"):
+        return f"ERROR: source must be tester|reviewer|ci|human|ultrareview|merge, got {source!r}"
 
     if err := ensure_verified_for_unit(unit_id):
         return err
@@ -943,7 +958,14 @@ def address_review(unit_id: str, source: str, feedback: str) -> str:
     if not feature or not unit:
         return f"ERROR: feature/unit lookup failed for {unit_id}"
 
-    round_num = state.increment_review_round(unit_id)
+    # F-018: merge source is mechanical (rebase, not a quality fix), so it
+    # must NOT consume the cap-3 budget — the caller's
+    # conflict_fix_attempts counter covers it. Every other source still
+    # bumps review_round (cap-3 quality budget).
+    if source == "merge":
+        round_num = unit_state.review_round
+    else:
+        round_num = state.increment_review_round(unit_id)
     state.touch_unit(unit_id, status="fixing")
     state.record_event(
         unit_id,
@@ -2700,16 +2722,163 @@ def _terminal_already_emitted(unit_id: str) -> bool:
     return any(e.get("event_type") == "cycle_terminal_emitted" for e in state.list_events(unit_id))
 
 
+@dataclass(frozen=True)
+class ConflictResult:
+    """Mergeable-check probe outcome — populated only when the PR has conflicts.
+
+    :func:`_check_mergeable` returns this when ``inspect_unit_health``'s
+    :func:`~orchestrator.health.decide_transitions` emits a
+    ``pr_conflict_detected`` event action; otherwise ``None``. The file
+    list is the dispatch payload to the coder's rebase prompt.
+    """
+
+    conflict_files: list[str]
+    mergeable_state: str
+
+
+def _check_mergeable(unit_id: str) -> ConflictResult | None:
+    """Probe PR mergeable state without mutating ``state.db``. F-018.
+
+    Wraps ``inspect_unit_health(dry_run=True)`` semantics: re-runs the
+    F-014 probe + decide table, then scans ``actions_to_apply`` for the
+    ``pr_conflict_detected`` event action. Returns the conflict file list
+    + ``mergeable_state`` on hit, ``None`` on clean / no PR / probe error.
+
+    Goes through the same ``_load_context`` + ``_probe_and_decide``
+    helpers ``inspect_unit_health`` uses so the on-the-wire signal is
+    bit-identical to a manual ``inspect_unit_health(dry_run=True)`` call —
+    no parallel probe path that could diverge.
+    """
+    # Lazy import — ``tools.health`` registers ``@mcp.tool()`` decorators
+    # on load; keep the import out of module-load to mirror the daemon's
+    # pattern (orchestrator.daemon._apply_health_action).
+    from orchestrator.tools.health import _load_context, _probe_and_decide
+
+    ctx = _load_context(unit_id)
+    if isinstance(ctx, str):
+        return None  # no PR / no feature / no token — no signal to surface
+    unit_state, repo_url = ctx
+    result = _probe_and_decide(unit_state, repo_url)
+    if isinstance(result, str):
+        return None  # probe error — same defensive posture
+    _report, decision = result
+    for action in decision.actions_to_apply:
+        if action.kind == "event" and action.event_type == "pr_conflict_detected":
+            files_raw = action.payload.get("conflict_files") or []
+            return ConflictResult(
+                conflict_files=list(files_raw),
+                mergeable_state=str(action.payload.get("mergeable_state") or ""),
+            )
+    return None
+
+
+def _conflict_fix_loop(ctx: CycleContext, label: str) -> tuple[bool, str | None]:
+    """F-018 mergeable gate — dispatch + wait + re-probe until clean or cap-3.
+
+    Runs after each ``_wait_ci_with_fix_loop`` in ``cycle_review``.
+    Behavior by mergeable state:
+
+      * No conflict (``_check_mergeable`` returns ``None``) → ``(True, None)``;
+        cycle_review proceeds to the next phase.
+      * Conflict + ``conflict_fix_attempts`` < CAP_3 → bump the counter,
+        dispatch ``address_review(source='merge', ...)`` with the
+        conflict-file list, then re-wait CI on the rebased HEAD via
+        ``_wait_ci_with_fix_loop`` and loop back to the mergeable probe.
+      * Conflict + ``conflict_fix_attempts`` >= CAP_3 → escalate with the
+        ``conflict_rebase_diverging`` slug; cycle_review terminates.
+
+    Crucially, ``conflict_fix_attempts`` is bumped via the dedicated
+    :func:`~orchestrator.state.increment_conflict_fix_attempts` helper —
+    NOT the ``review_round`` (cap-3 quality budget) one. A unit with zero
+    quality issues can survive three sibling-merge conflicts without
+    burning the cap-3 budget; conversely a cap-3 tester-bug fix doesn't
+    bump conflict_fix_attempts.
+    """
+    while True:
+        result = _check_mergeable(ctx.unit_id)
+        ctx.history.append(
+            {
+                "step": f"_check_mergeable ({label})",
+                "status": "conflict" if result else "clean",
+                "conflict_files": list(result.conflict_files) if result else [],
+            }
+        )
+        if result is None:
+            return True, None
+
+        attempts = state.get_conflict_fix_attempts(ctx.unit_id)
+        if attempts >= CAP_3:
+            state.record_event(
+                ctx.unit_id,
+                ctx.feature_id,
+                "conflict_rebase_diverging",
+                source="orchestrator",
+                cycle_number=attempts,
+                summary=f"cap-{CAP_3} on conflict-fix attempts",
+                details=json.dumps(
+                    {
+                        "reason": "conflict_rebase_diverging",
+                        "conflict_files": list(result.conflict_files),
+                        "mergeable_state": result.mergeable_state,
+                    }
+                ),
+            )
+            state.touch_unit(
+                ctx.unit_id,
+                status="escalated",
+                error=f"BLOCKED [conflict_rebase_diverging]: cap-{CAP_3} rebase attempts",
+            )
+            return False, (
+                f"BLOCKED [conflict_rebase_diverging]: hit cap-{CAP_3} on rebase "
+                f"attempts after {label}; main is too volatile (last conflict: "
+                f"{', '.join(result.conflict_files) or result.mergeable_state})"
+            )
+
+        new_attempts = state.increment_conflict_fix_attempts(ctx.unit_id)
+        files_csv = ", ".join(result.conflict_files) if result.conflict_files else "(unspecified)"
+        feedback = (
+            f"PR has merge conflicts (mergeable_state={result.mergeable_state!r}, "
+            f"attempt {new_attempts}/{CAP_3}). Rebase against main; resolve conflicts "
+            f"in: {files_csv}. Force-push the rebased HEAD (see `## When resumed with "
+            f"feedback` → `SOURCE: merge` in your system prompt)."
+        )
+        fix_out = _record_step(
+            ctx,
+            f"address_review (merge) after {label}",
+            address_review(ctx.unit_id, "merge", feedback),
+        )
+        if fix_out.get("outcome") != "FIX_PUSHED":
+            return False, (
+                f"coder fix for merge conflict after {label} did not succeed: "
+                f"{fix_out.get('outcome', 'unknown')}"
+            )
+
+        ok, msg = _wait_ci_with_fix_loop(ctx, f"conflict-fix rebase push after {label}")
+        if not ok:
+            return False, msg or f"CI gate failed after conflict-fix rebase ({label})"
+        # Loop: re-probe mergeable on the new HEAD. Sibling units can race
+        # and merge between the rebase push and CI green, so a second
+        # conflict-fix cycle on the same gate is in scope.
+
+
 def _run_tester_advance(ctx: CycleContext) -> tuple[bool, str | None]:
     """Tester-phase work: GATE 1 (CI on coder push) → tester → GATE 2.
 
     Returns ``(success, escalation_msg)``. Shared by ``advance_to_tester``
     and the ``cycle_review`` wrapper so both paths walk the same engine
     (spec § "No parallel state machine").
+
+    F-018: each CI-green gate is paired with a ``_conflict_fix_loop`` so
+    a sibling-merge-induced conflict catches the coder for a rebase
+    before the next phase spawns on a soon-to-be-unmergeable HEAD.
     """
     ok, msg = _wait_ci_with_fix_loop(ctx, "coder PR push")
     if not ok:
         return False, msg or "CI gate failed before tester"
+
+    ok, msg = _conflict_fix_loop(ctx, "coder PR push")
+    if not ok:
+        return False, msg or "mergeable gate failed before tester"
 
     passed, msg = _tester_phase(ctx)
     if not passed:
@@ -2718,6 +2887,10 @@ def _run_tester_advance(ctx: CycleContext) -> tuple[bool, str | None]:
     ok, msg = _wait_ci_with_fix_loop(ctx, "tester test push")
     if not ok:
         return False, msg or "CI gate failed before reviewer"
+
+    ok, msg = _conflict_fix_loop(ctx, "tester test push")
+    if not ok:
+        return False, msg or "mergeable gate failed before reviewer"
 
     return True, None
 

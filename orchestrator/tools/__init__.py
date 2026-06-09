@@ -440,6 +440,12 @@ def compose_fix_task(
     anchoring the coder on "reviewer already endorsed, fix without scope
     creep" and a FEEDBACK label matching the no-inline-anchors contract
     (same shape as ``'ci'``).
+
+    F-018: ``source='merge'`` is the conflict-fix variant — dispatched
+    when ``inspect_unit_health`` reports ``pr_conflict_detected``. The
+    coder is asked to rebase against main (not merge) so the PR's commit
+    graph stays linear, and to force-push the rebased HEAD. The FEEDBACK
+    above is the canonical conflict-file list; no inline anchors apply.
     """
     context = _render_context_blocks(
         feature_spec_text=feature_spec_text, predecessor_logs=predecessor_logs
@@ -466,6 +472,28 @@ def compose_fix_task(
             "`ci`. Post one bottom-of-PR comment summarizing what you changed "
             "per finding (which file / what fix), then push."
         )
+    elif source == "merge":
+        # F-018: mechanical rebase against main, not a code change. The
+        # PR's commit graph must stay linear (rebase, not merge) so a
+        # future delta-review's prior_sha..current_sha diff is the rebased
+        # commit's *content* diff, not "main's history smashed into the
+        # PR's history". Force-push is required because the rebase
+        # rewrites the branch's commit SHAs.
+        guidance = (
+            "A sibling unit merged into main while this PR was in review, "
+            "creating a conflict. Rebase your branch onto the latest main "
+            "(`git fetch origin main && git rebase origin/main`) and resolve "
+            "the conflicts in the files listed above. Do NOT `git merge` — "
+            "the PR's commit graph must stay linear so a future reviewer "
+            "delta-diff is clean. After resolving, force-push the rebased "
+            "HEAD (`git push --force-with-lease origin <branch>`).\n\n"
+            "Scope is the rebase ONLY. The reviewer's prior endorsement "
+            "still stands on the unrebased content; do not opportunistically "
+            "refactor or 'while I'm in here' clean up. If the conflict can't "
+            "be mechanically resolved (overlapping semantic changes you'd "
+            "have to guess at), abort the rebase and emit "
+            "`BLOCKED: reason=merge_conflict_unresolved | <which files>`."
+        )
     else:
         guidance = (
             f"Follow the source-specific fix-loop flow in your system prompt "
@@ -480,12 +508,12 @@ def compose_fix_task(
     # FEEDBACK label has to match the actual source-of-truth contract: for
     # tester / reviewer / human, the inline review threads on the PR ARE the
     # source of truth and FEEDBACK is just the orchestrator's tag pointing
-    # there; for ci / ultrareview, there are no inline anchors so FEEDBACK
-    # IS the full source of truth. Using the "actionable detail lives in
-    # PR comments" label on the latter group misleads the coder into
-    # fetching threads that don't exist for the cycle (and the variant
+    # there; for ci / ultrareview / merge, there are no inline anchors so
+    # FEEDBACK IS the full source of truth. Using the "actionable detail
+    # lives in PR comments" label on the latter group misleads the coder
+    # into fetching threads that don't exist for the cycle (and the variant
     # guidance directly contradicts it — Copilot review on PR #51).
-    if source in ("ci", "ultrareview"):
+    if source in ("ci", "ultrareview", "merge"):
         feedback_label = "FEEDBACK (full context — no inline review threads for this source)"
     else:
         feedback_label = "FEEDBACK (orchestrator summary — actionable detail lives in PR comments)"

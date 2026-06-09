@@ -22,7 +22,7 @@ from orchestrator.blocked_reasons import (
 
 class TestTaxonomy:
     def test_expected_slugs_present(self):
-        # The unit spec enumerates exactly these nine slugs; lock that
+        # The unit spec enumerates exactly these slugs; lock that
         # contract so accidental renames are caught.
         assert {
             "branch_protection_blocked_push",
@@ -33,6 +33,11 @@ class TestTaxonomy:
             "rate_limited",
             "ci_tool_missing",
             "merge_conflict_unresolved",
+            # F-018: orchestrator-side escalation when ``conflict_fix_attempts``
+            # hits the cap (3 rebase rounds). Distinct from
+            # ``merge_conflict_unresolved`` (single rebase the coder couldn't
+            # resolve mechanically) — diverging means main is too volatile.
+            "conflict_rebase_diverging",
             "unknown",
         } == VALID_REASONS
 

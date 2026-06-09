@@ -180,16 +180,21 @@ class TestReasonTaxonomy:
         "rate_limited",
         "ci_tool_missing",
         "merge_conflict_unresolved",
+        # F-018: orchestrator-side escalation when ``conflict_fix_attempts``
+        # hits the cap (3 rebase rounds). Distinct from
+        # ``merge_conflict_unresolved`` (single rebase the coder couldn't
+        # resolve mechanically) — diverging means main is too volatile.
+        "conflict_rebase_diverging",
         "unknown",
     }
 
     def test_valid_reasons_exact_set(self):
-        """VALID_REASONS is exactly the spec'd nine slugs — no more, no less."""
+        """VALID_REASONS is exactly the spec'd slugs — no more, no less."""
         assert set(VALID_REASONS) == self.EXPECTED
 
-    def test_nine_slugs_total(self):
-        """Lock cardinality to nine so a stray addition is caught."""
-        assert len(VALID_REASONS) == 9
+    def test_taxonomy_cardinality(self):
+        """Lock cardinality so a stray addition is caught."""
+        assert len(VALID_REASONS) == len(self.EXPECTED)
 
     @pytest.mark.parametrize("slug", sorted(EXPECTED))
     def test_every_slug_has_enum_member(self, slug):
@@ -235,11 +240,23 @@ class TestPromptsTeachStructuredFormat:
         assert "|" in body  # trivially true, but pairs with the next:
         assert "<free text>" in body or "<one-line free text>" in body
 
+    # ``conflict_rebase_diverging`` (F-018) is an orchestrator-side
+    # escalation reason — the cycle_review mergeable gate and the
+    # daemon's awaiting-merge post-terminal monitor emit it when the
+    # ``conflict_fix_attempts`` counter caps. Workers never emit
+    # ``BLOCKED: reason=conflict_rebase_diverging``, so listing it in
+    # the worker prompts would mislead them about their emit menu.
+    _WORKER_EMITTABLE_SLUGS: frozenset[str] = frozenset(
+        TestReasonTaxonomy.EXPECTED - {"conflict_rebase_diverging"}
+    )
+
     @pytest.mark.parametrize("role", ["coder", "tester", "reviewer"])
-    @pytest.mark.parametrize("slug", sorted(TestReasonTaxonomy.EXPECTED))
+    @pytest.mark.parametrize("slug", sorted(_WORKER_EMITTABLE_SLUGS))
     def test_each_role_prompt_lists_every_slug(self, role, slug, prompts):
-        """All nine slugs must be documented in each role's prompt so the
-        agent has a complete menu to pick from."""
+        """Every worker-emittable slug must be documented in each role's
+        prompt so the agent has a complete menu to pick from.
+        Orchestrator-only slugs are excluded — see
+        :data:`_WORKER_EMITTABLE_SLUGS`."""
         assert slug in prompts[role], f"prompt {role}.md is missing slug {slug!r} from the taxonomy"
 
 

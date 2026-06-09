@@ -49,6 +49,13 @@ class BlockedReason(StrEnum):
     RATE_LIMITED = "rate_limited"
     CI_TOOL_MISSING = "ci_tool_missing"
     MERGE_CONFLICT_UNRESOLVED = "merge_conflict_unresolved"
+    # F-018: orchestrator-side escalation when ``conflict_fix_attempts`` hits
+    # the cap (3 rebase rounds) before the PR becomes mergeable. Distinct
+    # from ``MERGE_CONFLICT_UNRESOLVED`` (worker-emitted, single rebase the
+    # coder couldn't resolve mechanically) — diverging means main is too
+    # volatile and the user needs to decide whether to land a sibling
+    # first, rebase manually, or take over.
+    CONFLICT_REBASE_DIVERGING = "conflict_rebase_diverging"
     UNKNOWN = "unknown"
 
 

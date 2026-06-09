@@ -543,6 +543,25 @@ class TestEvents:
         assert s["event_counts_by_type"]["spawn_tester"] == 2
         assert s["event_counts_by_type"]["spawn_coder"] == 1
 
+    def test_summarize_unit_surfaces_conflict_fix_attempts(self, tmp_state_db):
+        """PR #66 M1: ``conflict_fix_attempts`` must appear in the
+        ``current_state`` digest of ``summarize_unit`` so the
+        ``unit_summary`` MCP tool surfaces the counter to operators.
+        Otherwise a unit consuming N of 3 conflict-fix retries looks
+        identical to a clean unit in chat.
+        """
+        state.save_feature(Feature(id="F", title="t", description=""))
+        state.upsert_unit_state(WorkUnitState(unit_id="U1", feature_id="F", status="fixing"))
+        state.increment_conflict_fix_attempts("U1")
+        state.increment_conflict_fix_attempts("U1")
+        s = state.summarize_unit("U1")
+        assert "conflict_fix_attempts" in s["current_state"]
+        assert s["current_state"]["conflict_fix_attempts"] == 2
+        # ``review_round`` (the existing cap-3 budget) stays separately
+        # visible — the two counters are independent and the digest
+        # surfaces both.
+        assert s["current_state"]["review_round"] == 0
+
 
 class TestEventDedupeKey:
     """F-016 Phase 0 — ``dedupe_key`` makes terminal-marker recording
@@ -1005,6 +1024,164 @@ class TestPhase25Migration:
         after = cols()
         assert "cancelled_at" in after
         assert "owner" in after
+
+
+# --------------------------- F-018: conflict_fix_attempts ---------------------------
+
+
+class TestConflictFixAttemptsMigration:
+    """F-018 — pre-F-018 DBs missing ``conflict_fix_attempts`` must
+    migrate on the next ``init_db`` without losing rows, and the
+    column defaults to 0 so units predating the feature behave exactly
+    like today.
+    """
+
+    def _seed_pre_f018(self, db_path) -> None:
+        """Build a work_units schema without ``conflict_fix_attempts``."""
+        with sqlite3.connect(db_path) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE features (
+                    id          TEXT PRIMARY KEY,
+                    title       TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    repo_path   TEXT NOT NULL DEFAULT '',
+                    branch_prefix TEXT NOT NULL DEFAULT '',
+                    status      TEXT NOT NULL DEFAULT 'draft',
+                    created_at  TEXT NOT NULL
+                );
+                CREATE TABLE work_units (
+                    unit_id              TEXT PRIMARY KEY,
+                    feature_id           TEXT NOT NULL,
+                    status               TEXT NOT NULL DEFAULT 'pending',
+                    branch               TEXT NOT NULL DEFAULT '',
+                    pr_number            INTEGER,
+                    coder_session_id     TEXT NOT NULL DEFAULT '',
+                    tester_session_id    TEXT NOT NULL DEFAULT '',
+                    reviewer_session_id  TEXT NOT NULL DEFAULT '',
+                    review_round         INTEGER NOT NULL DEFAULT 0,
+                    last_activity        TEXT NOT NULL DEFAULT '',
+                    last_error           TEXT NOT NULL DEFAULT ''
+                );
+                """
+            )
+            ts = datetime.now(UTC).isoformat()
+            conn.execute(
+                "INSERT INTO features (id, title, description, created_at) VALUES (?, ?, ?, ?)",
+                ("F-LEGACY", "old", "d", ts),
+            )
+            conn.execute(
+                "INSERT INTO work_units (unit_id, feature_id, status, branch, "
+                "review_round, last_activity) VALUES (?, ?, ?, ?, ?, ?)",
+                ("F-LEGACY-U-1", "F-LEGACY", "in_ci", "f-legacy-u-1", 2, ts),
+            )
+
+    def test_migration_adds_column_and_backfills_default_zero(self, monkeypatch, tmp_path):
+        db_path = tmp_path / "legacy.db"
+        monkeypatch.setattr("orchestrator.state.STATE_DB", db_path)
+        self._seed_pre_f018(db_path)
+
+        state.init_db()
+
+        with sqlite3.connect(db_path) as conn:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(work_units)").fetchall()}
+        assert "conflict_fix_attempts" in cols
+
+        got = state.get_unit_state("F-LEGACY-U-1")
+        assert got is not None
+        assert got.conflict_fix_attempts == 0
+        # Existing columns must be untouched.
+        assert got.review_round == 2
+        assert got.status == "in_ci"
+
+    def test_migration_is_idempotent(self, tmp_state_db):
+        """tmp_state_db fixture already ran init_db; running it again
+        must be a no-op (no duplicate-column error)."""
+        state.init_db()  # would raise OperationalError if non-idempotent
+        with sqlite3.connect(tmp_state_db) as conn:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(work_units)").fetchall()}
+        assert "conflict_fix_attempts" in cols
+
+    def test_migration_swallows_duplicate_column_race(self, tmp_state_db):
+        conn = sqlite3.connect(tmp_state_db)
+        conn.row_factory = sqlite3.Row
+        try:
+            fake = _PragmaBlindConn(conn)
+            state._migrate_work_units_conflict_fix_attempts(fake)
+        finally:
+            conn.close()
+
+    def test_migration_propagates_unrelated_operational_errors(self, tmp_state_db):
+        conn = sqlite3.connect(tmp_state_db)
+        conn.row_factory = sqlite3.Row
+        try:
+            fake = _AlterErrorConn(conn, sqlite3.OperationalError("disk I/O error"))
+            with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+                state._migrate_work_units_conflict_fix_attempts(fake)
+        finally:
+            conn.close()
+
+
+class TestConflictFixAttemptsHelpers:
+    """F-018 — ``increment_conflict_fix_attempts`` / ``get_conflict_fix_attempts``.
+
+    Counter is independent of ``review_round`` so a conflict-fix round
+    does not consume the quality cap-3 budget (and vice versa).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _seed_unit(self, tmp_state_db):
+        state.save_feature(Feature(id="F-018", title="t", description="d"))
+        state.save_plan(
+            "F-018",
+            [WorkUnit(id="F-018-U-1", feature_id="F-018", title="t", description="d")],
+        )
+        state.upsert_unit_state(
+            WorkUnitState(unit_id="F-018-U-1", feature_id="F-018", status="in_ci")
+        )
+
+    def test_fresh_unit_reads_zero(self):
+        assert state.get_conflict_fix_attempts("F-018-U-1") == 0
+
+    def test_increment_returns_new_value(self):
+        assert state.increment_conflict_fix_attempts("F-018-U-1") == 1
+        assert state.increment_conflict_fix_attempts("F-018-U-1") == 2
+        assert state.get_conflict_fix_attempts("F-018-U-1") == 2
+
+    def test_independent_of_review_round(self):
+        """A conflict-fix bump must NOT touch review_round, and vice versa."""
+        state.increment_review_round("F-018-U-1")
+        state.increment_review_round("F-018-U-1")
+        state.increment_conflict_fix_attempts("F-018-U-1")
+        got = state.get_unit_state("F-018-U-1")
+        assert got is not None
+        assert got.review_round == 2
+        assert got.conflict_fix_attempts == 1
+        # Reverse direction — bumping conflict counter twice must leave
+        # review_round at 2.
+        state.increment_conflict_fix_attempts("F-018-U-1")
+        state.increment_conflict_fix_attempts("F-018-U-1")
+        got = state.get_unit_state("F-018-U-1")
+        assert got is not None
+        assert got.review_round == 2
+        assert got.conflict_fix_attempts == 3
+
+    def test_get_missing_unit_returns_zero(self):
+        assert state.get_conflict_fix_attempts("F-018-U-NOPE") == 0
+
+    def test_upsert_preserves_conflict_fix_attempts(self):
+        """``upsert_unit_state`` is a generic write path; it must NOT
+        clobber the F-018 counter back to zero (mirrors the existing
+        ``cancelled_at`` / ``owner`` preservation contract)."""
+        state.increment_conflict_fix_attempts("F-018-U-1")
+        state.increment_conflict_fix_attempts("F-018-U-1")
+        state.upsert_unit_state(
+            WorkUnitState(unit_id="F-018-U-1", feature_id="F-018", status="reviewing")
+        )
+        got = state.get_unit_state("F-018-U-1")
+        assert got is not None
+        assert got.conflict_fix_attempts == 2  # preserved through upsert
+        assert got.status == "reviewing"
 
 
 # --------------------------- F-016 Phase 3: daemon_locks ---------------------------
