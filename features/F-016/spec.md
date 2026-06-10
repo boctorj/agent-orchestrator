@@ -61,14 +61,31 @@ harness during rollout. F-015 should be marked `obsoleted-by F-016`.
   blocking + nudges); explicit `cycle_review_async` / `cycle_review_blocking`
   always available. `cycle_review_blocking` calls the daemon's engine
   in-process — no duplicate transition table.
-- **F-016-U-7 — Phase 5: cleanup.** Move blocking phase helpers into
+- **F-016-U-7 — Phase 5: cleanup + unified bootstrap + credential
+  hardening.** Move blocking phase helpers into
   `orchestrator/cycle/phases.py` (shared by daemon + blocking caller),
-  retire thread-pool internals, update CLAUDE.md/README/`docs/DAEMON.md`.
+  retire thread-pool internals; `orchestrator run` auto-starts a
+  detached daemon when `ORCH_DAEMON_DRIVE=true`; add `orchestrator
+  daemon stop`; strip/validate `ANTHROPIC_*` to kill shell-rc
+  shadowing; update CLAUDE.md/README/`docs/DAEMON.md`.
+- **F-016-U-8 — Phase 6: uniform non-blocking dispatch.** U-6 made
+  only `cycle_review` a non-blocking dispatcher, but `spawn_unit`,
+  `address_review`, `spawn_tester`, `spawn_reviewer`, `send_to_unit`,
+  and `parallel_units{,_global}` still block minutes — so the lead
+  foot-guns itself by calling a blocking sibling (the post-F-016
+  blocking still observed in practice). Factor U-6's gate into a
+  shared `_dispatch_or_block` helper and apply it to every
+  long-running command; add the missing `_async` variants
+  (`address_review_async`, `spawn_tester_async`, `spawn_reviewer_async`).
+  Each surface keeps an explicit `_blocking`/`_async` variant; only the
+  default flips. Depends on U-7.
 
 ## Acceptance
 
-When all seven units merge:
-1. `spawn_unit`, `cycle_review`, `parallel_units_global` all return in ≤3s.
+When all eight units merge:
+1. `spawn_unit`, `address_review`, `spawn_tester`, `spawn_reviewer`,
+   `send_to_unit`, `cycle_review`, `parallel_units{,_global}` all return
+   in ≤3s under NTFY+daemon (U-8 — not just `cycle_review`).
 2. A lead session killed mid-cycle does not strand the unit; the daemon
    completes the cycle and ntfy fires.
 3. `list_in_flight` / `resume_unit` / `tail_worker` continue to work
