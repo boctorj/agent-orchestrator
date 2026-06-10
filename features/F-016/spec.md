@@ -95,6 +95,12 @@ harness during rollout. F-015 should be marked `obsoleted-by F-016`.
   ships ahead of U-7/U-8 (U-8 rebases its dispatcher onto this guard).
   Incident stopgap until merged: U-7's `coder_session_id` set to a
   `GHOST-LOOP-HALTED-*` sentinel so the existing guard refuses spawns.
+  Also folds in a second anti-loop defect found during incident
+  triage: the daemon re-emits `ci_drift_detected` every ~6 s poll for
+  an `in_ci` unit with persistently-red CI (no dedupe), hammering the
+  GitHub API and bloating `unit_events`. U-9 rate-limits/dedupes the
+  drift event (emit only on a changed failing-check-set, throttled
+  per unit) in both the daemon tick and `inspect_unit_health`.
 
 ## Acceptance
 
