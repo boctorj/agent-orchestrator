@@ -404,8 +404,11 @@ def daemon_stop() -> None:
         console.print(
             f"[red]Lock row exists for {path} but has no recorded pid.[/red]\n"
             f"  holder_id={row.get('holder_id')} heartbeat_at={row.get('heartbeat_at')}\n"
-            f"  Likely a pre-F-016-U-7 daemon — kill it manually and remove the "
-            f"row with `orchestrator daemon status` to find the holder."
+            f"  Likely a pre-F-016-U-7 daemon — use `orchestrator daemon status` "
+            f"to read the holder, then either kill the process manually + "
+            f'`sqlite3 state.db "DELETE FROM daemon_locks WHERE state_db_path = '
+            f"'{path}';\"` to clear the row, or wait for stale-heartbeat takeover "
+            f"on the next `orchestrator daemon start`."
         )
         raise SystemExit(1)
 
@@ -413,9 +416,22 @@ def daemon_stop() -> None:
     try:
         os.kill(pid, _signal.SIGTERM)
     except ProcessLookupError:
-        console.print("[yellow]PID not alive — clearing stale lock row.[/yellow]")
+        # Process is gone — best-effort release of OUR row, then verify
+        # the workspace is actually clear before reporting success. A
+        # ``release_daemon_lock`` returning False (lock taken over
+        # mid-call by a fresh daemon) must NOT exit 0 — the new owner
+        # is alive and the operator's "stop" intent didn't land. See
+        # PR #67 Copilot finding on the original always-exit-0 branch.
         state.release_daemon_lock(path, row.get("holder_id", ""))
-        raise SystemExit(0) from None
+        if state.get_daemon_lock(path) is None:
+            console.print("[yellow]PID not alive — cleared stale lock row.[/yellow]")
+            raise SystemExit(0) from None
+        console.print(
+            "[red]PID not alive but lock row is still present "
+            "(another daemon took over the workspace between read and signal). "
+            "Re-run `orchestrator daemon stop` against the new holder.[/red]"
+        )
+        raise SystemExit(2) from None
     except PermissionError:
         console.print(f"[red]Permission denied signaling pid {pid}.[/red]")
         raise SystemExit(2) from None
@@ -439,9 +455,20 @@ def daemon_stop() -> None:
         os.kill(pid, kill_signal)
     except ProcessLookupError:
         # Race — it died after SIGTERM but before we sent SIGKILL.
+        # Same caveat as the SIGTERM ProcessLookupError branch above:
+        # ``release_daemon_lock`` may no-op if the workspace was
+        # taken over, so verify the row actually cleared before
+        # reporting success.
         state.release_daemon_lock(path, row.get("holder_id", ""))
-        console.print("[green]✓ daemon stopped (between SIGTERM and SIGKILL)[/green]")
-        raise SystemExit(0) from None
+        if state.get_daemon_lock(path) is None:
+            console.print("[green]✓ daemon stopped (between SIGTERM and SIGKILL)[/green]")
+            raise SystemExit(0) from None
+        console.print(
+            "[red]Daemon died between SIGTERM and SIGKILL but lock row is still "
+            "present (another daemon took over the workspace). "
+            "Re-run `orchestrator daemon stop` against the new holder.[/red]"
+        )
+        raise SystemExit(2) from None
     except PermissionError:
         console.print(f"[red]Permission denied SIGKILLing pid {pid}.[/red]")
         raise SystemExit(2) from None

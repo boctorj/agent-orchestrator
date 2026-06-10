@@ -578,3 +578,98 @@ def test_daemon_stop_no_pid_recorded(runner, tmp_path, monkeypatch):
     result = runner.invoke(cli, ["daemon", "stop"])
     assert result.exit_code == 1
     assert "no recorded pid" in result.output.lower()
+
+
+def test_daemon_stop_no_pid_diagnostic_mentions_sqlite_delete(runner, tmp_path, monkeypatch):
+    """PR #67 Copilot finding: the legacy-lock diagnostic mustn't claim
+    ``orchestrator daemon status`` removes rows (it's read-only). The
+    fixed copy points the operator at sqlite for the actual delete."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("orchestrator.state.STATE_DB", tmp_path / "state.db")
+    from orchestrator import state
+
+    state.init_db()
+    path = str(state.STATE_DB.resolve())
+    state.claim_daemon_lock(path, "legacy-holder")  # no pid kwarg
+    result = runner.invoke(cli, ["daemon", "stop"])
+    assert result.exit_code == 1
+    # The diagnostic must NOT claim daemon status performs deletion.
+    assert "remove the row with `orchestrator daemon status`" not in result.output
+    # The diagnostic must point to a viable cleanup path: either sqlite
+    # delete or stale-heartbeat takeover.
+    assert "sqlite" in result.output.lower() or "stale-heartbeat takeover" in result.output.lower()
+
+
+def test_daemon_stop_sigterm_processlookuperror_with_lock_taken_over(runner, tmp_path, monkeypatch):
+    """PR #67 Copilot finding (M-1): when SIGTERM raises
+    ProcessLookupError AND release_daemon_lock no-ops because the
+    workspace was taken over mid-call, we must NOT exit 0 — that
+    would falsely report success while a new daemon owns the
+    workspace."""
+    import os as _os
+    import signal as _signal
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("orchestrator.state.STATE_DB", tmp_path / "state.db")
+    from orchestrator import state
+
+    state.init_db()
+    path = str(state.STATE_DB.resolve())
+    state.claim_daemon_lock(path, "old-holder", pid=99996)
+
+    def fake_kill(pid, sig):
+        # Race: by the time we signal the old pid, it's gone, AND a
+        # new daemon has claimed the workspace.
+        if sig == _signal.SIGTERM:
+            # Force stale takeover by hand: bump the old row's
+            # heartbeat back, then claim with a fresh holder.
+            import sqlite3
+            from datetime import UTC, datetime, timedelta
+
+            with sqlite3.connect(state.STATE_DB) as conn:
+                conn.execute(
+                    "UPDATE daemon_locks SET heartbeat_at = ? WHERE state_db_path = ?",
+                    (
+                        (datetime.now(UTC) - timedelta(seconds=120))
+                        .isoformat()
+                        .replace("+00:00", "+00:00"),
+                        path,
+                    ),
+                )
+                conn.commit()
+            state.claim_daemon_lock(path, "new-holder", pid=88888)
+            raise ProcessLookupError(3, "No such process")
+
+    monkeypatch.setattr(_os, "kill", fake_kill)
+    result = runner.invoke(cli, ["daemon", "stop"])
+    # NOT exit 0 — the workspace still has a daemon (the new one).
+    assert result.exit_code == 2, result.output
+    # Diagnostic names the takeover so the operator can stop the
+    # current holder.
+    assert "took over" in result.output.lower() or "new holder" in result.output.lower()
+
+
+def test_daemon_stop_sigterm_processlookuperror_with_clean_release(runner, tmp_path, monkeypatch):
+    """The benign case: SIGTERM raises ProcessLookupError because the
+    daemon was already dead, and our row release clears the lock. Exit
+    0 is correct here — the original always-exit-0 was right for this
+    branch and wrong for the takeover-race branch."""
+    import os as _os
+    import signal as _signal
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("orchestrator.state.STATE_DB", tmp_path / "state.db")
+    from orchestrator import state
+
+    state.init_db()
+    path = str(state.STATE_DB.resolve())
+    state.claim_daemon_lock(path, "dead-holder", pid=99995)
+
+    def fake_kill(pid, sig):
+        if sig == _signal.SIGTERM:
+            raise ProcessLookupError(3, "No such process")
+
+    monkeypatch.setattr(_os, "kill", fake_kill)
+    result = runner.invoke(cli, ["daemon", "stop"])
+    assert result.exit_code == 0, result.output
+    assert state.get_daemon_lock(path) is None
