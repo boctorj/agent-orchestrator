@@ -136,6 +136,27 @@ def _migrate_work_units_conflict_fix_attempts(conn: sqlite3.Connection) -> None:
             raise
 
 
+def _migrate_daemon_locks_pid(conn: sqlite3.Connection) -> None:
+    """Add F-016-U-7 ``pid`` to ``daemon_locks`` for pre-U-7 DBs.
+
+    ``orchestrator daemon stop`` reads the column to send SIGTERM to the
+    holder. The column is nullable so existing rows from older daemons
+    (which never recorded a PID) keep working — ``daemon stop`` falls
+    back to "no PID to signal" in that case.
+
+    Race-safe in the same shape as :func:`_migrate_features_ultrareview`
+    (PRAGMA-probe → ALTER → swallow ``duplicate column name``).
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(daemon_locks)").fetchall()}
+    if "pid" in cols:
+        return
+    try:
+        conn.execute("ALTER TABLE daemon_locks ADD COLUMN pid INTEGER")
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e).lower():
+            raise
+
+
 def _migrate_unit_events_dedupe_key(conn: sqlite3.Connection) -> None:
     """Add `dedupe_key` + its UNIQUE index to `unit_events` for pre-F-016 DBs.
 
@@ -275,7 +296,14 @@ def init_db() -> None:
                 state_db_path TEXT PRIMARY KEY,
                 holder_id     TEXT NOT NULL,
                 heartbeat_at  TEXT NOT NULL,
-                started_at    TEXT NOT NULL
+                started_at    TEXT NOT NULL,
+                -- F-016-U-7: the holder daemon's OS PID, so
+                -- ``orchestrator daemon stop`` can send SIGTERM without
+                -- needing a sidecar pidfile. Nullable so legacy rows
+                -- from pre-U-7 daemons keep working (``daemon stop``
+                -- reports "no pid recorded" and the operator falls back
+                -- to a manual kill).
+                pid           INTEGER
             );
             """
         )
@@ -283,6 +311,7 @@ def init_db() -> None:
         _migrate_work_units_cancel_owner(conn)
         _migrate_work_units_conflict_fix_attempts(conn)
         _migrate_unit_events_dedupe_key(conn)
+        _migrate_daemon_locks_pid(conn)
 
 
 # --------------------------- features ---------------------------
@@ -1192,6 +1221,7 @@ def claim_daemon_lock(
     holder_id: str,
     *,
     stale_after_s: int = DEFAULT_DAEMON_LOCK_STALE_AFTER_S,
+    pid: int | None = None,
 ) -> bool:
     """Atomically claim the workspace-scoped daemon lock.
 
@@ -1218,6 +1248,11 @@ def claim_daemon_lock(
             restarts).
         stale_after_s: Seconds since the live row's ``heartbeat_at``
             before takeover is permitted.
+        pid: Optional OS process id of the holder. F-016-U-7's
+            ``orchestrator daemon stop`` reads this to send SIGTERM
+            without a sidecar pidfile; legacy callers that omit it
+            leave the column NULL (stop falls back to "no pid
+            recorded").
     """
     now = _now()
     try:
@@ -1233,9 +1268,10 @@ def claim_daemon_lock(
         # through to the takeover branch rather than racing the SELECT.
         try:
             conn.execute(
-                "INSERT INTO daemon_locks (state_db_path, holder_id, heartbeat_at, started_at) "
-                "VALUES (?, ?, ?, ?)",
-                (state_db_path, holder_id, now, now),
+                "INSERT INTO daemon_locks "
+                "(state_db_path, holder_id, heartbeat_at, started_at, pid) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (state_db_path, holder_id, now, now, pid),
             )
             return True
         except sqlite3.IntegrityError:
@@ -1257,11 +1293,21 @@ def claim_daemon_lock(
             # / ``daemon status`` reading can compute the daemon's
             # uptime as ``now() - started_at``. A re-claim is just a
             # cheap heartbeat refresh, not a "new daemon".
-            conn.execute(
-                "UPDATE daemon_locks SET heartbeat_at = ? "
-                "WHERE state_db_path = ? AND holder_id = ?",
-                (now, state_db_path, holder_id),
-            )
+            # ``pid`` is refreshed only when the caller supplied one,
+            # so a manual re-claim that omits it doesn't clobber the
+            # already-recorded PID.
+            if pid is None:
+                conn.execute(
+                    "UPDATE daemon_locks SET heartbeat_at = ? "
+                    "WHERE state_db_path = ? AND holder_id = ?",
+                    (now, state_db_path, holder_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE daemon_locks SET heartbeat_at = ?, pid = ? "
+                    "WHERE state_db_path = ? AND holder_id = ?",
+                    (now, pid, state_db_path, holder_id),
+                )
             return True
 
         existing_dt: datetime | None
@@ -1284,9 +1330,10 @@ def claim_daemon_lock(
         # Stale row — take over via CAS so a concurrent takeover can
         # not also win.
         cur = conn.execute(
-            "UPDATE daemon_locks SET holder_id = ?, heartbeat_at = ?, started_at = ? "
+            "UPDATE daemon_locks "
+            "SET holder_id = ?, heartbeat_at = ?, started_at = ?, pid = ? "
             "WHERE state_db_path = ? AND holder_id = ?",
-            (holder_id, now, now, state_db_path, row["holder_id"]),
+            (holder_id, now, now, pid, state_db_path, row["holder_id"]),
         )
         return cur.rowcount > 0
 

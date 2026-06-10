@@ -18,9 +18,12 @@ the module without silently creating state.db.
 
 from __future__ import annotations
 
+import os
+import sys
+
 from dotenv import load_dotenv
 
-from orchestrator import state
+from orchestrator import env_guard, state
 from orchestrator.tools import mcp
 
 load_dotenv()
@@ -40,6 +43,21 @@ from orchestrator.tools import (  # noqa: E402
 
 
 def main() -> None:
+    # F-016-U-7 credential hardening (b): refuse to serve MCP tools
+    # when ``ANTHROPIC_API_KEY`` doesn't pass the shape check. Without
+    # this gate a stale shell-rc export silently shadows ``.env`` and
+    # every ``spawn_unit`` returns an opaque Anthropic 401 minutes
+    # later. The diagnostic goes to stderr so Claude Code surfaces it
+    # in the MCP server logs.
+    resolved = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not env_guard.is_valid_anthropic_key(resolved):
+        from pathlib import Path  # noqa: PLC0415 — cold-path only
+
+        env_file_value = env_guard.read_env_file_values(Path(".env")).get("ANTHROPIC_API_KEY", "")
+        diag = env_guard.anthropic_key_diagnostic(resolved, env_file_value)
+        print(f"orchestrator MCP server: refusing to start — {diag}", file=sys.stderr)
+        raise SystemExit(1)
+
     # Initialize schema before serving any tool calls. Idempotent.
     state.init_db()
     mcp.run()

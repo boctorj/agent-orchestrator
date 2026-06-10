@@ -1097,6 +1097,7 @@ def claim_singleton(
     *,
     holder_id: str | None = None,
     stale_after_s: int = state.DEFAULT_DAEMON_LOCK_STALE_AFTER_S,
+    pid: int | None = None,
 ) -> DaemonHandle | None:
     """Acquire the workspace-scoped daemon lock or return ``None`` on contention.
 
@@ -1107,10 +1108,15 @@ def claim_singleton(
         stale_after_s: Forwarded to :func:`~orchestrator.state.claim_daemon_lock`
             — how old the existing holder's heartbeat must be before
             takeover is allowed.
+        pid: Optional OS PID to record on the lock row. F-016-U-7's
+            ``orchestrator daemon stop`` reads it to send SIGTERM.
+            Defaults to :func:`os.getpid`; tests pass an explicit value
+            to keep the assertion stable.
     """
     holder = holder_id or uuid.uuid4().hex
+    resolved_pid = os.getpid() if pid is None else pid
     path = _state_db_path_str()
-    if state.claim_daemon_lock(path, holder, stale_after_s=stale_after_s):
+    if state.claim_daemon_lock(path, holder, stale_after_s=stale_after_s, pid=resolved_pid):
         return DaemonHandle(holder_id=holder, state_db_path=path)
     return None
 

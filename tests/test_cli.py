@@ -372,3 +372,205 @@ def test_run_with_no_remote_control_flag(runner, tmp_path, monkeypatch):
 
     runner.invoke(cli, ["run", "--no-remote-control"])
     assert "--remote-control" not in exec_calls[0]["args"]
+
+
+# --------------------------- F-016-U-7: run strips ANTHROPIC_AUTH_TOKEN ---------------------------
+
+
+def test_run_strips_anthropic_auth_token(runner, tmp_path, monkeypatch):
+    """F-016-U-7 (a): a stale ``ANTHROPIC_AUTH_TOKEN`` OAuth token in
+    the parent env would shadow the API-key flow we just validated.
+    ``orchestrator run`` strips both ``ANTHROPIC_API_KEY`` AND
+    ``ANTHROPIC_AUTH_TOKEN`` from the env passed to Claude Code so the
+    MCP server sees credentials only from ``.env``."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=sk-ant-real\n")
+    monkeypatch.setattr("shutil.which", lambda name: "/fake/claude")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "sk-ant-stale-oauth-token")
+
+    exec_calls = []
+
+    def fake_exec(prog, args, env):
+        exec_calls.append({"env": dict(env)})
+        raise SystemExit(0)
+
+    monkeypatch.setattr("os.execvpe", fake_exec)
+
+    runner.invoke(cli, ["run"])
+    assert len(exec_calls) == 1
+    assert "ANTHROPIC_API_KEY" not in exec_calls[0]["env"]
+    assert "ANTHROPIC_AUTH_TOKEN" not in exec_calls[0]["env"]
+
+
+def test_run_validates_resolved_key_format(runner, tmp_path, monkeypatch):
+    """F-016-U-7 (b): ``run`` refuses to start when the resolved
+    ``ANTHROPIC_API_KEY`` doesn't match ``sk-ant-``. The diagnostic
+    names the shell-rc files so the operator knows where to look."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=sk-ant-good\n")
+    # Shell env shadows the .env with a stale value — exactly the
+    # foot-gun this guard exists to catch.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "lkj")
+
+    result = runner.invoke(cli, ["run"])
+    assert result.exit_code == 1
+    # The spec-mandated diagnostic mentions the shell-rc files
+    assert "~/.zshrc" in result.output
+
+
+def test_run_starts_daemon_when_drive_enabled(runner, tmp_path, monkeypatch):
+    """F-016-U-7 unified bootstrap: ``orchestrator run`` auto-spawns
+    the watcher daemon as a detached child when ``ORCH_DAEMON_DRIVE=true``."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=sk-ant-real\nORCH_DAEMON_DRIVE=true\n")
+    monkeypatch.setattr("shutil.which", lambda name: "/fake/claude")
+    # Avoid mutating the test process's env with the .env values.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ORCH_DAEMON_DRIVE", raising=False)
+
+    spawn_calls = []
+
+    def fake_start_daemon_detached(console):
+        spawn_calls.append(True)
+
+    monkeypatch.setattr("orchestrator.cli._start_daemon_detached", fake_start_daemon_detached)
+    monkeypatch.setattr("os.execvpe", lambda *a, **k: (_ for _ in ()).throw(SystemExit(0)))
+
+    runner.invoke(cli, ["run"])
+    assert len(spawn_calls) == 1
+
+
+def test_run_skips_daemon_when_drive_off(runner, tmp_path, monkeypatch):
+    """Without ``ORCH_DAEMON_DRIVE=true`` the bootstrap stays out of the way."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=sk-ant-real\n")
+    monkeypatch.setattr("shutil.which", lambda name: "/fake/claude")
+    monkeypatch.delenv("ORCH_DAEMON_DRIVE", raising=False)
+
+    spawn_calls = []
+
+    def fake_start_daemon_detached(console):
+        spawn_calls.append(True)
+
+    monkeypatch.setattr("orchestrator.cli._start_daemon_detached", fake_start_daemon_detached)
+    monkeypatch.setattr("os.execvpe", lambda *a, **k: (_ for _ in ()).throw(SystemExit(0)))
+
+    runner.invoke(cli, ["run"])
+    assert spawn_calls == []
+
+
+# --------------------------- F-016-U-7: daemon stop ---------------------------
+
+
+def test_daemon_stop_no_daemon_running(runner, tmp_path, monkeypatch):
+    """``orchestrator daemon stop`` with no daemon → exit 1 (per spec)."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("orchestrator.state.STATE_DB", tmp_path / "state.db")
+    result = runner.invoke(cli, ["daemon", "stop"])
+    assert result.exit_code == 1
+    assert "No daemon running" in result.output
+
+
+def test_daemon_stop_sigterm_clears_lock(runner, tmp_path, monkeypatch):
+    """SIGTERM path: kill is signaled, lock row cleared by the (fake)
+    daemon's release_singleton, exit 0."""
+    import os as _os
+    import signal as _signal
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("orchestrator.state.STATE_DB", tmp_path / "state.db")
+    from orchestrator import state
+
+    state.init_db()
+    path = str(state.STATE_DB.resolve())
+    state.claim_daemon_lock(path, "fake-holder", pid=99999)
+
+    kill_calls = []
+
+    def fake_kill(pid, sig):
+        kill_calls.append((pid, sig))
+        # Simulate clean shutdown — the (fake) daemon releases its lock
+        # in response to SIGTERM.
+        if sig == _signal.SIGTERM:
+            state.release_daemon_lock(path, "fake-holder")
+
+    monkeypatch.setattr(_os, "kill", fake_kill)
+
+    result = runner.invoke(cli, ["daemon", "stop"])
+    assert result.exit_code == 0, result.output
+    assert kill_calls[0] == (99999, _signal.SIGTERM)
+    assert "stopped" in result.output.lower()
+
+
+def test_daemon_stop_sigkill_fallback(runner, tmp_path, monkeypatch):
+    """When the daemon ignores SIGTERM, ``stop`` escalates to SIGKILL
+    after the 10s window (we shrink the timeout in tests)."""
+    import os as _os
+    import signal as _signal
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("orchestrator.state.STATE_DB", tmp_path / "state.db")
+    # Shrink both timeouts so the test doesn't actually wait 10s.
+    monkeypatch.setattr("orchestrator.cli._DAEMON_STOP_TIMEOUT_S", 0.2)
+    monkeypatch.setattr("orchestrator.cli._DAEMON_STOP_AFTER_KILL_S", 0.2)
+    from orchestrator import state
+
+    state.init_db()
+    path = str(state.STATE_DB.resolve())
+    state.claim_daemon_lock(path, "fake-holder", pid=99998)
+
+    kill_calls = []
+
+    def fake_kill(pid, sig):
+        kill_calls.append((pid, sig))
+        # SIGTERM: ignored. SIGKILL: clear the lock (simulating the
+        # OS reaping the process and the next claim_daemon_lock
+        # taking over the stale row).
+        if sig == _signal.SIGKILL:
+            state.release_daemon_lock(path, "fake-holder")
+
+    monkeypatch.setattr(_os, "kill", fake_kill)
+
+    result = runner.invoke(cli, ["daemon", "stop"])
+    assert result.exit_code == 0, result.output
+    # Both signals fired
+    signals = [s for _, s in kill_calls]
+    assert _signal.SIGTERM in signals
+    assert _signal.SIGKILL in signals
+
+
+def test_daemon_stop_kill_failed_exit_2(runner, tmp_path, monkeypatch):
+    """When SIGKILL also fails to clear the lock, exit 2 (per spec)."""
+    import os as _os
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("orchestrator.state.STATE_DB", tmp_path / "state.db")
+    monkeypatch.setattr("orchestrator.cli._DAEMON_STOP_TIMEOUT_S", 0.1)
+    monkeypatch.setattr("orchestrator.cli._DAEMON_STOP_AFTER_KILL_S", 0.1)
+    from orchestrator import state
+
+    state.init_db()
+    path = str(state.STATE_DB.resolve())
+    state.claim_daemon_lock(path, "fake-holder", pid=99997)
+
+    # Both SIGTERM and SIGKILL ignored — lock stays.
+    monkeypatch.setattr(_os, "kill", lambda pid, sig: None)
+
+    result = runner.invoke(cli, ["daemon", "stop"])
+    assert result.exit_code == 2, result.output
+
+
+def test_daemon_stop_no_pid_recorded(runner, tmp_path, monkeypatch):
+    """Pre-F-016-U-7 lock rows have no ``pid`` column value — ``stop``
+    refuses with exit 1 + a clear diagnostic rather than nuking the row."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("orchestrator.state.STATE_DB", tmp_path / "state.db")
+    from orchestrator import state
+
+    state.init_db()
+    path = str(state.STATE_DB.resolve())
+    state.claim_daemon_lock(path, "legacy-holder")  # no pid kwarg
+
+    result = runner.invoke(cli, ["daemon", "stop"])
+    assert result.exit_code == 1
+    assert "no recorded pid" in result.output.lower()

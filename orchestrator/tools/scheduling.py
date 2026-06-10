@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from orchestrator import state
 from orchestrator.models import CANCELLED_UNIT_STATUSES, READY_TO_MERGE_STATUSES
 from orchestrator.tools import ensure_verified_for_feature, mcp
-from orchestrator.tools.execution import cycle_review_blocking, spawn_unit
+from orchestrator.tools.execution import cycle_review, spawn_unit
 
 
 @mcp.tool()
@@ -137,6 +136,15 @@ def _run_one(feature_id: str, unit_id: str) -> dict:
     """Spawn + cycle-review one unit. Used by both parallel tools.
 
     Returns a result dict whether the unit succeeded, failed, or errored.
+
+    F-016 Phase 5: the thread pool that used to wrap this helper has been
+    retired — daemon-driven concurrency (proposal § Phase 5: "Delete
+    parallel_units / parallel_units_global thread-pool internals once
+    daemon-driven concurrency proves itself in production") handles the
+    fan-out now. ``cycle_review`` auto-routes async vs. blocking via the
+    Phase 4 dispatcher (``NTFY_TOPIC`` + daemon health), so the parallel
+    callers walk the same engine the chat persona does without a parallel
+    blocking path.
     """
     try:
         spawn_result = spawn_unit(feature_id, unit_id)
@@ -164,14 +172,12 @@ def _run_one(feature_id: str, unit_id: str) -> dict:
         }
 
     try:
-        # Phase 4 default-flip aware: thread-pool callers always want
-        # blocking semantics, so route through the explicit blocking
-        # variant. Otherwise an NTFY-configured workspace would have
-        # every parallel job return ≤2 s with the daemon doing the
-        # real work — the pool would "finish" while the units were
-        # still in flight, breaking the JSON shape downstream consumers
-        # (parallel_units / parallel_units_global response) expect.
-        cycle_result = cycle_review_blocking(feature_id, unit_id)
+        # F-016 Phase 4 dispatcher: ``cycle_review`` is async when
+        # ``NTFY_TOPIC`` + the daemon are live, blocking otherwise.
+        # Both branches return JSON ``_emit_terminal`` produces (success
+        # or escalation) OR the async handoff envelope, so downstream
+        # consumers see a parseable dict either way.
+        cycle_result = cycle_review(feature_id, unit_id)
         cy = json.loads(cycle_result)
     except Exception as e:  # noqa: BLE001
         return {
@@ -187,26 +193,52 @@ def _run_one(feature_id: str, unit_id: str) -> dict:
         "unit_id": unit_id,
         "pr_url": sp.get("pr_url"),
         "pr_number": sp.get("pr_number"),
+        # ``cy`` may be either the terminal-emit JSON (``outcome``
+        # populated, ``approved_awaiting_merge`` / ``escalated`` on the
+        # blocking path) OR the Phase 4 async-handoff envelope
+        # (``delivered=True``, ``mode='async_daemon'``, ``outcome``
+        # absent — the daemon will drive the unit to terminal and ntfy
+        # will push on completion). Pass both through so the lead can
+        # tell the difference; downstream callers that key on
+        # ``cycle_outcome`` see ``None`` for the async branch, which is
+        # the right signal that "the unit isn't done yet — wait for
+        # the ntfy push".
         "cycle_outcome": cy.get("outcome"),
         "cycle_message": cy.get("message"),
+        "cycle_mode": cy.get("mode"),
+        "cycle_delivered": cy.get("delivered"),
     }
+
+
+# F-016 Phase 5: the ``max_concurrent`` parameter is retained on both
+# parallel surfaces for callsite compatibility (CLAUDE.md's scheduling
+# rule and the lead persona still pass it), but it's now a no-op — the
+# daemon owns fan-out. Documented on each tool so a curious caller sees
+# why the knob doesn't change behavior.
 
 
 @mcp.tool()
 def parallel_units(feature_id: str, unit_ids: list[str], max_concurrent: int = 3) -> str:
-    """Spawn + cycle-review multiple units in parallel within ONE feature.
+    """Spawn + cycle-review multiple units within ONE feature.
 
-    BLOCKS until all done. Up to `max_concurrent` (default 3, hard cap 5)
-    run simultaneously via a thread pool.
+    Use after ``next_ready_units`` returns 2+ ready units in a single
+    feature. Each unit walks ``spawn_unit`` + ``cycle_review`` in turn;
+    when the F-016 watcher daemon is running and ``NTFY_TOPIC`` is set,
+    ``cycle_review`` hands off to the daemon (≤2 s per dispatch) and
+    actual fan-out is daemon-driven. Without those, each call falls back
+    to blocking ``cycle_review_blocking`` semantics — slower, but
+    correct.
 
-    Use after `next_ready_units` returns 2+ ready units in a single feature.
-    Significantly faster than serial spawn_unit + cycle_review.
+    The ``max_concurrent`` argument is kept for callsite compatibility
+    (proposal § Phase 5 retires the thread pool but the lead persona
+    still passes the knob); concurrency is delegated to the daemon's
+    poll loop now and the value is otherwise unused.
 
     Caveats:
-    - Cap of 5 to stay within Anthropic rate limits
     - Does NOT validate dependencies — call next_ready_units first
-    - Independent unit failures don't affect siblings
+    - Independent unit failures don't affect siblings (each is a try/except)
     """
+    del max_concurrent  # daemon owns fan-out; retained for callsite compat
     if not unit_ids:
         return json.dumps({"error": "no unit_ids provided"})
 
@@ -214,18 +246,12 @@ def parallel_units(feature_id: str, unit_ids: list[str], max_concurrent: int = 3
     if err := ensure_verified_for_feature(feature_id):
         return json.dumps({"error": err})
 
-    max_workers = min(max_concurrent, len(unit_ids), 5)
-    results: list[dict] = []
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(_run_one, feature_id, uid): uid for uid in unit_ids}
-        for fut in as_completed(futures):
-            results.append(fut.result())
+    results = [_run_one(feature_id, uid) for uid in unit_ids]
 
     return json.dumps(
         {
             "feature_id": feature_id,
             "unit_count": len(unit_ids),
-            "max_concurrent": max_workers,
             "results": results,
         },
         indent=2,
@@ -234,16 +260,25 @@ def parallel_units(feature_id: str, unit_ids: list[str], max_concurrent: int = 3
 
 @mcp.tool()
 def parallel_units_global(unit_refs: list[dict], max_concurrent: int = 3) -> str:
-    """Run units from MULTIPLE features in parallel. BLOCKS until all done.
+    """Run units from MULTIPLE features.
 
-    unit_refs: list of {"feature_id": ..., "unit_id": ...} dicts.
+    ``unit_refs``: list of ``{"feature_id": ..., "unit_id": ...}`` dicts.
 
-    Use after `next_ready_units_all` when the ready list spans multiple
-    features. Saturates the concurrency budget evenly across features
-    rather than blocking on one at a time.
+    Use after ``next_ready_units_all`` when the ready list spans multiple
+    features. Each unit walks ``spawn_unit`` + ``cycle_review`` in turn;
+    when the F-016 watcher daemon is running and ``NTFY_TOPIC`` is set,
+    ``cycle_review`` hands off to the daemon (≤2 s per dispatch) and
+    actual fan-out is daemon-driven. Without those, each call falls back
+    to blocking ``cycle_review_blocking`` semantics.
 
-    Cap of 5 max_concurrent. Independent unit failures don't affect siblings.
+    The ``max_concurrent`` argument is kept for callsite compatibility
+    (proposal § Phase 5 retires the thread pool but the lead persona
+    still passes the knob); concurrency is delegated to the daemon's
+    poll loop now and the value is otherwise unused.
+
+    Independent unit failures don't affect siblings.
     """
+    del max_concurrent  # daemon owns fan-out; retained for callsite compat
     if not unit_refs:
         return json.dumps({"error": "no unit_refs provided"})
 
@@ -272,17 +307,11 @@ def parallel_units_global(unit_refs: list[dict], max_concurrent: int = 3) -> str
             indent=2,
         )
 
-    max_workers = min(max_concurrent, len(unit_refs), 5)
-    results: list[dict] = []
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(_run_one, ref["feature_id"], ref["unit_id"]): ref for ref in unit_refs}
-        for fut in as_completed(futures):
-            results.append(fut.result())
+    results = [_run_one(ref["feature_id"], ref["unit_id"]) for ref in unit_refs]
 
     return json.dumps(
         {
             "unit_count": len(unit_refs),
-            "max_concurrent": max_workers,
             "results": results,
         },
         indent=2,
