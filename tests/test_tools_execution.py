@@ -164,6 +164,15 @@ class TestSpawnUnit:
         assert "not in plan" in msg
 
     def test_unit_already_has_coder(self, tmp_state_db):
+        """F-016-U-9 ghost-row guard refuses re-spawn on an active row.
+
+        The pre-U-9 guard fired on ``existing.coder_session_id != ""``,
+        but a failed blocking spawn never persisted the session id, so
+        the row stayed re-spawnable. The new guard is status-based —
+        any status in ``{coding, opening_pr, in_ci, testing, reviewing,
+        fixing, escalated}`` refuses, regardless of whether
+        ``coder_session_id`` was written.
+        """
         _setup_feature()
         state.upsert_unit_state(
             WorkUnitState(
@@ -174,7 +183,11 @@ class TestSpawnUnit:
             )
         )
         msg = execution.spawn_unit("F-001", "F-001-U-1")
-        assert "already has coder session" in msg
+        assert "ERROR" in msg
+        assert "status='coding'" in msg
+        # Caller is pointed at the right recovery surfaces.
+        assert "cancel_unit" in msg
+        assert "inspect_unit_health" in msg
 
     def test_missing_github_token(self, tmp_state_db, no_github_token):
         _setup_feature()

@@ -76,6 +76,84 @@ def _snapshot_interval_hours() -> int:
 
 
 # ---------------------------------------------------------------------------
+# F-016-U-9: ci_drift_detected dedupe.
+#
+# The 2026-06-10 incident triage surfaced a second anti-loop defect: a unit
+# parked in_ci with persistently-red CI was re-emitting ``ci_drift_detected``
+# on every ~6s daemon poll (no dedupe). Hammered the GitHub API and bloated
+# unit_events with hundreds of identical rows.
+#
+# Dedupe rules (both must agree to write a new row):
+#   1. **Failing-check-set changed.** If the failing checks for THIS probe
+#      match the most-recent prior ci_drift_detected row, the situation has
+#      not evolved and the event is a no-op.
+#   2. **Rate-limit window expired.** Same as ``health_report_snapshot``,
+#      governed by ``ORCH_HEALTH_SNAPSHOT_INTERVAL_HOURS``. A re-emit fires
+#      only when the prior drift row is older than the window OR the set
+#      changes.
+# ---------------------------------------------------------------------------
+
+
+def _parse_failing_set(details: str) -> frozenset[str]:
+    """Extract the failing check-set from a ``ci_drift_detected`` event's details.
+
+    The producer writes ``f"failing checks: {', '.join(failing)}"``; this
+    helper is the inverse. Returns an empty set when ``details`` doesn't
+    match (a malformed legacy row, or a future details-format change) —
+    that yields a conservative "treat as different set" outcome, so a
+    real drift always fires through.
+    """
+    prefix = "failing checks: "
+    if not details.startswith(prefix):
+        return frozenset()
+    payload = details[len(prefix) :].strip()
+    if not payload:
+        return frozenset()
+    return frozenset(item.strip() for item in payload.split(",") if item.strip())
+
+
+def _should_emit_ci_drift(unit_state: WorkUnitState, action: Action) -> bool:
+    """F-016-U-9 dedupe: emit ``ci_drift_detected`` only on a real change.
+
+    Returns ``True`` when EITHER the failing-check-set differs from the
+    last ``ci_drift_detected`` row for this unit OR the prior row is
+    older than ``ORCH_HEALTH_SNAPSHOT_INTERVAL_HOURS`` (the same rate-
+    limit window the snapshot path uses, so the two surfaces share a
+    single throttle knob).
+
+    The first ``ci_drift_detected`` for a unit (no prior row) always
+    fires — there's nothing to dedupe against.
+    """
+    interval = _snapshot_interval_hours()
+    now = datetime.now(UTC)
+    incoming = _parse_failing_set(action.details)
+    events = state.list_events(unit_state.unit_id)
+    for ev in reversed(events):  # most-recent first
+        if ev.get("event_type") != "ci_drift_detected":
+            continue
+        prior_set = _parse_failing_set(ev.get("details") or "")
+        if prior_set != incoming:
+            return True  # set changed → real drift evolution → emit
+        if interval <= 0:
+            # Rate-limit disabled — still respect set-equality (which
+            # just failed), so unchanged-set + disabled-throttle is a
+            # no-op. This preserves the dedupe-by-content guarantee
+            # while letting operators opt-out of the time window.
+            return False
+        ts = ev.get("ts") or ""
+        try:
+            normalized = ts.replace("Z", "+00:00") if ts.endswith("Z") else ts
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            # Unparseable timestamp on the prior row — treat the prior
+            # as out-of-window so a real drift always re-surfaces.
+            return True
+        age = now.timestamp() - parsed.timestamp()
+        return age >= interval * 3600
+    return True  # no prior ci_drift_detected row — first emit always fires
+
+
+# ---------------------------------------------------------------------------
 # Production clients — minimal wiring around the existing github helpers.
 # Methods we can't satisfy from today's :mod:`orchestrator.github` surface
 # return empty / safe defaults; the protocol still type-checks and the
@@ -213,6 +291,16 @@ def _apply_action(unit_state: WorkUnitState, action: Action) -> None:
         return
 
     if action.kind == "event" and action.event_type:
+        # F-016-U-9: throttle ``ci_drift_detected`` so a persistently-red
+        # PR doesn't generate one event + GitHub-API storm per ~6s
+        # daemon poll. The check_runs round-trip already happened by the
+        # time we reach here — the dedupe just suppresses the
+        # ``unit_events`` row AND the ``last_error`` rewrite when the
+        # failing-check-set is unchanged within the rate-limit window.
+        if action.event_type == "ci_drift_detected" and not _should_emit_ci_drift(
+            unit_state, action
+        ):
+            return
         if action.set_last_error:
             state.touch_unit(unit_state.unit_id, error=action.set_last_error)
         state.record_event(
