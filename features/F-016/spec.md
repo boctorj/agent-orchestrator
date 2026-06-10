@@ -79,10 +79,26 @@ harness during rollout. F-015 should be marked `obsoleted-by F-016`.
   (`address_review_async`, `spawn_tester_async`, `spawn_reviewer_async`).
   Each surface keeps an explicit `_blocking`/`_async` variant; only the
   default flips. Depends on U-7.
+- **F-016-U-9 — Spawn ghost-row guard + retry cap (anti-loop
+  hardening).** Born from a live incident (2026-06-10): U-7 was
+  re-spawned ~6× over 12 h, each blocking spawn dying on a
+  managed-agents network read-timeout after 45–60 min and never
+  persisting a `session_id`, so the row stayed re-spawnable forever.
+  `spawn_unit`'s only idempotency check is non-empty
+  `coder_session_id` ([execution.py:128]), which a failed spawn never
+  sets. Fix: refuse re-spawn on a row already in
+  `{coding,opening_pr,in_ci,testing,reviewing,fixing,escalated}`
+  (point caller at `inspect_unit_health`/`cancel_unit`), plus a
+  3-attempt cap that escalates + ntfy instead of looping. Applies to
+  `spawn_unit` + `spawn_unit_async`. Safety/idempotency fix, NOT the
+  transport cure (async in U-7/U-8 fixes the timeout itself). No deps;
+  ships ahead of U-7/U-8 (U-8 rebases its dispatcher onto this guard).
+  Incident stopgap until merged: U-7's `coder_session_id` set to a
+  `GHOST-LOOP-HALTED-*` sentinel so the existing guard refuses spawns.
 
 ## Acceptance
 
-When all eight units merge:
+When all nine units merge:
 1. `spawn_unit`, `address_review`, `spawn_tester`, `spawn_reviewer`,
    `send_to_unit`, `cycle_review`, `parallel_units{,_global}` all return
    in ≤3s under NTFY+daemon (U-8 — not just `cycle_review`).
