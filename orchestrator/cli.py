@@ -402,7 +402,7 @@ def daemon_stop() -> None:
     pid = row.get("pid")
     if not isinstance(pid, int) or pid <= 0:
         console.print(
-            f"[red]Lock row exists for {path} but has no recorded pid.[/red]\n"
+            f"[red]Lock row exists for {path} but has no recorded pid.[/red]\n"  # noqa: S608  # nosec B608
             f"  holder_id={row.get('holder_id')} heartbeat_at={row.get('heartbeat_at')}\n"
             f"  Likely a pre-F-016-U-7 daemon — use `orchestrator daemon status` "
             f"to read the holder, then either kill the process manually + "
