@@ -25,6 +25,7 @@ import time
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
+from typing import Any
 
 import click
 from rich.console import Console
@@ -197,16 +198,32 @@ def _start_daemon_detached(console: Console) -> None:
         )
         return
 
+    # POSIX gets ``start_new_session=True`` so the daemon detaches from
+    # the chat session's controlling terminal (a Ctrl-C in the lead won't
+    # propagate to the daemon's process group). Windows has no concept
+    # of POSIX sessions and rejects ``start_new_session`` with
+    # ``ValueError``; the equivalent there is the ``CREATE_NEW_PROCESS_GROUP``
+    # creation flag (subprocess module constant), which puts the child
+    # in its own process group so it doesn't receive a Ctrl-C delivered
+    # to the lead.
+    detach_kwargs: dict[str, Any]
+    if sys.platform == "win32":
+        # ``CREATE_NEW_PROCESS_GROUP`` is defined on Windows only; the
+        # ``getattr`` guard keeps mypy happy on the POSIX type stub.
+        detach_kwargs = {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+    else:
+        detach_kwargs = {"start_new_session": True}
+
     try:
         proc = subprocess.Popen(  # nosec B603 — argv list, no shell; sys.executable is trusted  # noqa: S603
             [sys.executable, "-m", "orchestrator.daemon"],
             stdout=log_handle,
             stderr=log_handle,
             stdin=subprocess.DEVNULL,
-            start_new_session=True,  # decouple from the chat session
             close_fds=True,
             cwd=os.getcwd(),
             env=dict(os.environ),
+            **detach_kwargs,
         )
     except OSError as exc:
         console.print(
@@ -411,8 +428,15 @@ def daemon_stop() -> None:
         f"[yellow]Daemon ignored SIGTERM for {_DAEMON_STOP_TIMEOUT_S:.0f}s. "
         f"Escalating to SIGKILL pid {pid}…[/yellow]"
     )
+    # ``signal.SIGKILL`` is POSIX-only; Windows treats ``os.kill`` with
+    # ``signal.SIGTERM`` itself as a forceful terminate (it calls
+    # ``TerminateProcess`` under the hood). Resolve the strongest
+    # available signal at call time so the type checker (which sees
+    # ``signal.SIGKILL`` undefined on Windows) and the Windows runtime
+    # both stay happy.
+    kill_signal: int = getattr(_signal, "SIGKILL", _signal.SIGTERM)
     try:
-        os.kill(pid, _signal.SIGKILL)
+        os.kill(pid, kill_signal)
     except ProcessLookupError:
         # Race — it died after SIGTERM but before we sent SIGKILL.
         state.release_daemon_lock(path, row.get("holder_id", ""))

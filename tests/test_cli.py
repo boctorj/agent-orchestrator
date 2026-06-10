@@ -502,6 +502,10 @@ def test_daemon_stop_sigterm_clears_lock(runner, tmp_path, monkeypatch):
     assert "stopped" in result.output.lower()
 
 
+@pytest.mark.skipif(
+    not hasattr(__import__("signal"), "SIGKILL"),
+    reason="SIGKILL is POSIX-only; on Windows the fallback path uses SIGTERM (already covered by test_daemon_stop_sigterm_clears_lock)",
+)
 def test_daemon_stop_sigkill_fallback(runner, tmp_path, monkeypatch):
     """When the daemon ignores SIGTERM, ``stop`` escalates to SIGKILL
     after the 10s window (we shrink the timeout in tests)."""
