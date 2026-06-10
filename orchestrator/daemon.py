@@ -228,34 +228,47 @@ def reset_worker_cache() -> None:
 #   → no-op).
 #
 #   It does NOT block the "cross-cycle re-entry with the same session
-#   id" case: a unit that has progressed past ``testing`` and then
-#   returns to ``testing`` in a later cycle with the **same**
+#   id" case on its own: a unit that has progressed past ``testing``
+#   and then returns to ``testing`` in a later cycle with the **same**
 #   ``tester_session_id`` would re-fire the original ``TESTS_PASS`` on
 #   the next daemon scan (the source status is satisfied, the marker
-#   payload is still on the tail). That gap is currently unreachable
-#   in production because the lead's re-entry helpers
-#   (``orchestrator.tools.execution._tester_phase`` and friends) clear
-#   the role's ``<role>_session_id`` before re-spawning when the agent
-#   returns to an upstream status in a new cycle — so cycle N+1's
-#   tester runs in a fresh session with no prior ``TESTS_PASS`` in its
-#   tail.
+#   payload is still on the tail).
 #
-#   **Caller contract:** when the orchestrator re-enters an upstream
-#   active status in a new cycle (e.g. ``reviewing → fixing → testing``
-#   on a tester-found bug), it MUST clear ``<role>_session_id`` before
-#   the role's worker is re-spawned. A future F-016-U-6 / F-016-U-7
-#   change that resumes an existing session instead of cold-starting
-#   on cycle re-entry MUST tighten this fence further (the proposed
-#   ``unit_events`` dedupe-key lookup in PR #61 review thread M1 is
-#   the natural follow-up) or the cross-cycle backflip becomes
-#   reachable. The
+#   That gap WAS historically unreachable because the lead's re-entry
+#   helpers (``orchestrator.tools.execution._tester_phase`` and
+#   friends) cleared the role's ``<role>_session_id`` before re-
+#   spawning. **F-018 Stage 4 broke that invariant** — the daemon-
+#   driven autonomous loop closure re-enters ``reviewing`` while
+#   reusing the existing ``reviewer_session_id`` (to preserve the
+#   F-013 delta-review context the session already has loaded).
+#   Without further protection, the persistent OLD
+#   ``REVIEW_RECOMMEND_MERGE`` on the reviewer's tail would re-fire
+#   ``reviewing → approved_awaiting_merge`` before the reviewer's
+#   actual delta-review verdict on the new SHA lands.
+#
+#   **Closed via dedupe-gate in ``reconcile_unit`` Stage 1 (PR #66 N1):**
+#   ``_apply_marker_transition`` is now only invoked when
+#   ``_record_marker`` returned True (i.e., the
+#   ``unit_events.dedupe_key`` UNIQUE INSERT landed — a fresh marker).
+#   A persistent OLD marker re-observed on a later tick collapses to
+#   ``INSERT OR IGNORE → False``, the gate skips
+#   ``_apply_marker_transition``, and the transition does not re-fire.
+#   This is the "proposed ``unit_events`` dedupe-key lookup" the
+#   original docstring named as the natural follow-up, now landed.
+#
+#   **Caller contract (still recommended even with the dedupe-gate):**
+#   when the orchestrator re-enters an upstream active status in a
+#   new cycle (e.g. ``reviewing → fixing → testing`` on a tester-
+#   found bug) AND the marker payload genuinely needs to change
+#   between cycles, the lead's helpers SHOULD still clear
+#   ``<role>_session_id`` before the role's worker is re-spawned —
+#   the dedupe-gate guards against re-applying a stale marker, but a
+#   fresh session with no prior marker in its tail is the cleaner
+#   surface for downstream debugging. The
 #   ``tests/test_f016_u5_tester_extras.py::TestStaleMarkerNoBackflip``
-#   suite covers the in-scope downstream-status case; the cross-cycle
-#   invariant is documented (here) rather than test-pinned at this
-#   layer — pinning it would require a contract test on
-#   ``orchestrator.tools.execution._tester_phase`` /
-#   ``_reviewer_phase``, which is the right home for the assertion and
-#   the natural sibling of the U-6/U-7 fence work.
+#   suite covers the in-scope downstream-status case;
+#   ``tests/test_daemon.py::TestStage1DedupeGate`` covers the
+#   cross-cycle re-entry case the dedupe-gate now blocks.
 _MARKER_SOURCE_STATUSES: dict[tuple[str, str], frozenset[str]] = {
     ("coder", "PR_URL"): frozenset({"coding", "opening_pr"}),
     ("coder", "FIX_PUSHED"): frozenset({"coding", "opening_pr", "fixing"}),
@@ -980,7 +993,22 @@ def reconcile_unit(unit_id: str) -> None:
         spec, sid = _scan_role(unit, role)
         if spec is None or not sid:
             continue
-        _record_marker(unit, spec, sid)
+        # PR #66 N1: gate the status flip on ``_record_marker`` returning
+        # True (dedupe insert landed). A persistent marker that has
+        # already been recorded must NOT re-fire ``_apply_marker_transition``
+        # on a subsequent tick — that is precisely the cross-cycle
+        # backflip the source-status-fence comment at
+        # ``_MARKER_SOURCE_STATUSES`` calls out as "reachable once Stage 4
+        # re-enters reviewing with the same reviewer_session_id". Stage 4
+        # (F-018 autonomous loop closure) is the path that violates the
+        # original caller contract; this dedupe-gate closes the race by
+        # treating the unit_events.dedupe_key UNIQUE constraint as the
+        # source of truth for "this marker has already been applied".
+        # The fence docstring at L222-258 names this as the natural
+        # follow-up ("the proposed unit_events dedupe-key lookup in
+        # PR #61 review thread M1 is the natural follow-up").
+        if not _record_marker(unit, spec, sid):
+            continue
         if _apply_marker_transition(unit_id, spec):
             unit = state.get_unit_state(unit_id) or unit
             if not _is_actionable(unit):

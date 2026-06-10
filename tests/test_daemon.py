@@ -1581,3 +1581,309 @@ class TestDaemonDeltaReviewDispatch:
         # mechanical rebase. conflict_fix_attempts captured the one rebase round.
         assert got.review_round == 0
         assert got.conflict_fix_attempts == 1
+
+
+class TestStage1DedupeGate:
+    """PR #66 N1 — Stage 1 must only fire ``_apply_marker_transition`` when
+    ``_record_marker`` returned True (the ``unit_events.dedupe_key`` UNIQUE
+    INSERT landed). A persistent OLD marker on the worker's tail that has
+    already been recorded must NOT re-fire the transition on a later tick.
+
+    The race the dedupe-gate closes: F-018 Stage 4 re-enters ``reviewing``
+    while reusing the existing ``reviewer_session_id``. The reviewer's
+    tail still carries the pre-rebase ``REVIEW_RECOMMEND_MERGE`` until
+    the agent finishes processing the delta-review prompt (30s-5min on
+    Managed Agents). Without the gate, the daemon's next tick would
+    re-fire ``reviewing → approved_awaiting_merge`` on that stale marker
+    BEFORE the reviewer's actual delta-review verdict on the new SHA
+    lands — and if the new verdict is ``REVIEW_REQUEST_CHANGES``, the
+    unit strands at ``approved_awaiting_merge`` on a stale endorsement.
+    """
+
+    def _make_tail(self, text: str) -> _FakeTailResult:
+        return _FakeTailResult(
+            status="idle",
+            messages=[{"ts": "2026-06-09T00:00:00", "role": "agent", "text": text}],
+        )
+
+    def test_persistent_marker_does_not_re_fire_transition(self, tmp_state_db, monkeypatch):
+        """The literal N1 trace: a marker that has already been recorded
+        (dedupe-key hit on the second observation) must NOT cause
+        ``_apply_marker_transition`` to fire a second time, even when
+        the unit has cycled through an intermediate status and the
+        source-status fence happens to accept the marker again.
+        """
+        # Seed a unit in ``reviewing`` with a reviewer session.
+        unit = _seed(
+            unit_id="U-RACE",
+            feature_id="F-RACE",
+            status="reviewing",
+            sessions={"reviewer": "sr"},
+            pr_number=7,
+        )
+
+        # The reviewer's tail carries an OLD REVIEW_RECOMMEND_MERGE that
+        # the daemon already processed in a previous tick — simulate the
+        # already-recorded state by directly calling ``_record_marker``
+        # once with the same content the scan path will see.
+        marker_text = "all clean\nREVIEW_RECOMMEND_MERGE: ship it"
+
+        class _PersistentTailWorker:
+            tail_calls: list[str] = []
+
+            def tail_messages(self, sid: str, *, limit: int = 50):  # noqa: ARG002
+                # Same tail every call — the persistent marker stays
+                # there for the lifetime of the session.
+                self.tail_calls.append(sid)
+                return _FakeTailResult(
+                    status="idle",
+                    messages=[{"ts": "2026-06-09T00:00:00", "role": "agent", "text": marker_text}],
+                )
+
+        worker = _PersistentTailWorker()
+        monkeypatch.setattr("orchestrator.daemon.make_worker", lambda _r: worker)
+        # No F-014 transitions; we are testing Stage 1 only.
+        monkeypatch.setattr(daemon, "_probe_and_decide_unit", lambda _u: [])
+
+        # Tick 1: the daemon picks up the marker, records it, and flips
+        # status. The unit lands at approved_awaiting_merge.
+        daemon.reconcile_unit(unit.unit_id)
+        got = state.get_unit_state(unit.unit_id)
+        assert got is not None
+        assert got.status == "approved_awaiting_merge"
+
+        # Simulate Stage 4: the daemon flips status back to ``reviewing``
+        # (delta-review dispatched) while the reviewer's tail STILL
+        # carries the same persistent marker. The session_id is
+        # unchanged — Stage 4 reuses the existing session.
+        state.touch_unit(unit.unit_id, status="reviewing")
+
+        # Tick 2: Stage 1 scans the same tail, sees the same marker.
+        # The dedupe-key on the second ``record_event`` call must
+        # collapse to INSERT OR IGNORE → False, and the gate must skip
+        # ``_apply_marker_transition``. Status stays at ``reviewing``.
+        daemon.reconcile_unit(unit.unit_id)
+        got = state.get_unit_state(unit.unit_id)
+        assert got is not None
+        assert got.status == "reviewing", (
+            f"PR #66 N1: persistent OLD marker must NOT re-fire the "
+            f"transition after Stage 4 re-entry (would land on stale "
+            f"endorsement before the reviewer's delta verdict arrives); "
+            f"got status={got.status!r}"
+        )
+
+        # Audit: the reviewer_recommend_merge event landed exactly once.
+        events = state.list_events(unit.unit_id)
+        rows = [e for e in events if e["event_type"] == "reviewer_recommend_merge"]
+        assert len(rows) == 1, (
+            f"the persistent marker must record exactly one audit row "
+            f"across both ticks (dedupe-key collapses the second insert); "
+            f"got {len(rows)} rows"
+        )
+
+    def test_fresh_marker_after_persistent_one_still_fires(self, tmp_state_db, monkeypatch):
+        """The dedupe-gate must NOT block a legitimately new marker. When
+        the reviewer's delta-review eventually emits a NEW verdict on
+        the new SHA, the dedupe key changes (the marker payload differs)
+        and the transition fires normally."""
+        unit = _seed(
+            unit_id="U-DG",
+            feature_id="F-DG",
+            status="reviewing",
+            sessions={"reviewer": "sr"},
+            pr_number=8,
+        )
+
+        tail_state = {"text": "all clean\nREVIEW_RECOMMEND_MERGE: ship it"}
+
+        class _UpdatingTailWorker:
+            def tail_messages(self, sid: str, *, limit: int = 50):  # noqa: ARG002
+                return _FakeTailResult(
+                    status="idle",
+                    messages=[
+                        {"ts": "2026-06-09T00:00:00", "role": "agent", "text": tail_state["text"]}
+                    ],
+                )
+
+        worker = _UpdatingTailWorker()
+        monkeypatch.setattr("orchestrator.daemon.make_worker", lambda _r: worker)
+        monkeypatch.setattr(daemon, "_probe_and_decide_unit", lambda _u: [])
+
+        # Tick 1: original marker → approved_awaiting_merge.
+        daemon.reconcile_unit(unit.unit_id)
+        assert state.get_unit_state(unit.unit_id).status == "approved_awaiting_merge"
+
+        # Stage 4 dispatch happens (status flipped back to reviewing).
+        state.touch_unit(unit.unit_id, status="reviewing")
+
+        # Tick 2 with the same tail: dedupe blocks re-fire.
+        daemon.reconcile_unit(unit.unit_id)
+        assert state.get_unit_state(unit.unit_id).status == "reviewing"
+
+        # The reviewer's actual delta verdict lands — a NEW marker with
+        # a different payload (different reason text) lands on the tail.
+        tail_state["text"] = (
+            "delta review on rebased HEAD\n"
+            "REVIEW_RECOMMEND_MERGE: prior findings all resolved on new SHA"
+        )
+
+        # Tick 3: the new marker has a fresh dedupe key (payload
+        # differs) → record returns True → transition fires →
+        # approved_awaiting_merge.
+        daemon.reconcile_unit(unit.unit_id)
+        got = state.get_unit_state(unit.unit_id)
+        assert got is not None
+        assert got.status == "approved_awaiting_merge", (
+            f"the dedupe-gate must NOT block a legitimately fresh marker; got status={got.status!r}"
+        )
+
+        # Two distinct reviewer_recommend_merge rows in the audit log.
+        events = state.list_events(unit.unit_id)
+        rows = [e for e in events if e["event_type"] == "reviewer_recommend_merge"]
+        assert len(rows) == 2, (
+            f"each distinct marker payload must produce its own audit row; got {len(rows)}"
+        )
+
+    def test_stage4_then_persistent_marker_does_not_premature_terminal(
+        self, tmp_state_db, monkeypatch
+    ):
+        """Higher-fidelity simulation of the N1 trace: the daemon's own
+        Stage 4 dispatch is what re-enters ``reviewing``, and the
+        persistent OLD marker is on the same reviewer session the
+        delta-review will reuse. Before the dedupe-gate, this would
+        flip the unit to ``approved_awaiting_merge`` on the stale
+        endorsement; after the gate, status stays at ``reviewing``
+        until the reviewer's actual delta verdict arrives.
+
+        Setup mirrors production ordering: the daemon's original
+        ``_record_marker`` for the OLD endorsement happens FIRST (when
+        the reviewer first emitted during the original ``cycle_review``
+        run), the coder's rebase ``fix_pushed`` event lands AFTER, so
+        ``stale_marker.detect_stale_reviewer_marker`` correctly
+        classifies as ``stale``.
+        """
+        import time as _time
+
+        from orchestrator import markers as _markers
+        from orchestrator.models import WorkUnit
+
+        # Manually build the unit + feature + plan; we need precise
+        # control over event ordering for the stale-marker classifier.
+        state.save_feature(
+            Feature(
+                id="F-PRE",
+                title="t",
+                description="d",
+                repo_path="https://github.com/o/r",
+                status="approved",
+            )
+        )
+        state.save_plan(
+            "F-PRE", [WorkUnit(id="U-PRE", feature_id="F-PRE", title="u", description="d")]
+        )
+        state.approve_plan("F-PRE")
+        state.upsert_unit_state(
+            WorkUnitState(
+                unit_id="U-PRE",
+                feature_id="F-PRE",
+                status="in_ci",
+                branch="feat/x",
+                pr_number=11,
+                coder_session_id="sc",
+                reviewer_session_id="sr",
+            )
+        )
+
+        persistent_marker = "all clean\nREVIEW_RECOMMEND_MERGE: ship it"
+
+        # Step 1: simulate the daemon's ORIGINAL observation of the
+        # reviewer marker (during the pre-conflict cycle_review run).
+        # Use the daemon's own ``_record_marker`` so the dedupe key
+        # matches what a later scan will compute.
+        unit_for_initial = state.get_unit_state("U-PRE")
+        assert unit_for_initial is not None
+        old_spec = _markers.scan_response("reviewer", persistent_marker)
+        assert old_spec is not None
+        daemon._record_marker(unit_for_initial, old_spec, "sr")
+
+        # Step 2: simulate the coder's rebase push (the F-018 conflict-
+        # fix flow that landed on tick 0). The ``fix_pushed`` event's
+        # ts MUST be greater than the reviewer event's ts so the stale-
+        # marker classifier sees a later coder push.
+        _time.sleep(0.01)  # ensure ts ordering on coarse-grained clocks
+        state.record_event(
+            "U-PRE",
+            "F-PRE",
+            "fix_pushed",
+            source="coder",
+            cycle_number=0,
+            summary="rebased on main; resolved sibling.py",
+            details="",
+            dedupe_key="fix_pushed:U-PRE:rebase",
+        )
+
+        class _Stage4SimWorker:
+            def __init__(self) -> None:
+                self.coder_resume_calls: list[tuple[str, str]] = []
+                self.reviewer_resume_calls: list[tuple[str, str]] = []
+
+            def resume_async(self, sid: str, msg: str) -> None:
+                # Stage 4 calls resume_async on the reviewer; Stage 3
+                # would call it on the coder (not exercised here).
+                if "DELTA RE-REVIEW" in msg:
+                    self.reviewer_resume_calls.append((sid, msg))
+                else:
+                    self.coder_resume_calls.append((sid, msg))
+
+            def tail_messages(self, sid: str, *, limit: int = 50):  # noqa: ARG002
+                # Only the reviewer's tail carries the persistent OLD
+                # marker; the coder's tail is empty (the rebase already
+                # landed in the seed).
+                if sid == "sr":
+                    return _FakeTailResult(
+                        status="idle",
+                        messages=[
+                            {
+                                "ts": "2026-06-09T00:00:00",
+                                "role": "agent",
+                                "text": persistent_marker,
+                            }
+                        ],
+                    )
+                return _FakeTailResult()
+
+        worker = _Stage4SimWorker()
+        monkeypatch.setattr("orchestrator.daemon.make_worker", lambda _r: worker)
+        monkeypatch.setattr(
+            "orchestrator.github.get_pr_state",
+            lambda url, pr: {"head_sha": "rebased"},
+        )
+        monkeypatch.setattr(daemon, "_probe_and_decide_unit", lambda _u: [])
+
+        # Tick 1: Stage 1 dedupes the OLD marker (same dedupe key as
+        # the original observation), gate skips the transition. Stage 4
+        # detects the stale-marker case (later coder push) and
+        # dispatches the delta-review, flipping status to ``reviewing``.
+        daemon.reconcile_unit("U-PRE")
+        got = state.get_unit_state("U-PRE")
+        assert got is not None
+        assert got.status == "reviewing", (
+            f"tick 1: Stage 4 must transition in_ci → reviewing; got {got.status}"
+        )
+        # The reviewer was resumed asynchronously with the delta prompt.
+        assert len(worker.reviewer_resume_calls) == 1
+
+        # Tick 2: the reviewer is still processing the delta prompt
+        # (would take 30s-5min in production); the tail STILL carries
+        # only the OLD persistent marker. Without the dedupe-gate, the
+        # daemon would flip status to approved_awaiting_merge on the
+        # stale endorsement here — that is the N1 bug.
+        daemon.reconcile_unit("U-PRE")
+        got = state.get_unit_state("U-PRE")
+        assert got is not None
+        assert got.status == "reviewing", (
+            f"PR #66 N1: tick 2 must NOT flip to approved_awaiting_merge "
+            f"on the stale OLD marker — only the reviewer's actual "
+            f"delta-verdict on the new SHA may drive the transition. "
+            f"got status={got.status!r}"
+        )
