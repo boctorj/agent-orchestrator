@@ -526,12 +526,13 @@ def test_daemon_stop_sigkill_fallback(runner, tmp_path, monkeypatch):
     kill_calls = []
 
     def fake_kill(pid, sig):
+        # Neither signal clears the lock: a SIGKILL'd daemon is reaped
+        # by the kernel WITHOUT running its `finally: release_singleton`
+        # cleanup, so the row stays until the stop command releases it
+        # itself. (The old test cleared the lock inside fake_kill on
+        # SIGKILL, which simulated impossible kernel behavior and masked
+        # the orphan-lock bug — reviewer C1.)
         kill_calls.append((pid, sig))
-        # SIGTERM: ignored. SIGKILL: clear the lock (simulating the
-        # OS reaping the process and the next claim_daemon_lock
-        # taking over the stale row).
-        if sig == _signal.SIGKILL:
-            state.release_daemon_lock(path, "fake-holder")
 
     monkeypatch.setattr(_os, "kill", fake_kill)
 
@@ -541,11 +542,19 @@ def test_daemon_stop_sigkill_fallback(runner, tmp_path, monkeypatch):
     signals = [s for _, s in kill_calls]
     assert _signal.SIGTERM in signals
     assert _signal.SIGKILL in signals
+    # The stop command — not the (uncatchable) SIGKILL — cleared the row.
+    assert state.get_daemon_lock(path) is None
 
 
 def test_daemon_stop_kill_failed_exit_2(runner, tmp_path, monkeypatch):
-    """When SIGKILL also fails to clear the lock, exit 2 (per spec)."""
+    """Exit 2 when the lock row is still present after SIGKILL because a
+    fresh daemon took over the workspace — the stop command's holder-
+    scoped release no-ops on the holder mismatch, so we must NOT report
+    a clean stop. (Post-C1: with the daemon dead and no takeover, the
+    stop command always clears its own orphan row and exits 0, so the
+    only remaining exit-2 path is the takeover hazard.)"""
     import os as _os
+    import signal as _signal
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("orchestrator.state.STATE_DB", tmp_path / "state.db")
@@ -557,11 +566,22 @@ def test_daemon_stop_kill_failed_exit_2(runner, tmp_path, monkeypatch):
     path = str(state.STATE_DB.resolve())
     state.claim_daemon_lock(path, "fake-holder", pid=99997)
 
-    # Both SIGTERM and SIGKILL ignored — lock stays.
-    monkeypatch.setattr(_os, "kill", lambda pid, sig: None)
+    def fake_kill(pid, sig):
+        # SIGTERM ignored. On SIGKILL, simulate a fresh daemon taking
+        # over the workspace: the original holder's row is replaced by a
+        # new holder. The stop command's release (scoped to the original
+        # "fake-holder") then no-ops and the new holder's row persists.
+        if sig == _signal.SIGKILL:
+            state.release_daemon_lock(path, "fake-holder")
+            state.claim_daemon_lock(path, "new-holder", pid=88888)
+
+    monkeypatch.setattr(_os, "kill", fake_kill)
 
     result = runner.invoke(cli, ["daemon", "stop"])
     assert result.exit_code == 2, result.output
+    # The new holder's row is untouched by the holder-scoped release.
+    row = state.get_daemon_lock(path)
+    assert row is not None and row.get("holder_id") == "new-holder"
 
 
 def test_daemon_stop_no_pid_recorded(runner, tmp_path, monkeypatch):

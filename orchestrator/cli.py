@@ -473,10 +473,22 @@ def daemon_stop() -> None:
         console.print(f"[red]Permission denied SIGKILLing pid {pid}.[/red]")
         raise SystemExit(2) from None
 
+    # SIGKILL bypasses the daemon's signal handler, so the
+    # ``finally: release_singleton`` cleanup at the bottom of
+    # ``DaemonLoop.run`` never executes — the killed process cannot
+    # release its own lock row. The stop command must do it. Holder-
+    # scoped (same as the two ProcessLookupError branches above): if a
+    # fresh daemon took over the workspace via stale-heartbeat takeover,
+    # ``release_daemon_lock`` no-ops on the holder mismatch and the
+    # verify below surfaces that as exit 2 rather than a false success.
+    state.release_daemon_lock(path, row.get("holder_id", ""))
     if _wait_for_daemon_lock_clear(path, timeout_s=_DAEMON_STOP_AFTER_KILL_S):
         console.print("[green]✓ daemon killed (SIGKILL)[/green]")
         raise SystemExit(0)
-    console.print("[red]Lock row still present after SIGKILL — manual cleanup required.[/red]")
+    console.print(
+        "[red]Lock row still present after SIGKILL — another daemon took over "
+        "the workspace. Re-run `orchestrator daemon stop` against the new holder.[/red]"
+    )
     raise SystemExit(2)
 
 

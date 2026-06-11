@@ -3154,7 +3154,7 @@ _CYCLE_REVIEW_ASYNC_HANDOFF_MSG = (
     "(in_ci → done once the human merges, escalation on conflict/CI "
     "drift). Spawning the next-phase worker (tester after coder, "
     "reviewer after tester) is NOT yet driven by the daemon — that "
-    "ships with F-016-U-7. Until then, advance the unit through testing "
+    "ships with F-016-U-8. Until then, advance the unit through testing "
     "/ reviewing with advance_to_tester / advance_to_reviewer / "
     "advance_to_terminal (or call cycle_review_blocking for the full "
     "pipeline)."
@@ -3167,8 +3167,9 @@ terminal and ntfy will push on completion", but the U-5 daemon
 (:func:`~orchestrator.daemon._scan_role`) and applies F-014 actions via
 :func:`orchestrator.tools.health._apply_action`; it does not call
 :func:`spawn_tester` / :func:`spawn_reviewer` / the ``advance_to_*``
-phase commands. End-to-end drive ships with U-7's
-``orchestrator/cycle/phases.py`` extraction. Tell the truth here so a
+phase commands. U-7 only created the ``orchestrator/cycle/phases.py``
+re-export shim; daemon-side spawning of next-phase workers (end-to-end
+drive) ships with F-016-U-8. Tell the truth here so a
 user who reads the response on a unit stuck in ``in_ci`` knows the
 right next step."""
 
