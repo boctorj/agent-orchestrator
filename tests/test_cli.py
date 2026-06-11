@@ -546,6 +546,10 @@ def test_daemon_stop_sigkill_fallback(runner, tmp_path, monkeypatch):
     assert state.get_daemon_lock(path) is None
 
 
+@pytest.mark.skipif(
+    not hasattr(__import__("signal"), "SIGKILL"),
+    reason="SIGKILL is POSIX-only; on Windows the fallback path collapses to SIGTERM, so the SIGKILL-takeover path under test does not apply.",
+)
 def test_daemon_stop_kill_failed_exit_2(runner, tmp_path, monkeypatch):
     """Exit 2 when the lock row is still present after SIGKILL because a
     fresh daemon took over the workspace — the stop command's holder-
