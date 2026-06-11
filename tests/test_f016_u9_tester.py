@@ -68,9 +68,7 @@ NON_GUARDED_STATUSES = ("pending", "cancelled", "done", "approved_awaiting_merge
 def _bypass_verify_gate(monkeypatch, tmp_state_db):
     """``ensure_verified_for_feature`` is enforced before any spawn —
     bypass it so the test exercises the U-9 guard, not the verify gate."""
-    monkeypatch.setattr(
-        "orchestrator.tools.execution.ensure_verified_for_feature", lambda _f: None
-    )
+    monkeypatch.setattr("orchestrator.tools.execution.ensure_verified_for_feature", lambda _f: None)
     monkeypatch.setattr("orchestrator.tools.execution.ensure_verified_for_unit", lambda _u: None)
 
 
@@ -209,14 +207,10 @@ def _capture_pushes(monkeypatch) -> list[dict]:
     pushes: list[dict] = []
 
     def _capture(unit_id: str, reason: str, *args, reason_slug: str = "unknown", **kwargs):
-        pushes.append(
-            {"unit_id": unit_id, "reason": reason, "reason_slug": reason_slug}
-        )
+        pushes.append({"unit_id": unit_id, "reason": reason, "reason_slug": reason_slug})
         return True
 
-    monkeypatch.setattr(
-        "orchestrator.tools.execution.ntfy.push_escalation", _capture
-    )
+    monkeypatch.setattr("orchestrator.tools.execution.ntfy.push_escalation", _capture)
     return pushes
 
 
@@ -236,9 +230,7 @@ class TestGhostRowGuard:
     """
 
     @pytest.mark.parametrize("status", GUARDED_STATUSES)
-    def test_blocking_spawn_refuses_active_status(
-        self, tmp_state_db, monkeypatch, status
-    ):
+    def test_blocking_spawn_refuses_active_status(self, tmp_state_db, monkeypatch, status):
         """``spawn_unit`` MUST refuse re-spawn on every active + escalated status."""
         _seed_plan()
         # No coder_session_id — the ghost-row scenario.
@@ -257,16 +249,12 @@ class TestGhostRowGuard:
         assert _AlwaysFailingBlockingWorker.calls == 0
 
     @pytest.mark.parametrize("status", GUARDED_STATUSES)
-    def test_async_spawn_refuses_active_status(
-        self, tmp_state_db, monkeypatch, status
-    ):
+    def test_async_spawn_refuses_active_status(self, tmp_state_db, monkeypatch, status):
         """``spawn_unit_async`` MUST mirror the blocking refusal."""
         _seed_plan()
         _seed_row(UNIT_ID, status=status)
         _AlwaysFailingAsyncWorker.calls = 0
-        monkeypatch.setattr(
-            "orchestrator.tools.execution.make_worker", _AlwaysFailingAsyncWorker
-        )
+        monkeypatch.setattr("orchestrator.tools.execution.make_worker", _AlwaysFailingAsyncWorker)
 
         msg = execution.spawn_unit_async(FEATURE_ID, UNIT_ID)
 
@@ -274,9 +262,7 @@ class TestGhostRowGuard:
         assert repr(status) in msg
         assert _AlwaysFailingAsyncWorker.calls == 0
 
-    def test_refusal_message_points_at_recovery_surfaces(
-        self, tmp_state_db, monkeypatch
-    ):
+    def test_refusal_message_points_at_recovery_surfaces(self, tmp_state_db, monkeypatch):
         """The error MUST point the caller at ``inspect_unit_health`` /
         ``resume_unit`` (check real state) and ``cancel_unit`` (reset).
 
@@ -296,9 +282,9 @@ class TestGhostRowGuard:
         assert "cancel_unit" in msg, "refusal must mention cancel_unit"
         # The spec mentions BOTH check primitives; at least one must
         # appear so the user knows how to verify before resetting.
-        assert (
-            "inspect_unit_health" in msg or "resume_unit" in msg
-        ), "refusal must mention inspect_unit_health or resume_unit"
+        assert "inspect_unit_health" in msg or "resume_unit" in msg, (
+            "refusal must mention inspect_unit_health or resume_unit"
+        )
 
     def test_guard_preserves_existing_session_id(self, tmp_state_db, monkeypatch):
         """A refused re-spawn MUST NOT clobber ``coder_session_id``.
@@ -309,9 +295,7 @@ class TestGhostRowGuard:
         """
         _seed_plan()
         _seed_row(UNIT_ID, status="coding", coder_session_id="sesn-precious")
-        monkeypatch.setattr(
-            "orchestrator.tools.execution.make_worker", _AlwaysFailingAsyncWorker
-        )
+        monkeypatch.setattr("orchestrator.tools.execution.make_worker", _AlwaysFailingAsyncWorker)
 
         execution.spawn_unit_async(FEATURE_ID, UNIT_ID)
 
@@ -335,9 +319,7 @@ class TestCleanFirstSpawnSucceeds:
         """The lead's first spawn (no work_units row yet) must work."""
         _seed_plan()
         worker = _SucceedingAsyncWorker("coder")
-        monkeypatch.setattr(
-            "orchestrator.tools.execution.make_worker", lambda _r: worker
-        )
+        monkeypatch.setattr("orchestrator.tools.execution.make_worker", lambda _r: worker)
 
         msg = execution.spawn_unit_async(FEATURE_ID, UNIT_ID)
 
@@ -355,9 +337,7 @@ class TestCleanFirstSpawnSucceeds:
         _seed_plan()
         _seed_row(UNIT_ID, status=status)
         worker = _SucceedingAsyncWorker("coder")
-        monkeypatch.setattr(
-            "orchestrator.tools.execution.make_worker", lambda _r: worker
-        )
+        monkeypatch.setattr("orchestrator.tools.execution.make_worker", lambda _r: worker)
 
         msg = execution.spawn_unit_async(FEATURE_ID, UNIT_ID)
 
@@ -391,9 +371,7 @@ def test_cancel_then_redispatch_works(tmp_state_db, monkeypatch):
 
     # Re-dispatch — the guard must NOT refuse a cancelled row.
     worker = _SucceedingAsyncWorker("coder")
-    monkeypatch.setattr(
-        "orchestrator.tools.execution.make_worker", lambda _r: worker
-    )
+    monkeypatch.setattr("orchestrator.tools.execution.make_worker", lambda _r: worker)
 
     msg = execution.spawn_unit_async(FEATURE_ID, UNIT_ID)
 
@@ -418,9 +396,7 @@ class TestSpawnFailureCap:
     a spawn successfully persists a session_id.
     """
 
-    def _force_failures(
-        self, monkeypatch, *, n: int, bypass_guard_between: bool = True
-    ) -> None:
+    def _force_failures(self, monkeypatch, *, n: int, bypass_guard_between: bool = True) -> None:
         """Drive ``n`` consecutive failed blocking spawns. The ghost-row
         guard would otherwise refuse attempts 2..n; ``cancel_unit``
         between attempts simulates a caller bypassing guard 1 so the
@@ -449,8 +425,7 @@ class TestSpawnFailureCap:
         self._force_failures(monkeypatch, n=SPAWN_CAP_EXPECTED - 1)
 
         cap_events = [
-            e for e in state.list_events(UNIT_ID)
-            if e["event_type"] == "spawn_failure_cap_hit"
+            e for e in state.list_events(UNIT_ID) if e["event_type"] == "spawn_failure_cap_hit"
         ]
         cap_pushes = [p for p in pushes if p["reason_slug"] == "spawn_failure_cap"]
         assert cap_events == [], f"cap event must NOT fire before threshold: {cap_events!r}"
@@ -513,13 +488,11 @@ class TestSpawnFailureCap:
         msg = execution.spawn_unit(FEATURE_ID, UNIT_ID)
         assert msg.startswith("ERROR")
         assert "'escalated'" in msg
-        assert (
-            _AlwaysFailingBlockingWorker.calls == baseline_calls
-        ), "guard must short-circuit before the worker is invoked"
+        assert _AlwaysFailingBlockingWorker.calls == baseline_calls, (
+            "guard must short-circuit before the worker is invoked"
+        )
 
-    def test_counter_resets_after_successful_async_spawn(
-        self, tmp_state_db, monkeypatch
-    ):
+    def test_counter_resets_after_successful_async_spawn(self, tmp_state_db, monkeypatch):
         """Counter MUST reset once a spawn writes a session_id.
 
         Spec § U-9: "Counter resets once a spawn successfully persists
@@ -536,9 +509,7 @@ class TestSpawnFailureCap:
         # Cancel + successful async spawn → persists session_id.
         state.cancel_unit(UNIT_ID)
         worker = _SucceedingAsyncWorker("coder")
-        monkeypatch.setattr(
-            "orchestrator.tools.execution.make_worker", lambda _r: worker
-        )
+        monkeypatch.setattr("orchestrator.tools.execution.make_worker", lambda _r: worker)
         assert "ERROR" not in execution.spawn_unit_async(FEATURE_ID, UNIT_ID)
 
         # Counter is now zero — the session-bearing row is the reset signal.
@@ -548,9 +519,7 @@ class TestSpawnFailureCap:
         cap_pushes = [p for p in pushes if p["reason_slug"] == "spawn_failure_cap"]
         assert cap_pushes == []
 
-    def test_counter_resets_after_successful_blocking_pr_open(
-        self, tmp_state_db, monkeypatch
-    ):
+    def test_counter_resets_after_successful_blocking_pr_open(self, tmp_state_db, monkeypatch):
         """Counter MUST reset after the blocking happy-path ``pr_opened`` row.
 
         The blocking path's reset signal is the ``pr_opened`` event,
@@ -569,9 +538,7 @@ class TestSpawnFailureCap:
         # Cancel + successful blocking spawn → records pr_opened with session_id.
         state.cancel_unit(UNIT_ID)
         worker = _SucceedingBlockingWorker("coder")
-        monkeypatch.setattr(
-            "orchestrator.tools.execution.ManagedAgentWorker", lambda role: worker
-        )
+        monkeypatch.setattr("orchestrator.tools.execution.ManagedAgentWorker", lambda role: worker)
         msg = execution.spawn_unit(FEATURE_ID, UNIT_ID)
         assert "ERROR" not in msg, msg
 
@@ -589,9 +556,7 @@ class TestSpawnFailureCap:
         _seed_plan()
         pushes = _capture_pushes(monkeypatch)
         _AlwaysFailingAsyncWorker.calls = 0
-        monkeypatch.setattr(
-            "orchestrator.tools.execution.make_worker", _AlwaysFailingAsyncWorker
-        )
+        monkeypatch.setattr("orchestrator.tools.execution.make_worker", _AlwaysFailingAsyncWorker)
 
         for i in range(SPAWN_CAP_EXPECTED):
             execution.spawn_unit_async(FEATURE_ID, UNIT_ID)
@@ -599,8 +564,7 @@ class TestSpawnFailureCap:
                 state.cancel_unit(UNIT_ID)
 
         cap_events = [
-            e for e in state.list_events(UNIT_ID)
-            if e["event_type"] == "spawn_failure_cap_hit"
+            e for e in state.list_events(UNIT_ID) if e["event_type"] == "spawn_failure_cap_hit"
         ]
         cap_pushes = [p for p in pushes if p["reason_slug"] == "spawn_failure_cap"]
         assert len(cap_events) == 1
@@ -663,15 +627,10 @@ class TestCiDriftDedupe:
         unit = _seed_unit_in_state()
         tools_health._apply_action(unit, _drift(["test"]))
 
-        rows = [
-            e for e in state.list_events(UNIT_ID)
-            if e["event_type"] == "ci_drift_detected"
-        ]
+        rows = [e for e in state.list_events(UNIT_ID) if e["event_type"] == "ci_drift_detected"]
         assert len(rows) == 1
 
-    def test_repeated_unchanged_set_within_window_is_suppressed(
-        self, tmp_state_db, monkeypatch
-    ):
+    def test_repeated_unchanged_set_within_window_is_suppressed(self, tmp_state_db, monkeypatch):
         """Spec § Tests: "ci_drift_detected emitted at most once for an
         unchanged failing-check-set across repeated daemon ticks."
 
@@ -682,10 +641,7 @@ class TestCiDriftDedupe:
         for _ in range(10):
             tools_health._apply_action(unit, _drift(["test"]))
 
-        rows = [
-            e for e in state.list_events(UNIT_ID)
-            if e["event_type"] == "ci_drift_detected"
-        ]
+        rows = [e for e in state.list_events(UNIT_ID) if e["event_type"] == "ci_drift_detected"]
         assert len(rows) == 1
 
     def test_changed_failing_set_re_emits(self, tmp_state_db, monkeypatch):
@@ -699,10 +655,7 @@ class TestCiDriftDedupe:
         tools_health._apply_action(unit, _drift(["test", "lint"]))
         tools_health._apply_action(unit, _drift(["lint"]))
 
-        rows = [
-            e for e in state.list_events(UNIT_ID)
-            if e["event_type"] == "ci_drift_detected"
-        ]
+        rows = [e for e in state.list_events(UNIT_ID) if e["event_type"] == "ci_drift_detected"]
         assert len(rows) == 3
         details = {r["details"] for r in rows}
         assert "failing checks: test" in details
@@ -731,10 +684,7 @@ class TestCiDriftDedupe:
 
         tools_health._apply_action(unit, _drift(["test"]))
 
-        rows = [
-            e for e in state.list_events(UNIT_ID)
-            if e["event_type"] == "ci_drift_detected"
-        ]
+        rows = [e for e in state.list_events(UNIT_ID) if e["event_type"] == "ci_drift_detected"]
         assert len(rows) == 2
 
     def test_dedupe_suppresses_last_error_rewrite(self, tmp_state_db, monkeypatch):
@@ -799,10 +749,7 @@ class TestCiDriftDedupe:
         for _ in range(5):
             tools_health.inspect_unit_health(UNIT_ID)
 
-        rows = [
-            e for e in state.list_events(UNIT_ID)
-            if e["event_type"] == "ci_drift_detected"
-        ]
+        rows = [e for e in state.list_events(UNIT_ID) if e["event_type"] == "ci_drift_detected"]
         assert len(rows) == 1, (
             f"5 inspect_unit_health calls produced {len(rows)} ci_drift_detected "
             f"events; expected exactly 1 (dedupe broken)"
@@ -832,10 +779,7 @@ class TestCiDriftDedupe:
         for _ in range(10):
             daemon.reconcile_unit(UNIT_ID)
 
-        rows = [
-            e for e in state.list_events(UNIT_ID)
-            if e["event_type"] == "ci_drift_detected"
-        ]
+        rows = [e for e in state.list_events(UNIT_ID) if e["event_type"] == "ci_drift_detected"]
         assert len(rows) == 1, (
             f"10 daemon ticks produced {len(rows)} ci_drift_detected events; "
             f"expected exactly 1 (dedupe broken at daemon-tick layer)"
