@@ -42,10 +42,19 @@ orchestrator init
 # 3. Verify everything is ready
 orchestrator doctor
 
-# 4. Launch Claude Code with the lead
+# 4. Launch Claude Code + the watcher daemon (one command)
 orchestrator run
+```
 
-# 5. In another terminal — live dashboard
+When `ORCH_DAEMON_DRIVE=true` is in `.env`, `orchestrator run` auto-spawns
+the F-016 watcher daemon as a detached child process (it survives the
+chat session's death by design — see
+[`docs/DAEMON.md`](docs/DAEMON.md)). Stop it later with
+`orchestrator daemon stop`. The live TUI dashboard remains a separate
+process for terminal-split viewing:
+
+```bash
+# In another terminal — live dashboard
 orchestrator dashboard
 ```
 
@@ -66,8 +75,11 @@ The `orchestrator init` wizard prompts for:
 | Command | What it does |
 |---|---|
 | `orchestrator init` | Interactive setup wizard (writes `.env`, initializes `state.db`) |
-| `orchestrator doctor` | Health check — 10 checks across env, tokens, claude CLI, package |
-| `orchestrator run` | Launches Claude Code with `--remote-control` and clean env |
+| `orchestrator doctor` | Health check — env, tokens, claude CLI, package, plus F-016-U-7 env-vs-`.env` shadowing audit |
+| `orchestrator run` | Launches Claude Code with `--remote-control` and clean env; when `ORCH_DAEMON_DRIVE=true` also spawns the F-016 watcher daemon as a detached child |
+| `orchestrator daemon start` | Run the watcher daemon in the foreground (operator-controlled supervisor setup) |
+| `orchestrator daemon status` | Show the workspace's daemon-lock holder + heartbeat |
+| `orchestrator daemon stop` | SIGTERM the running daemon, wait up to 10 s, SIGKILL fallback |
 | `orchestrator dashboard` | Live TUI dashboard (~2s refresh, Ctrl+C to quit) |
 | `orchestrator verify-repo <url>` | Run + cache the branch-protection / approvals / no-bypass policy check for a target repo (24h TTL); required before any spawn |
 | `orchestrator version` | Print installed version |

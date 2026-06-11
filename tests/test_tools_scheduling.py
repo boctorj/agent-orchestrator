@@ -114,27 +114,20 @@ def test_next_ready_units_all_empty(tmp_state_db):
 # --------------------------- parallel_units + parallel_units_global ---------------------------
 
 
-def _make_fake_one(call_log, log_lock, sleep_s=0.1, barrier=None):
-    """Create a fake do_one that mimics a successful spawn+cycle.
+def _make_fake_one(call_log, log_lock):
+    """Create a fake ``_run_one`` that records each call.
 
-    When ``barrier`` is supplied, each invocation blocks on it before
-    returning, so every pooled task is provably in-flight simultaneously.
-    That makes the "distinct threads used" assertion deterministic:
-    ``ThreadPoolExecutor(max_workers=N)`` treats N as a *ceiling*, so a
-    task that finishes before the pool lazily spins up the Nth worker may
-    legally reuse an idle thread — yielding <N distinct ids and a flake on
-    slow runners (seen on windows-py3.11). Gating every task on the
-    barrier forces one live thread per concurrent task. The timeout turns
-    a genuine concurrency regression (serial execution) into a loud
-    failure instead of a hang.
+    F-016 Phase 5 retired the thread-pool fan-out (``parallel_units`` /
+    ``parallel_units_global`` no longer use ``ThreadPoolExecutor`` —
+    daemon-driven concurrency handles the fan-out via ``cycle_review``'s
+    Phase 4 async dispatch). This fake records each ``_run_one`` call so
+    tests can assert (a) every unit was dispatched and (b) the calls
+    happened on the caller's thread (no pool was spun up).
     """
 
     def fake(*args, **kwargs):
         with log_lock:
             call_log.append((threading.get_ident(), time.time()))
-        if barrier is not None:
-            barrier.wait(timeout=5.0)
-        time.sleep(sleep_s)
         return {
             "feature_id": args[0] if args else kwargs.get("feature_id", "F"),
             "unit_id": args[1] if len(args) > 1 else kwargs.get("unit_id", "U"),
@@ -153,40 +146,38 @@ def test_parallel_units_empty(tmp_state_db):
     assert "error" in parsed
 
 
-def test_parallel_units_runs_concurrently(tmp_state_db, monkeypatch):
+def test_parallel_units_dispatches_every_unit_serially(tmp_state_db, monkeypatch):
+    """F-016 Phase 5: no thread pool. The dispatcher walks every unit on
+    the caller's thread; daemon-driven concurrency owns fan-out."""
     call_log = []
     log_lock = threading.Lock()
-    barrier = threading.Barrier(3)
-    fake = _make_fake_one(call_log, log_lock, sleep_s=0.2, barrier=barrier)
+    fake = _make_fake_one(call_log, log_lock)
     monkeypatch.setattr(scheduling, "_run_one", fake)
 
-    start = time.time()
     out = scheduling.parallel_units("F-001", ["U1", "U2", "U3"], max_concurrent=3)
-    elapsed = time.time() - start
-
     parsed = json.loads(out)
     assert parsed["unit_count"] == 3
-    assert parsed["max_concurrent"] == 3
-    # 3 units × 0.2s each = 0.6s serial; parallel should be ~0.2s. Threshold
-    # sits below 0.6s (real serial regression) but above the per-thread
-    # startup cost macOS/Windows CI runners pay on cold pools — 0.5s was
-    # tight enough to flake on slower runners (seen on PR #47 cycle 4).
-    assert elapsed < 0.55
-    # Three distinct threads used
+    assert len(parsed["results"]) == 3
+    # All calls happen on the caller's thread — proof the thread pool is gone.
     thread_ids = {t for t, _ in call_log}
-    assert len(thread_ids) == 3
+    assert thread_ids == {threading.get_ident()}
 
 
-def test_parallel_units_caps_concurrency_at_5(tmp_state_db, monkeypatch):
-    fake = _make_fake_one([], threading.Lock(), sleep_s=0.0)
+def test_parallel_units_max_concurrent_is_noop(tmp_state_db, monkeypatch):
+    """``max_concurrent`` is retained for callsite compatibility (the
+    lead persona still passes it) but the daemon owns fan-out now, so
+    the value doesn't change behavior — the response intentionally
+    omits the legacy ``max_concurrent`` key."""
+    fake = _make_fake_one([], threading.Lock())
     monkeypatch.setattr(scheduling, "_run_one", fake)
 
     out = scheduling.parallel_units(
         "F-001", ["U1", "U2", "U3", "U4", "U5", "U6", "U7"], max_concurrent=100
     )
     parsed = json.loads(out)
-    # Cap is min(max_concurrent, len(unit_ids), 5)
-    assert parsed["max_concurrent"] == 5
+    assert parsed["unit_count"] == 7
+    assert len(parsed["results"]) == 7
+    assert "max_concurrent" not in parsed
 
 
 def test_parallel_units_global_empty(tmp_state_db):
@@ -208,11 +199,12 @@ def test_parallel_units_global_rejects_bad_refs(tmp_state_db):
     assert "error" in json.loads(out)
 
 
-def test_parallel_units_global_runs_cross_feature_concurrent(tmp_state_db, monkeypatch):
+def test_parallel_units_global_dispatches_cross_feature_serially(tmp_state_db, monkeypatch):
+    """Same shape as the single-feature dispatcher — every ref is dispatched
+    on the caller's thread, no thread pool, daemon owns fan-out."""
     call_log = []
     log_lock = threading.Lock()
-    barrier = threading.Barrier(3)
-    fake = _make_fake_one(call_log, log_lock, sleep_s=0.15, barrier=barrier)
+    fake = _make_fake_one(call_log, log_lock)
     monkeypatch.setattr(scheduling, "_run_one", fake)
 
     refs = [
@@ -220,19 +212,13 @@ def test_parallel_units_global_runs_cross_feature_concurrent(tmp_state_db, monke
         {"feature_id": "F-002", "unit_id": "U-1"},
         {"feature_id": "F-003", "unit_id": "U-1"},
     ]
-    start = time.time()
     out = scheduling.parallel_units_global(refs, max_concurrent=3)
-    elapsed = time.time() - start
 
     parsed = json.loads(out)
     assert parsed["unit_count"] == 3
-    # ~0.15s parallel vs 0.45s serial. Threshold stays below the serial
-    # baseline (correct = strictly parallel) but loosened above 0.4s after
-    # PR #47 cycle 4 surfaced flakes on slower macOS / Windows runners
-    # where thread pool startup cost can land in the 0.4-0.5s window.
-    assert elapsed < 0.55
+    assert len(parsed["results"]) == 3
     thread_ids = {t for t, _ in call_log}
-    assert len(thread_ids) == 3
+    assert thread_ids == {threading.get_ident()}
 
 
 # --------------------------- _run_one internals ---------------------------
@@ -279,10 +265,10 @@ def test_run_one_cycle_raises(tmp_state_db, monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("cycle exploded")
 
-    # Thread-pool callers always block, so _run_one routes through the
-    # explicit blocking variant (F-016-U-6). Patch THAT symbol — patching
-    # the legacy dispatcher would no-op.
-    monkeypatch.setattr(scheduling, "cycle_review_blocking", boom)
+    # F-016 Phase 5: ``_run_one`` calls the Phase 4 dispatcher
+    # ``cycle_review`` (auto-routes async vs. blocking on ``NTFY_TOPIC`` +
+    # daemon health) — patching it here covers both branches.
+    monkeypatch.setattr(scheduling, "cycle_review", boom)
     out = scheduling._run_one("F-001", "U-X")
     assert out["phase"] == "cycle"
     assert "error" in out
@@ -296,7 +282,7 @@ def test_run_one_happy_path(tmp_state_db, monkeypatch):
     )
     monkeypatch.setattr(
         scheduling,
-        "cycle_review_blocking",
+        "cycle_review",
         lambda f, u: json.dumps({"outcome": "approved_awaiting_merge", "message": "ok"}),
     )
     out = scheduling._run_one("F-001", "U-X")

@@ -1,29 +1,48 @@
 """CLI entry point for the agent orchestrator.
 
 Subcommands:
-    orchestrator version     — show version
-    orchestrator doctor      — health check (verify env, tokens, claude CLI)
-    orchestrator init        — interactive setup wizard
-    orchestrator dashboard   — launch the live TUI dashboard
-    orchestrator run         — launch Claude Code with Remote Control
+    orchestrator version          — show version
+    orchestrator doctor           — health check (env + tokens + claude CLI + shadowing audit)
+    orchestrator init             — interactive setup wizard
+    orchestrator dashboard        — launch the live TUI dashboard
+    orchestrator run              — launch Claude Code (+ detached watcher daemon when opted in)
+    orchestrator daemon start     — run the F-016 watcher daemon in the foreground
+    orchestrator daemon status    — show the workspace's daemon-lock holder + heartbeat
+    orchestrator daemon stop      — SIGTERM (→ 10 s → SIGKILL fallback) the workspace daemon
+    orchestrator verify-repo URL  — run + cache the branch-protection policy check
 
 Install: `pip install -e .` from project root.
 """
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shutil
 import sys
+import time
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
+from typing import Any
 
 import click
 from rich.console import Console
 
+from orchestrator import env_guard
+
 PKG_NAME = "agent-orchestrator"
+
+# How long ``orchestrator run`` waits for the detached daemon's
+# ``daemon_locks`` row to appear before continuing to ``execvpe(claude)``.
+# Long enough for a fork + Python interpreter startup + SQLite write
+# (~1-2s on a cold cache); short enough that the chat banner doesn't
+# noticeably stall. The chat boots regardless of whether the daemon
+# actually claimed the lock — this is a courtesy "tell the user the
+# daemon's up" wait, not a hard prerequisite.
+_DAEMON_BOOTSTRAP_TIMEOUT_S = 5.0
+_DAEMON_BOOTSTRAP_POLL_S = 0.1
 
 
 def _silence_httpx_logging() -> None:
@@ -85,6 +104,187 @@ def _docker_daemon_warning() -> str | None:
     return None
 
 
+def _resolve_anthropic_key(env_file: Path) -> tuple[str, str]:
+    """Return ``(resolved, file_value)`` for the F-016-U-7 credential checks.
+
+    ``resolved`` is the value the MCP server / daemon will see:
+    ``ANTHROPIC_API_KEY`` from the process env if set, otherwise the
+    value parsed from ``env_file``. This mirrors python-dotenv's
+    ``load_dotenv(override=False)`` semantics without actually mutating
+    ``os.environ`` — the CLI runs in the same process as the test
+    suite, and a stray ``load_dotenv`` would pollute pytest's shared
+    process state across test cases.
+
+    ``file_value`` is the raw ``.env`` value (empty when the file is
+    missing or doesn't contain the key) so the diagnostic can name the
+    foot-gun source.
+    """
+    file_value = env_guard.read_env_file_values(env_file).get("ANTHROPIC_API_KEY", "")
+    resolved = os.environ.get("ANTHROPIC_API_KEY", "") or file_value
+    return resolved, file_value
+
+
+def _guard_anthropic_key(console: Console, *, label: str) -> bool:
+    """Validate ``ANTHROPIC_API_KEY`` shape; print a diagnostic and return False on bad.
+
+    F-016-U-7 credential hardening (b): every orchestrator entry point
+    that will spawn workers refuses to start if the resolved
+    ``ANTHROPIC_API_KEY`` doesn't match the well-known ``sk-ant-``
+    prefix. Composes :func:`env_guard.is_valid_anthropic_key` with the
+    spec-mandated diagnostic so a stale shell-rc export shadowing a
+    valid ``.env`` key produces an actionable error instead of an
+    opaque Anthropic 401 minutes later.
+
+    Returns False when the check fails so the caller can pick its own
+    exit code (``orchestrator run`` uses 1, ``daemon start`` uses 4 —
+    distinct from the other ``daemon start`` codes for systemd /
+    launchd branching).
+    """
+    resolved, file_value = _resolve_anthropic_key(Path(".env"))
+    if env_guard.is_valid_anthropic_key(resolved):
+        return True
+    diag = env_guard.anthropic_key_diagnostic(resolved, file_value)
+    console.print(f"[red]✗ {label}: {diag}[/red]")
+    return False
+
+
+def _start_daemon_detached(console: Console) -> None:
+    """F-016-U-7 unified bootstrap: spawn the watcher daemon as a detached child.
+
+    Called from ``orchestrator run`` when ``ORCH_DAEMON_DRIVE=true``.
+    The daemon survives the chat session's death by design (spec
+    § "Open questions": "Separate process, not an MCP subprocess —
+    decoupled lifetimes so a killed lead doesn't kill the watcher").
+
+    Behavior:
+
+      * If a daemon already holds the workspace's lock, print a one-liner
+        with the existing holder's ``started_at`` and no-op.
+      * Otherwise, ``subprocess.Popen([sys.executable, "-m",
+        "orchestrator.daemon"], start_new_session=True)`` with
+        stdout/stderr redirected to ``daemon.log`` in the workspace.
+      * Wait up to ``_DAEMON_BOOTSTRAP_TIMEOUT_S`` for the lock row to
+        appear so the banner can confirm the daemon claimed it.
+        Whether or not the lock lands within the budget, the chat
+        boots — the wait is a courtesy, not a prerequisite.
+
+    Loud failures (file-open error on ``daemon.log``, Popen raises) are
+    surfaced as a one-line warning so the operator can fix and re-run
+    ``orchestrator daemon start`` manually; the chat continues to boot
+    in the soft-fail case because the daemon was opt-in to begin with.
+    """
+    from orchestrator import state
+
+    state.init_db()  # need the table before reading daemon_locks
+    path = str(state.STATE_DB.resolve())
+    existing = state.get_daemon_lock(path)
+    if existing is not None:
+        started = existing.get("started_at") or "?"
+        console.print(f"[dim]daemon already running (started at {started})[/dim]")
+        return
+
+    # Lazy-import subprocess so the rest of the CLI doesn't pay its
+    # import cost (and a future security audit of the launcher chain
+    # sees one explicit Popen callsite, not a module-level import).
+    import subprocess  # noqa: PLC0415  # nosec B404 — the whole helper is a Popen
+
+    log_path = Path("daemon.log").resolve()
+    try:
+        log_handle = open(log_path, "ab")  # noqa: SIM115 — keep open across Popen
+    except OSError as exc:
+        console.print(
+            f"[yellow]could not open {log_path} for daemon log "
+            f"({exc.__class__.__name__}: {exc}); daemon not started[/yellow]"
+        )
+        return
+
+    # POSIX gets ``start_new_session=True`` so the daemon detaches from
+    # the chat session's controlling terminal (a Ctrl-C in the lead won't
+    # propagate to the daemon's process group). Windows has no concept
+    # of POSIX sessions and rejects ``start_new_session`` with
+    # ``ValueError``; the equivalent there is the ``CREATE_NEW_PROCESS_GROUP``
+    # creation flag (subprocess module constant), which puts the child
+    # in its own process group so it doesn't receive a Ctrl-C delivered
+    # to the lead.
+    detach_kwargs: dict[str, Any]
+    if sys.platform == "win32":
+        # ``CREATE_NEW_PROCESS_GROUP`` is defined on Windows only; the
+        # ``getattr`` guard keeps mypy happy on the POSIX type stub.
+        detach_kwargs = {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+    else:
+        detach_kwargs = {"start_new_session": True}
+
+    try:
+        proc = subprocess.Popen(  # nosec B603 — argv list, no shell; sys.executable is trusted  # noqa: S603
+            [sys.executable, "-m", "orchestrator.daemon"],
+            stdout=log_handle,
+            stderr=log_handle,
+            stdin=subprocess.DEVNULL,
+            close_fds=True,
+            cwd=os.getcwd(),
+            env=dict(os.environ),
+            **detach_kwargs,
+        )
+    except OSError as exc:
+        console.print(
+            f"[yellow]daemon spawn failed ({exc.__class__.__name__}: {exc}); "
+            f"chat continues without a watcher. Run `orchestrator daemon start` "
+            f"manually in another terminal to retry.[/yellow]"
+        )
+        return
+    finally:
+        # We hand the fd to the child via Popen above; close our copy so
+        # this process doesn't keep the log file referenced past spawn.
+        # ``file.close()`` is idempotent — the early-return paths above
+        # are safe to share this single cleanup.
+        with contextlib.suppress(OSError):
+            log_handle.close()
+
+    deadline = time.monotonic() + _DAEMON_BOOTSTRAP_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if state.get_daemon_lock(path) is not None:
+            console.print(f"[dim]daemon started (pid {proc.pid}, log: {log_path.name})[/dim]")
+            return
+        # ``poll()`` is None while the child is still alive. If it
+        # already exited (config error → exit 2 / lock-held → exit 3),
+        # surface that immediately rather than waiting out the budget.
+        ret = proc.poll()
+        if ret is not None:
+            console.print(
+                f"[yellow]daemon exited immediately (rc={ret}); "
+                f"see {log_path.name} for details[/yellow]"
+            )
+            return
+        time.sleep(_DAEMON_BOOTSTRAP_POLL_S)
+
+    # Timed out waiting for the lock. The daemon may still be coming
+    # up — don't crash the chat, just tell the operator what we saw.
+    console.print(
+        f"[yellow]daemon spawned (pid {proc.pid}) but no lock row visible "
+        f"after {_DAEMON_BOOTSTRAP_TIMEOUT_S:.1f}s; check {log_path.name}[/yellow]"
+    )
+
+
+def _daemon_drive_enabled(*, env_file: Path | None = None) -> bool:
+    """Coarse ``ORCH_DAEMON_DRIVE`` boolean — mirrors :func:`orchestrator.daemon.is_drive_enabled`.
+
+    Pulled into ``cli`` so ``orchestrator run`` can decide whether to
+    auto-spawn the watcher without importing ``orchestrator.daemon``
+    at module load (which would drag the worker / health graph onto
+    every ``--version`` / ``init`` / ``doctor`` invocation).
+
+    Reads the process env first; if not set there, falls back to
+    parsing ``env_file`` (since the daemon child process will load
+    ``.env`` on its own startup, the user's expectation is that
+    ``ORCH_DAEMON_DRIVE=true`` in ``.env`` is enough to trigger the
+    auto-bootstrap).
+    """
+    raw = os.environ.get("ORCH_DAEMON_DRIVE", "")
+    if not raw and env_file is not None:
+        raw = env_guard.read_env_file_values(env_file).get("ORCH_DAEMON_DRIVE", "")
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 @click.group(help="Multi-agent SDLC orchestrator.")
 @click.version_option(_version(), prog_name=PKG_NAME)
 def cli() -> None:
@@ -131,6 +331,13 @@ def daemon_start() -> None:
     / ``ORCH_DAEMON_DRIVE`` reach the loop. Without ``ORCH_DAEMON_DRIVE=true``
     the loop is a no-op (the daemon refuses to claim the lock).
 
+    Validates ``ANTHROPIC_API_KEY`` format before claiming the lock
+    (F-016-U-7 credential hardening): a stale shell-rc export
+    (``ANTHROPIC_API_KEY='lkj'``) that shadowed the ``.env`` value
+    would have produced opaque worker 401s on every tick; the daemon
+    refuses to start instead so the operator sees the foot-gun
+    immediately.
+
     Exit codes (operator-facing — branch on ``$?`` from a systemd /
     launchd / shell-script supervisor):
 
@@ -141,15 +348,180 @@ def daemon_start() -> None:
       * ``3`` — another daemon already owns this workspace's
         ``state.db`` lock. Same-workspace contention is a
         configuration error, not a transient.
+      * ``4`` — ``ANTHROPIC_API_KEY`` failed the format check (F-016-U-7).
     """
     from dotenv import load_dotenv
 
     from orchestrator import daemon as daemon_module
     from orchestrator import state
 
+    # ``daemon start`` runs as its own process in production (either
+    # the ``orchestrator run`` detached child or an operator's manual
+    # invocation), so the ``load_dotenv`` mutation is contained to
+    # that process. Validate the key against the resolved env after
+    # the load so a stale shell-rc export shadowing a valid ``.env``
+    # key fires the diagnostic.
     load_dotenv(dotenv_path=Path(".env"))
+    if not _guard_anthropic_key(Console(), label="orchestrator daemon start"):
+        raise SystemExit(4)
     state.init_db()
     raise SystemExit(daemon_module.exit_code_for_run(daemon_module.run_daemon()))
+
+
+@daemon.command("stop", help="Stop the running daemon (SIGTERM → 10s wait → SIGKILL).")
+def daemon_stop() -> None:
+    """Signal the workspace's daemon and wait for the lock row to clear.
+
+    Reads ``daemon_locks`` for the resolved ``state.STATE_DB`` path,
+    sends SIGTERM to the holder's PID, polls for the row to vanish for
+    up to ``_DAEMON_STOP_TIMEOUT_S`` (10 s), then falls back to SIGKILL
+    if the daemon ignored SIGTERM. F-016-U-7.
+
+    Exit codes (per spec):
+
+      * ``0`` — stopped cleanly (the SIGTERM path landed; the lock row
+        is gone).
+      * ``1`` — no daemon running for this workspace (no lock row, or
+        the row exists with no PID recorded).
+      * ``2`` — the daemon ignored SIGTERM AND SIGKILL within the
+        timeout, or the PID was already dead / not ours. Operator must
+        investigate (zombie, permission error, etc.).
+    """
+    import signal as _signal
+
+    from orchestrator import state
+
+    state.init_db()
+    console = Console()
+    path = str(state.STATE_DB.resolve())
+    row = state.get_daemon_lock(path)
+    if row is None:
+        console.print(f"[dim]No daemon running for {path}[/dim]")
+        raise SystemExit(1)
+
+    pid = row.get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        console.print(
+            f"[red]Lock row exists for {path} but has no recorded pid.[/red]\n"  # noqa: S608  # nosec B608
+            f"  holder_id={row.get('holder_id')} heartbeat_at={row.get('heartbeat_at')}\n"
+            f"  Likely a pre-F-016-U-7 daemon — use `orchestrator daemon status` "
+            f"to read the holder, then either kill the process manually + "
+            f'`sqlite3 state.db "DELETE FROM daemon_locks WHERE state_db_path = '
+            f"'{path}';\"` to clear the row, or wait for stale-heartbeat takeover "
+            f"on the next `orchestrator daemon start`."
+        )
+        raise SystemExit(1)
+
+    console.print(f"[dim]Sending SIGTERM to daemon pid {pid}…[/dim]")
+    try:
+        os.kill(pid, _signal.SIGTERM)
+    except ProcessLookupError:
+        # Process is gone — best-effort release of OUR row, then verify
+        # the workspace is actually clear before reporting success. A
+        # ``release_daemon_lock`` returning False (lock taken over
+        # mid-call by a fresh daemon) must NOT exit 0 — the new owner
+        # is alive and the operator's "stop" intent didn't land. See
+        # PR #67 Copilot finding on the original always-exit-0 branch.
+        state.release_daemon_lock(path, row.get("holder_id", ""))
+        if state.get_daemon_lock(path) is None:
+            console.print("[yellow]PID not alive — cleared stale lock row.[/yellow]")
+            raise SystemExit(0) from None
+        console.print(
+            "[red]PID not alive but lock row is still present "
+            "(another daemon took over the workspace between read and signal). "
+            "Re-run `orchestrator daemon stop` against the new holder.[/red]"
+        )
+        raise SystemExit(2) from None
+    except PermissionError:
+        console.print(f"[red]Permission denied signaling pid {pid}.[/red]")
+        raise SystemExit(2) from None
+
+    if _wait_for_daemon_lock_clear(path, timeout_s=_DAEMON_STOP_TIMEOUT_S):
+        console.print("[green]✓ daemon stopped[/green]")
+        raise SystemExit(0)
+
+    console.print(
+        f"[yellow]Daemon ignored SIGTERM for {_DAEMON_STOP_TIMEOUT_S:.0f}s. "
+        f"Escalating to SIGKILL pid {pid}…[/yellow]"
+    )
+    # ``signal.SIGKILL`` is POSIX-only; Windows treats ``os.kill`` with
+    # ``signal.SIGTERM`` itself as a forceful terminate (it calls
+    # ``TerminateProcess`` under the hood). Resolve the strongest
+    # available signal at call time so the type checker (which sees
+    # ``signal.SIGKILL`` undefined on Windows) and the Windows runtime
+    # both stay happy.
+    kill_signal: int = getattr(_signal, "SIGKILL", _signal.SIGTERM)
+    try:
+        os.kill(pid, kill_signal)
+    except ProcessLookupError:
+        # Race — it died after SIGTERM but before we sent SIGKILL.
+        # Same caveat as the SIGTERM ProcessLookupError branch above:
+        # ``release_daemon_lock`` may no-op if the workspace was
+        # taken over, so verify the row actually cleared before
+        # reporting success.
+        state.release_daemon_lock(path, row.get("holder_id", ""))
+        if state.get_daemon_lock(path) is None:
+            console.print("[green]✓ daemon stopped (between SIGTERM and SIGKILL)[/green]")
+            raise SystemExit(0) from None
+        console.print(
+            "[red]Daemon died between SIGTERM and SIGKILL but lock row is still "
+            "present (another daemon took over the workspace). "
+            "Re-run `orchestrator daemon stop` against the new holder.[/red]"
+        )
+        raise SystemExit(2) from None
+    except PermissionError:
+        console.print(f"[red]Permission denied SIGKILLing pid {pid}.[/red]")
+        raise SystemExit(2) from None
+
+    # SIGKILL bypasses the daemon's signal handler, so the
+    # ``finally: release_singleton`` cleanup at the bottom of
+    # ``DaemonLoop.run`` never executes — the killed process cannot
+    # release its own lock row. The stop command must do it. Holder-
+    # scoped (same as the two ProcessLookupError branches above): if a
+    # fresh daemon took over the workspace via stale-heartbeat takeover,
+    # ``release_daemon_lock`` no-ops on the holder mismatch and the
+    # verify below surfaces that as exit 2 rather than a false success.
+    state.release_daemon_lock(path, row.get("holder_id", ""))
+    if _wait_for_daemon_lock_clear(path, timeout_s=_DAEMON_STOP_AFTER_KILL_S):
+        console.print("[green]✓ daemon killed (SIGKILL)[/green]")
+        raise SystemExit(0)
+    console.print(
+        "[red]Lock row still present after SIGKILL — another daemon took over "
+        "the workspace. Re-run `orchestrator daemon stop` against the new holder.[/red]"
+    )
+    raise SystemExit(2)
+
+
+_DAEMON_STOP_TIMEOUT_S = 10.0
+"""How long ``daemon stop`` waits for the SIGTERM path to clear the
+``daemon_locks`` row before escalating to SIGKILL. Spec § Phase 5: "wait
+up to 10s for the lock to clear, falls back to SIGKILL after that"."""
+
+
+_DAEMON_STOP_AFTER_KILL_S = 2.0
+"""Brief window for the OS to reap the SIGKILL'd process and the
+daemon's ``release_singleton`` to land before we declare the operation
+failed. SIGKILL bypasses the daemon's signal handler, so the lock
+gets cleared via the stale-takeover path on the next start — but we
+still want to surface a clean "stopped" vs. "lock row stuck" verdict
+to the operator immediately."""
+
+
+def _wait_for_daemon_lock_clear(path: str, *, timeout_s: float) -> bool:
+    """Poll ``daemon_locks`` until the row disappears or the timeout fires.
+
+    Returns True iff the row cleared. Polling cadence matches the
+    bootstrap helper's 100ms — fast enough to feel snappy on a clean
+    shutdown, light enough on SQLite that we don't busy-spin.
+    """
+    from orchestrator import state
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if state.get_daemon_lock(path) is None:
+            return True
+        time.sleep(0.1)
+    return state.get_daemon_lock(path) is None
 
 
 @daemon.command("status", help="Show the current daemon lock holder (if any).")
@@ -196,9 +568,14 @@ def run(no_remote_control: bool) -> None:
         console.print("[red]Missing .env[/red] — run [cyan]orchestrator init[/cyan] first.")
         raise SystemExit(1)
 
-    env_content = env_file.read_text()
-    if not re.search(r"^ANTHROPIC_API_KEY=sk-ant-", env_content, re.MULTILINE):
-        console.print("[red]ANTHROPIC_API_KEY not set in .env[/red] (must start with `sk-ant-`).")
+    # F-016-U-7 credential hardening (b): refuse to start when the
+    # resolved ``ANTHROPIC_API_KEY`` doesn't pass the shape check. The
+    # diagnostic names ``~/.zshrc`` / ``.bashrc`` / ``.zprofile`` so a
+    # stale shell export shadowing a valid ``.env`` key is the obvious
+    # foot-gun the message points at. ``_guard_anthropic_key`` reads
+    # ``.env`` without mutating ``os.environ`` so the CLI surface stays
+    # pure (the MCP server subprocess loads ``.env`` itself).
+    if not _guard_anthropic_key(console, label="orchestrator run"):
         raise SystemExit(1)
 
     if not shutil.which("claude"):
@@ -208,9 +585,27 @@ def run(no_remote_control: bool) -> None:
         )
         raise SystemExit(1)
 
-    # Belt-and-suspenders: clear API key from parent env so claude uses claude.ai token
+    # F-016-U-7 unified bootstrap: when ``ORCH_DAEMON_DRIVE`` is on,
+    # spawn the watcher as a detached child BEFORE handing off to
+    # Claude Code. The daemon survives the chat session's death by
+    # design (spec § Open questions). Idempotent — if the daemon is
+    # already running, the helper no-ops with a one-line banner.
+    # ``_daemon_drive_enabled`` reads the resolved env (which includes
+    # ``.env`` since the daemon child loads it on its own startup), so
+    # ``ORCH_DAEMON_DRIVE=true`` works whether it's in ``.env`` or the
+    # shell.
+    if _daemon_drive_enabled(env_file=env_file):
+        _start_daemon_detached(console)
+
+    # Belt-and-suspenders: clear BOTH ``ANTHROPIC_API_KEY`` and
+    # ``ANTHROPIC_AUTH_TOKEN`` from the parent env so the MCP server
+    # subprocess sees credentials only via ``.env`` (which it loads
+    # explicitly via ``dotenv``). F-016-U-7 (a): without the
+    # ``ANTHROPIC_AUTH_TOKEN`` strip a stale OAuth token in the parent
+    # shell would shadow the API key flow we just validated.
     new_env = dict(os.environ)
     new_env.pop("ANTHROPIC_API_KEY", None)
+    new_env.pop("ANTHROPIC_AUTH_TOKEN", None)
 
     cmd = ["claude"]
     if not no_remote_control:
@@ -264,7 +659,10 @@ def doctor() -> None:
     report(".env file in current directory", env_exists)
 
     env_content = env_file.read_text() if env_exists else ""
-    ant_match = re.search(r"^ANTHROPIC_API_KEY=(\S+)", env_content, re.MULTILINE)
+    # ``ant_match`` is no longer needed — F-016-U-7 routes the
+    # ANTHROPIC_API_KEY check through the resolved-env path
+    # (env_guard.is_valid_anthropic_key) so the diagnostic catches
+    # shell-rc shadowing rather than just the ``.env`` source.
     gh_match = re.search(r"^GITHUB_TOKEN=(\S+)", env_content, re.MULTILINE)
     ntfy_match = re.search(r"^NTFY_TOPIC=(\S+)", env_content, re.MULTILINE)
     app_id_match = re.search(r"^GITHUB_APP_ID=(\S+)", env_content, re.MULTILINE)
@@ -272,11 +670,32 @@ def doctor() -> None:
     app_keypath_match = re.search(r"^GITHUB_APP_PRIVATE_KEY_PATH=(\S+)", env_content, re.MULTILINE)
     app_keyinline_match = re.search(r"^GITHUB_APP_PRIVATE_KEY=(.+)$", env_content, re.MULTILINE)
 
-    # 4. ANTHROPIC_API_KEY
-    if ant_match and ant_match.group(1).startswith("sk-ant-"):
-        report("ANTHROPIC_API_KEY format", True, f"prefix {ant_match.group(1)[:12]}…")
+    # F-016-U-7 credential hardening: resolve env vars without mutating
+    # ``os.environ`` (the CLI shares its process with the pytest suite
+    # — a stray ``load_dotenv`` would pollute every subsequent test).
+    # ``shell_env`` snapshots the parent-process state pre-merge so the
+    # shadowing audit (check 12 below) can flag divergences.
+    shell_env = {k: v for k, v in os.environ.items() if k in env_guard.SHADOWING_ENV_VARS}
+    env_file_values = env_guard.read_env_file_values(env_file) if env_exists else {}
+    env_file_anthropic = env_file_values.get("ANTHROPIC_API_KEY", "")
+    resolved_anthropic = shell_env.get("ANTHROPIC_API_KEY", "") or env_file_anthropic
+
+    # 4. ANTHROPIC_API_KEY — validate the RESOLVED value (process env
+    # if set, else ``.env``), not just the ``.env`` source. F-016-U-7
+    # credential hardening (b): a stale shell-rc export
+    # (``export ANTHROPIC_API_KEY='lkj'``) silently shadowing a valid
+    # ``.env`` key is the foot-gun this check exists to catch — the
+    # diagnostic names ``~/.zshrc`` / ``.bashrc`` / ``.zprofile`` so
+    # the operator knows where to look.
+    if env_guard.is_valid_anthropic_key(resolved_anthropic):
+        report(
+            "ANTHROPIC_API_KEY format",
+            True,
+            f"prefix {resolved_anthropic[:12]}…",
+        )
     else:
-        report("ANTHROPIC_API_KEY format", False, "missing or wrong format")
+        diag = env_guard.anthropic_key_diagnostic(resolved_anthropic, env_file_anthropic)
+        report("ANTHROPIC_API_KEY format", False, diag)
 
     # 5. GitHub auth — App takes precedence over PAT
     # Load .env values into os.environ so github_app helpers see them
@@ -447,6 +866,32 @@ def doctor() -> None:
             True,
             "[dim]managed_agents → no local container audit[/dim]",
         )
+
+    # 12. Env-vs-``.env`` shadowing audit (F-016-U-7 credential
+    # hardening (c)). Compare the parent-process snapshot against the
+    # file values — a key set in the shell-env AND in ``.env`` with
+    # divergent values is a stale shell-rc export silently winning,
+    # the exact foot-gun the spec calls out.
+    if env_exists:
+        shadow_findings = env_guard.detect_env_shadowing(shell_env, env_file_values)
+        if shadow_findings:
+            console.print()
+            console.print("[bold yellow]Env-vs-.env shadowing audit[/bold yellow]")
+            for finding in shadow_findings:
+                # Use ``report`` so the overall pass/fail rollup reflects
+                # the shadowing — a stale export silently winning over
+                # ``.env`` is a real failure, not advisory noise.
+                report(
+                    f"shadowing: {finding['name']}",
+                    False,
+                    env_guard.format_shadowing_finding(finding).split(": ", 1)[1],
+                )
+        else:
+            report(
+                "Env-vs-.env shadowing audit",
+                True,
+                "[dim]no orchestrator-relevant env vars shadowed[/dim]",
+            )
 
     console.print()
     if all_pass:

@@ -812,6 +812,11 @@ class TestExitCodeSentinels:
         from orchestrator.cli import cli
 
         monkeypatch.setenv(daemon.DAEMON_DRIVE_ENV, "true")
+        # F-016-U-7 credential guard at the daemon-start entry point —
+        # supply a valid-shaped key so the test exercises the
+        # lock-held branch (exit 3), not the credential-refusal branch
+        # (exit 4).
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake-for-tests")
         path = str(state.STATE_DB.resolve())
         state.claim_daemon_lock(path, "incumbent")
         result = CliRunner().invoke(cli, ["daemon", "start"])

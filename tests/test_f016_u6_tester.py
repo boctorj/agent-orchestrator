@@ -532,19 +532,21 @@ class TestEscalatedUnit:
 # ============================================================================
 
 
-class TestSchedulingRoutesThroughBlocking:
-    """The coder's commit message: "scheduling._run_one routes through
-    cycle_review_blocking explicitly so the parallel_units /
-    parallel_units_global thread pool keeps its 'finish when the unit
-    reaches terminal' contract regardless of how the default-flip is
-    configured."
+class TestSchedulingRoutesThroughDispatcher:
+    """F-016-U-7 retired the thread pool in ``parallel_units`` /
+    ``parallel_units_global`` (proposal § Phase 5: "Delete ...
+    thread-pool internals once daemon-driven concurrency proves itself
+    in production"). ``_run_one`` now routes through the Phase 4
+    dispatcher ``cycle_review`` — auto-async when ``NTFY_TOPIC`` + the
+    daemon are live, blocking otherwise — and the daemon owns fan-out.
 
-    Without this routing, an NTFY-set workspace would have every
-    parallel-pool worker return ≤2 s (the async handoff), the pool would
-    "complete", and the response JSON would report success while the
-    daemon was still in mid-flight."""
+    Prior to U-7 this test pinned the inverse contract (always
+    blocking, so the pool could 'finish when units reached terminal').
+    With the pool gone, the new contract is: each dispatch is a fast
+    handoff to the daemon, and the user learns completion via the
+    ntfy push the daemon fires on the terminal."""
 
-    def test_run_one_uses_blocking_variant_not_dispatcher(
+    def test_run_one_routes_through_dispatcher(
         self, tmp_state_db, with_github_token, with_ntfy_topic, monkeypatch
     ):
         from orchestrator.tools import scheduling
@@ -557,32 +559,19 @@ class TestSchedulingRoutesThroughBlocking:
             lambda f, u: json.dumps({"unit_id": u, "pr_url": "http://x", "pr_number": 5}),
         )
         dispatcher_calls: list[bool] = []
-        blocking_calls: list[bool] = []
 
         monkeypatch.setattr(
-            execution,
+            scheduling,
             "cycle_review",
             lambda f, u: (
                 dispatcher_calls.append(True) or json.dumps({"outcome": "approved_awaiting_merge"})
             ),
         )
-        monkeypatch.setattr(
-            scheduling,
-            "cycle_review_blocking",
-            lambda f, u: (
-                blocking_calls.append(True) or json.dumps({"outcome": "approved_awaiting_merge"})
-            ),
-        )
         scheduling._run_one("F-001", "F-016-U-6-T")
-        assert blocking_calls == [True], (
-            "scheduling._run_one did not call cycle_review_blocking; with "
-            "NTFY_TOPIC set the thread pool would hand off to async and "
-            "the parallel_units response would lie about completion."
-        )
-        assert dispatcher_calls == [], (
-            "scheduling._run_one called the dispatcher; with NTFY_TOPIC set "
-            "the dispatcher would route to async and the thread-pool contract "
-            "breaks."
+        assert dispatcher_calls == [True], (
+            "scheduling._run_one did not call the cycle_review dispatcher; "
+            "F-016-U-7 retired the thread pool and routes parallel_units "
+            "through the dispatcher so daemon-driven concurrency owns fan-out."
         )
 
 

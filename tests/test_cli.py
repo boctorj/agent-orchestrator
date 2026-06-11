@@ -372,3 +372,328 @@ def test_run_with_no_remote_control_flag(runner, tmp_path, monkeypatch):
 
     runner.invoke(cli, ["run", "--no-remote-control"])
     assert "--remote-control" not in exec_calls[0]["args"]
+
+
+# --------------------------- F-016-U-7: run strips ANTHROPIC_AUTH_TOKEN ---------------------------
+
+
+def test_run_strips_anthropic_auth_token(runner, tmp_path, monkeypatch):
+    """F-016-U-7 (a): a stale ``ANTHROPIC_AUTH_TOKEN`` OAuth token in
+    the parent env would shadow the API-key flow we just validated.
+    ``orchestrator run`` strips both ``ANTHROPIC_API_KEY`` AND
+    ``ANTHROPIC_AUTH_TOKEN`` from the env passed to Claude Code so the
+    MCP server sees credentials only from ``.env``."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=sk-ant-real\n")
+    monkeypatch.setattr("shutil.which", lambda name: "/fake/claude")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "sk-ant-stale-oauth-token")
+
+    exec_calls = []
+
+    def fake_exec(prog, args, env):
+        exec_calls.append({"env": dict(env)})
+        raise SystemExit(0)
+
+    monkeypatch.setattr("os.execvpe", fake_exec)
+
+    runner.invoke(cli, ["run"])
+    assert len(exec_calls) == 1
+    assert "ANTHROPIC_API_KEY" not in exec_calls[0]["env"]
+    assert "ANTHROPIC_AUTH_TOKEN" not in exec_calls[0]["env"]
+
+
+def test_run_validates_resolved_key_format(runner, tmp_path, monkeypatch):
+    """F-016-U-7 (b): ``run`` refuses to start when the resolved
+    ``ANTHROPIC_API_KEY`` doesn't match ``sk-ant-``. The diagnostic
+    names the shell-rc files so the operator knows where to look."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=sk-ant-good\n")
+    # Shell env shadows the .env with a stale value — exactly the
+    # foot-gun this guard exists to catch.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "lkj")
+
+    result = runner.invoke(cli, ["run"])
+    assert result.exit_code == 1
+    # The spec-mandated diagnostic mentions the shell-rc files
+    assert "~/.zshrc" in result.output
+
+
+def test_run_starts_daemon_when_drive_enabled(runner, tmp_path, monkeypatch):
+    """F-016-U-7 unified bootstrap: ``orchestrator run`` auto-spawns
+    the watcher daemon as a detached child when ``ORCH_DAEMON_DRIVE=true``."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=sk-ant-real\nORCH_DAEMON_DRIVE=true\n")
+    monkeypatch.setattr("shutil.which", lambda name: "/fake/claude")
+    # Avoid mutating the test process's env with the .env values.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ORCH_DAEMON_DRIVE", raising=False)
+
+    spawn_calls = []
+
+    def fake_start_daemon_detached(console):
+        spawn_calls.append(True)
+
+    monkeypatch.setattr("orchestrator.cli._start_daemon_detached", fake_start_daemon_detached)
+    monkeypatch.setattr("os.execvpe", lambda *a, **k: (_ for _ in ()).throw(SystemExit(0)))
+
+    runner.invoke(cli, ["run"])
+    assert len(spawn_calls) == 1
+
+
+def test_run_skips_daemon_when_drive_off(runner, tmp_path, monkeypatch):
+    """Without ``ORCH_DAEMON_DRIVE=true`` the bootstrap stays out of the way."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=sk-ant-real\n")
+    monkeypatch.setattr("shutil.which", lambda name: "/fake/claude")
+    monkeypatch.delenv("ORCH_DAEMON_DRIVE", raising=False)
+
+    spawn_calls = []
+
+    def fake_start_daemon_detached(console):
+        spawn_calls.append(True)
+
+    monkeypatch.setattr("orchestrator.cli._start_daemon_detached", fake_start_daemon_detached)
+    monkeypatch.setattr("os.execvpe", lambda *a, **k: (_ for _ in ()).throw(SystemExit(0)))
+
+    runner.invoke(cli, ["run"])
+    assert spawn_calls == []
+
+
+# --------------------------- F-016-U-7: daemon stop ---------------------------
+
+
+def test_daemon_stop_no_daemon_running(runner, tmp_path, monkeypatch):
+    """``orchestrator daemon stop`` with no daemon → exit 1 (per spec)."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("orchestrator.state.STATE_DB", tmp_path / "state.db")
+    result = runner.invoke(cli, ["daemon", "stop"])
+    assert result.exit_code == 1
+    assert "No daemon running" in result.output
+
+
+def test_daemon_stop_sigterm_clears_lock(runner, tmp_path, monkeypatch):
+    """SIGTERM path: kill is signaled, lock row cleared by the (fake)
+    daemon's release_singleton, exit 0."""
+    import os as _os
+    import signal as _signal
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("orchestrator.state.STATE_DB", tmp_path / "state.db")
+    from orchestrator import state
+
+    state.init_db()
+    path = str(state.STATE_DB.resolve())
+    state.claim_daemon_lock(path, "fake-holder", pid=99999)
+
+    kill_calls = []
+
+    def fake_kill(pid, sig):
+        kill_calls.append((pid, sig))
+        # Simulate clean shutdown — the (fake) daemon releases its lock
+        # in response to SIGTERM.
+        if sig == _signal.SIGTERM:
+            state.release_daemon_lock(path, "fake-holder")
+
+    monkeypatch.setattr(_os, "kill", fake_kill)
+
+    result = runner.invoke(cli, ["daemon", "stop"])
+    assert result.exit_code == 0, result.output
+    assert kill_calls[0] == (99999, _signal.SIGTERM)
+    assert "stopped" in result.output.lower()
+
+
+@pytest.mark.skipif(
+    not hasattr(__import__("signal"), "SIGKILL"),
+    reason="SIGKILL is POSIX-only; on Windows the fallback path uses SIGTERM (already covered by test_daemon_stop_sigterm_clears_lock)",
+)
+def test_daemon_stop_sigkill_fallback(runner, tmp_path, monkeypatch):
+    """When the daemon ignores SIGTERM, ``stop`` escalates to SIGKILL
+    after the 10s window (we shrink the timeout in tests)."""
+    import os as _os
+    import signal as _signal
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("orchestrator.state.STATE_DB", tmp_path / "state.db")
+    # Shrink both timeouts so the test doesn't actually wait 10s.
+    monkeypatch.setattr("orchestrator.cli._DAEMON_STOP_TIMEOUT_S", 0.2)
+    monkeypatch.setattr("orchestrator.cli._DAEMON_STOP_AFTER_KILL_S", 0.2)
+    from orchestrator import state
+
+    state.init_db()
+    path = str(state.STATE_DB.resolve())
+    state.claim_daemon_lock(path, "fake-holder", pid=99998)
+
+    kill_calls = []
+
+    def fake_kill(pid, sig):
+        # Neither signal clears the lock: a SIGKILL'd daemon is reaped
+        # by the kernel WITHOUT running its `finally: release_singleton`
+        # cleanup, so the row stays until the stop command releases it
+        # itself. (The old test cleared the lock inside fake_kill on
+        # SIGKILL, which simulated impossible kernel behavior and masked
+        # the orphan-lock bug — reviewer C1.)
+        kill_calls.append((pid, sig))
+
+    monkeypatch.setattr(_os, "kill", fake_kill)
+
+    result = runner.invoke(cli, ["daemon", "stop"])
+    assert result.exit_code == 0, result.output
+    # Both signals fired
+    signals = [s for _, s in kill_calls]
+    assert _signal.SIGTERM in signals
+    assert _signal.SIGKILL in signals
+    # The stop command — not the (uncatchable) SIGKILL — cleared the row.
+    assert state.get_daemon_lock(path) is None
+
+
+@pytest.mark.skipif(
+    not hasattr(__import__("signal"), "SIGKILL"),
+    reason="SIGKILL is POSIX-only; on Windows the fallback path collapses to SIGTERM, so the SIGKILL-takeover path under test does not apply.",
+)
+def test_daemon_stop_kill_failed_exit_2(runner, tmp_path, monkeypatch):
+    """Exit 2 when the lock row is still present after SIGKILL because a
+    fresh daemon took over the workspace — the stop command's holder-
+    scoped release no-ops on the holder mismatch, so we must NOT report
+    a clean stop. (Post-C1: with the daemon dead and no takeover, the
+    stop command always clears its own orphan row and exits 0, so the
+    only remaining exit-2 path is the takeover hazard.)"""
+    import os as _os
+    import signal as _signal
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("orchestrator.state.STATE_DB", tmp_path / "state.db")
+    monkeypatch.setattr("orchestrator.cli._DAEMON_STOP_TIMEOUT_S", 0.1)
+    monkeypatch.setattr("orchestrator.cli._DAEMON_STOP_AFTER_KILL_S", 0.1)
+    from orchestrator import state
+
+    state.init_db()
+    path = str(state.STATE_DB.resolve())
+    state.claim_daemon_lock(path, "fake-holder", pid=99997)
+
+    def fake_kill(pid, sig):
+        # SIGTERM ignored. On SIGKILL, simulate a fresh daemon taking
+        # over the workspace: the original holder's row is replaced by a
+        # new holder. The stop command's release (scoped to the original
+        # "fake-holder") then no-ops and the new holder's row persists.
+        if sig == _signal.SIGKILL:
+            state.release_daemon_lock(path, "fake-holder")
+            state.claim_daemon_lock(path, "new-holder", pid=88888)
+
+    monkeypatch.setattr(_os, "kill", fake_kill)
+
+    result = runner.invoke(cli, ["daemon", "stop"])
+    assert result.exit_code == 2, result.output
+    # The new holder's row is untouched by the holder-scoped release.
+    row = state.get_daemon_lock(path)
+    assert row is not None and row.get("holder_id") == "new-holder"
+
+
+def test_daemon_stop_no_pid_recorded(runner, tmp_path, monkeypatch):
+    """Pre-F-016-U-7 lock rows have no ``pid`` column value — ``stop``
+    refuses with exit 1 + a clear diagnostic rather than nuking the row."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("orchestrator.state.STATE_DB", tmp_path / "state.db")
+    from orchestrator import state
+
+    state.init_db()
+    path = str(state.STATE_DB.resolve())
+    state.claim_daemon_lock(path, "legacy-holder")  # no pid kwarg
+
+    result = runner.invoke(cli, ["daemon", "stop"])
+    assert result.exit_code == 1
+    assert "no recorded pid" in result.output.lower()
+
+
+def test_daemon_stop_no_pid_diagnostic_mentions_sqlite_delete(runner, tmp_path, monkeypatch):
+    """PR #67 Copilot finding: the legacy-lock diagnostic mustn't claim
+    ``orchestrator daemon status`` removes rows (it's read-only). The
+    fixed copy points the operator at sqlite for the actual delete."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("orchestrator.state.STATE_DB", tmp_path / "state.db")
+    from orchestrator import state
+
+    state.init_db()
+    path = str(state.STATE_DB.resolve())
+    state.claim_daemon_lock(path, "legacy-holder")  # no pid kwarg
+    result = runner.invoke(cli, ["daemon", "stop"])
+    assert result.exit_code == 1
+    # The diagnostic must NOT claim daemon status performs deletion.
+    assert "remove the row with `orchestrator daemon status`" not in result.output
+    # The diagnostic must point to a viable cleanup path: either sqlite
+    # delete or stale-heartbeat takeover.
+    assert "sqlite" in result.output.lower() or "stale-heartbeat takeover" in result.output.lower()
+
+
+def test_daemon_stop_sigterm_processlookuperror_with_lock_taken_over(runner, tmp_path, monkeypatch):
+    """PR #67 Copilot finding (M-1): when SIGTERM raises
+    ProcessLookupError AND release_daemon_lock no-ops because the
+    workspace was taken over mid-call, we must NOT exit 0 — that
+    would falsely report success while a new daemon owns the
+    workspace."""
+    import os as _os
+    import signal as _signal
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("orchestrator.state.STATE_DB", tmp_path / "state.db")
+    from orchestrator import state
+
+    state.init_db()
+    path = str(state.STATE_DB.resolve())
+    state.claim_daemon_lock(path, "old-holder", pid=99996)
+
+    def fake_kill(pid, sig):
+        # Race: by the time we signal the old pid, it's gone, AND a
+        # new daemon has claimed the workspace.
+        if sig == _signal.SIGTERM:
+            # Force stale takeover by hand: bump the old row's
+            # heartbeat back, then claim with a fresh holder.
+            import sqlite3
+            from datetime import UTC, datetime, timedelta
+
+            with sqlite3.connect(state.STATE_DB) as conn:
+                conn.execute(
+                    "UPDATE daemon_locks SET heartbeat_at = ? WHERE state_db_path = ?",
+                    (
+                        (datetime.now(UTC) - timedelta(seconds=120))
+                        .isoformat()
+                        .replace("+00:00", "+00:00"),
+                        path,
+                    ),
+                )
+                conn.commit()
+            state.claim_daemon_lock(path, "new-holder", pid=88888)
+            raise ProcessLookupError(3, "No such process")
+
+    monkeypatch.setattr(_os, "kill", fake_kill)
+    result = runner.invoke(cli, ["daemon", "stop"])
+    # NOT exit 0 — the workspace still has a daemon (the new one).
+    assert result.exit_code == 2, result.output
+    # Diagnostic names the takeover so the operator can stop the
+    # current holder.
+    assert "took over" in result.output.lower() or "new holder" in result.output.lower()
+
+
+def test_daemon_stop_sigterm_processlookuperror_with_clean_release(runner, tmp_path, monkeypatch):
+    """The benign case: SIGTERM raises ProcessLookupError because the
+    daemon was already dead, and our row release clears the lock. Exit
+    0 is correct here — the original always-exit-0 was right for this
+    branch and wrong for the takeover-race branch."""
+    import os as _os
+    import signal as _signal
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("orchestrator.state.STATE_DB", tmp_path / "state.db")
+    from orchestrator import state
+
+    state.init_db()
+    path = str(state.STATE_DB.resolve())
+    state.claim_daemon_lock(path, "dead-holder", pid=99995)
+
+    def fake_kill(pid, sig):
+        if sig == _signal.SIGTERM:
+            raise ProcessLookupError(3, "No such process")
+
+    monkeypatch.setattr(_os, "kill", fake_kill)
+    result = runner.invoke(cli, ["daemon", "stop"])
+    assert result.exit_code == 0, result.output
+    assert state.get_daemon_lock(path) is None

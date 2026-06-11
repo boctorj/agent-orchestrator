@@ -178,18 +178,23 @@ class TestDaemonLockRowShape:
         assert state.claim_daemon_lock(path, "h1") is True
         row = state.get_daemon_lock(path)
         assert row is not None
-        # Column set per proposal § "Singleton enforcement" verbatim.
+        # Column set per proposal § "Singleton enforcement" verbatim;
+        # F-016-U-7 added ``pid`` so ``orchestrator daemon stop`` can
+        # SIGTERM the holder without a sidecar pidfile.
         assert set(row.keys()) == {
             "state_db_path",
             "holder_id",
             "heartbeat_at",
             "started_at",
+            "pid",
         }
         assert row["state_db_path"] == path
         assert row["holder_id"] == "h1"
         # Both timestamps are non-empty ISO strings populated on claim.
         assert row["heartbeat_at"]
         assert row["started_at"]
+        # ``pid`` is nullable — this claim didn't pass one, so it's None.
+        assert row["pid"] is None
 
     def test_started_at_equals_heartbeat_at_on_fresh_claim(self, tmp_state_db):
         """On the initial INSERT the two timestamps share one ``_now()``
@@ -599,10 +604,10 @@ class TestCliDaemonGroupRegistered:
 
     def test_daemon_group_exists(self):
         assert "daemon" in cli.commands
-        # Both subcommands present.
+        # F-016-U-7 adds ``stop`` to the start/status pair.
         group = cli.commands["daemon"]
         assert hasattr(group, "commands")
-        assert set(group.commands.keys()) == {"start", "status"}
+        assert set(group.commands.keys()) == {"start", "status", "stop"}
 
     def test_daemon_help_runs_cleanly(self):
         result = CliRunner().invoke(cli, ["daemon", "--help"])
@@ -663,6 +668,10 @@ class TestCliDaemonStartCommand:
         via systemd ``Restart=on-failure`` / shell ``$?``.
         """
         monkeypatch.delenv(daemon.DAEMON_DRIVE_ENV, raising=False)
+        # F-016-U-7 credential guard runs before the drive-enabled
+        # check; supply a valid-shaped key so the test exercises the
+        # drive-disabled exit (2), not the credential-refusal exit (4).
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake-for-tests")
         result = CliRunner().invoke(cli, ["daemon", "start"])
         assert result.exit_code == 2, (
             f"`daemon start` did not exit with EXIT_DRIVE_DISABLED code (2); "
@@ -678,6 +687,7 @@ class TestCliDaemonStartCommand:
         transient — supervisors should stop retrying rather than busy-loop.
         """
         monkeypatch.setenv(daemon.DAEMON_DRIVE_ENV, "true")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake-for-tests")
         path = str(state.STATE_DB.resolve())
         state.claim_daemon_lock(path, "incumbent")
         result = CliRunner().invoke(cli, ["daemon", "start"])
