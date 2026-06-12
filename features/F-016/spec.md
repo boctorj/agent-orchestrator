@@ -61,8 +61,8 @@ harness during rollout. F-015 should be marked `obsoleted-by F-016`.
   blocking + nudges); explicit `cycle_review_async` / `cycle_review_blocking`
   always available. `cycle_review_blocking` calls the daemon's engine
   in-process — no duplicate transition table.
-- **F-016-U-7 — Phase 5: cleanup + unified bootstrap + credential
-  hardening.** Move blocking phase helpers into
+- **F-016-U-7 — Phase 5: cleanup + unified bootstrap + credential hardening.**
+  Move blocking phase helpers into
   `orchestrator/cycle/phases.py` (shared by daemon + blocking caller),
   retire thread-pool internals; `orchestrator run` auto-starts a
   detached daemon when `ORCH_DAEMON_DRIVE=true`; add `orchestrator
@@ -71,7 +71,7 @@ harness during rollout. F-015 should be marked `obsoleted-by F-016`.
 - **F-016-U-8 — Phase 6: uniform non-blocking dispatch.** U-6 made
   only `cycle_review` a non-blocking dispatcher, but `spawn_unit`,
   `address_review`, `spawn_tester`, `spawn_reviewer`, `send_to_unit`,
-  and `parallel_units{,_global}` still block minutes — so the lead
+  and `parallel_units` / `parallel_units_global` still block minutes — so the lead
   foot-guns itself by calling a blocking sibling (the post-F-016
   blocking still observed in practice). Factor U-6's gate into a
   shared `_dispatch_or_block` helper and apply it to every
@@ -79,8 +79,8 @@ harness during rollout. F-015 should be marked `obsoleted-by F-016`.
   (`address_review_async`, `spawn_tester_async`, `spawn_reviewer_async`).
   Each surface keeps an explicit `_blocking`/`_async` variant; only the
   default flips. Depends on U-7.
-- **F-016-U-9 — Spawn ghost-row guard + retry cap (anti-loop
-  hardening).** Born from a live incident (2026-06-10): U-7 was
+- **F-016-U-9 — Spawn ghost-row guard + retry cap (anti-loop hardening).**
+  Born from a live incident (2026-06-10): U-7 was
   re-spawned ~6× over 12 h, each blocking spawn dying on a
   managed-agents network read-timeout after 45–60 min and never
   persisting a `session_id`, so the row stayed re-spawnable forever.
@@ -95,19 +95,13 @@ harness during rollout. F-015 should be marked `obsoleted-by F-016`.
   ships ahead of U-7/U-8 (U-8 rebases its dispatcher onto this guard).
   Incident stopgap until merged: U-7's `coder_session_id` set to a
   `GHOST-LOOP-HALTED-*` sentinel so the existing guard refuses spawns.
-  Also folds in a second anti-loop defect found during incident
-  triage: the daemon re-emits `ci_drift_detected` every ~6 s poll for
-  an `in_ci` unit with persistently-red CI (no dedupe), hammering the
-  GitHub API and bloating `unit_events`. U-9 rate-limits/dedupes the
-  drift event (emit only on a changed failing-check-set, throttled
-  per unit) in both the daemon tick and `inspect_unit_health`.
 
 ## Acceptance
 
 When all nine units merge:
 1. `spawn_unit`, `address_review`, `spawn_tester`, `spawn_reviewer`,
-   `send_to_unit`, `cycle_review`, `parallel_units{,_global}` all return
-   in ≤3s under NTFY+daemon (U-8 — not just `cycle_review`).
+   `send_to_unit`, `cycle_review`, `parallel_units`, `parallel_units_global`
+   all return in ≤3s under NTFY+daemon (U-8 — not just `cycle_review`).
 2. A lead session killed mid-cycle does not strand the unit; the daemon
    completes the cycle and ntfy fires.
 3. `list_in_flight` / `resume_unit` / `tail_worker` continue to work
