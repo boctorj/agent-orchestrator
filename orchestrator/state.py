@@ -929,6 +929,33 @@ def tail_events(unit_id: str, limit: int = 200) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def last_event_of_type(unit_id: str, event_type: str) -> dict | None:
+    """Return the most-recent event of ``event_type`` for ``unit_id``, or ``None``.
+
+    Targeted query for dedupe / state-machine callers that need exactly
+    one row (the most recent of a given type), not a windowed walk. The
+    SQL filter pushes ``event_type = ?`` into the database so the answer
+    is unaffected by how many unrelated events accumulated since — the
+    failure mode :func:`tail_events` with its default ``limit`` is
+    exposed to (a buried prior row beyond the window → "no prior" → the
+    dedupe contract silently breaks once the unit has ≥``limit``
+    unrelated events).
+
+    The ``idx_unit_events_unit_ts`` index covers the ``unit_id``
+    prefix; SQLite scans the per-unit slice and stops on the first
+    ``event_type`` match in DESC order. O(matching rows in unit) in the
+    worst case, O(1) in the typical "newest event in unit is the
+    target type" case.
+    """
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM unit_events WHERE unit_id = ? AND event_type = ? "
+            "ORDER BY ts DESC, id DESC LIMIT 1",
+            (unit_id, event_type),
+        ).fetchone()
+    return dict(row) if row else None
+
+
 def summarize_unit(unit_id: str) -> dict:
     """Build a human-friendly digest of a unit's lifecycle.
 

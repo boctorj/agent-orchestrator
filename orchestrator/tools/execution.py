@@ -145,23 +145,31 @@ _SPAWN_FAILURE_CAP_LAST_ERROR_PREFIX = "BLOCKED [spawn_failure_cap]:"
 
 
 def _ghost_row_guard(unit_id: str) -> str | None:
-    """F-016-U-9: refuse re-spawn on an actively-worked / escalated row.
+    """F-016-U-9: refuse re-spawn on an actively-worked / escalated / terminal-merge row.
 
     Returns an actionable error string when the row is in
     :data:`_RESPAWN_REFUSED_STATUSES`; returns ``None`` on a clean first
-    spawn (no row, or a row in ``pending`` / ``cancelled`` /
-    ``approved_awaiting_merge`` / ``done``).
+    spawn (no row, or a row in ``pending`` / ``cancelled``).
 
-    Two paths point the caller at the right recovery:
+    The refused set covers four shapes of "do not silently re-spawn":
 
     - **active status** (``coding`` / ``opening_pr`` / ``in_ci`` /
       ``testing`` / ``reviewing`` / ``fixing``): a worker is (or was)
       driving the unit. Either it's still alive — use
       ``inspect_unit_health`` / ``resume_unit`` to confirm — or it died
       mid-flight; clear with ``cancel_unit`` before re-dispatching.
-    - **escalated**: the cap has already surfaced this unit. The user
-      has not yet decided. ``cancel_unit`` (explicit reset) is the gate
-      for re-dispatch.
+    - **escalated**: the cap or another path has already surfaced this
+      unit. The user has not yet decided. ``cancel_unit`` (explicit
+      reset) is the gate for re-dispatch. For cap-escalated rows
+      specifically, ``cancel_unit`` is carved out via
+      :func:`_is_cancel_refused` so the documented recovery actually
+      works end-to-end.
+    - **``done``** and **``approved_awaiting_merge``** (PR #69 C1):
+      both carry a ``coder_session_id`` + ``pr_number`` from the
+      original ``pr_opened`` event. The upsert at the top of
+      ``spawn_unit`` would blank those columns to constructor
+      defaults on a re-spawn — silently destroying the merge record
+      / endorsement. The guard refuses to let that happen.
     """
     existing = state.get_unit_state(unit_id)
     if existing is None:
@@ -175,6 +183,16 @@ def _ghost_row_guard(unit_id: str) -> str | None:
         f"resume_unit({unit_id}, 'coder') to check the real worker state, or "
         f"cancel_unit({unit_id}) to explicitly reset before re-dispatching."
     )
+
+
+# Wide window for the cap counter's reset-signal walk. Single units past
+# the default 200-event ``tail_events`` window would miss a buried
+# session-id-bearing OR ``unit_cancelled`` reset signal and falsely
+# escalate via the cap. 10_000 is deliberately well beyond any plausible
+# event count for a single unit (a unit averages ~10–50 events; even an
+# extreme cap-3 cycle stays well under 500). The bounded query is still
+# O(N) on the ``(unit_id, ts)`` index slice, so the wider cap is free.
+_CAP_COUNTER_TAIL_LIMIT = 10_000
 
 
 def _consecutive_failed_spawns(unit_id: str) -> int:
@@ -207,12 +225,14 @@ def _consecutive_failed_spawns(unit_id: str) -> int:
     Failure rows (``coder_error``) are emitted with ``session_id=""``,
     so they never act as a reset signal — only as counter increments.
 
-    Uses :func:`state.tail_events` (newest-first) so the dedupe stays
-    correct on units past the ~200-event ``list_events`` LIMIT — a
-    long-lived unit with hundreds of fix-cycle events would otherwise
-    only see the oldest 200 rows and miscount the recent tail.
+    Uses :func:`state.tail_events` with a wide
+    :data:`_CAP_COUNTER_TAIL_LIMIT` so a buried reset signal in a
+    long-lived unit (one with many fix-cycle events between failures)
+    is still seen. The pre-fix default ``limit=200`` would silently
+    miss any reset signal pushed beyond row 200 and falsely cap the
+    unit again.
     """
-    events = state.tail_events(unit_id)
+    events = state.tail_events(unit_id, limit=_CAP_COUNTER_TAIL_LIMIT)
     count = 0
     for ev in events:
         if ev.get("session_id"):

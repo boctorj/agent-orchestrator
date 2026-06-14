@@ -127,38 +127,39 @@ def _should_emit_ci_drift(unit_state: WorkUnitState, action: Action) -> bool:
     The first ``ci_drift_detected`` for a unit (no prior row) always
     fires — there's nothing to dedupe against.
 
-    Walks :func:`state.tail_events` (newest-first) rather than reversing
-    a :func:`list_events` page — ``list_events`` returns the OLDEST 200
-    rows so a long-lived unit's most recent drift would be invisible to
-    the dedupe and the contract would silently break.
+    Uses :func:`state.last_event_of_type` (a targeted ``ORDER BY ts
+    DESC LIMIT 1`` filtered on ``event_type``) rather than a windowed
+    :func:`state.tail_events` walk. The targeted query is unaffected
+    by how many unrelated events accumulated since the last drift —
+    the failure mode ``tail_events(limit=200)`` is exposed to (a
+    buried prior drift beyond the window → "no prior" → first-emit
+    fires → event-storm contract silently breaks on long-lived units).
     """
     interval = _snapshot_interval_hours()
     now = datetime.now(UTC)
     incoming = _parse_failing_set(action.details)
-    events = state.tail_events(unit_state.unit_id)
-    for ev in events:  # newest-first
-        if ev.get("event_type") != "ci_drift_detected":
-            continue
-        prior_set = _parse_failing_set(ev.get("details") or "")
-        if prior_set != incoming:
-            return True  # set changed → real drift evolution → emit
-        if interval <= 0:
-            # Rate-limit disabled — still respect set-equality (which
-            # just failed), so unchanged-set + disabled-throttle is a
-            # no-op. This preserves the dedupe-by-content guarantee
-            # while letting operators opt-out of the time window.
-            return False
-        ts = ev.get("ts") or ""
-        try:
-            normalized = ts.replace("Z", "+00:00") if ts.endswith("Z") else ts
-            parsed = datetime.fromisoformat(normalized)
-        except ValueError:
-            # Unparseable timestamp on the prior row — treat the prior
-            # as out-of-window so a real drift always re-surfaces.
-            return True
-        age = now.timestamp() - parsed.timestamp()
-        return age >= interval * 3600
-    return True  # no prior ci_drift_detected row — first emit always fires
+    prior = state.last_event_of_type(unit_state.unit_id, "ci_drift_detected")
+    if prior is None:
+        return True  # no prior ci_drift_detected row — first emit always fires
+    prior_set = _parse_failing_set(prior.get("details") or "")
+    if prior_set != incoming:
+        return True  # set changed → real drift evolution → emit
+    if interval <= 0:
+        # Rate-limit disabled — still respect set-equality (which just
+        # failed), so unchanged-set + disabled-throttle is a no-op.
+        # Preserves the dedupe-by-content guarantee while letting
+        # operators opt-out of the time window.
+        return False
+    ts = prior.get("ts") or ""
+    try:
+        normalized = ts.replace("Z", "+00:00") if ts.endswith("Z") else ts
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        # Unparseable timestamp on the prior row — treat the prior as
+        # out-of-window so a real drift always re-surfaces.
+        return True
+    age = now.timestamp() - parsed.timestamp()
+    return age >= interval * 3600
 
 
 # ---------------------------------------------------------------------------
