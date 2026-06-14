@@ -976,10 +976,7 @@ class TestStateTailEvents:
         """
         self._seed_unit()
         # 250 old rows + 3 recent ones the dedupe should see.
-        for i in range(250):
-            state.record_event(
-                "F-016-U-1", "F-016", "old_filler", source="orchestrator", summary=f"f{i}"
-            )
+        _bulk_record_filler("F-016-U-1", "F-016", "old_filler", 250)
         for i in range(3):
             state.record_event(
                 "F-016-U-1", "F-016", "recent", source="orchestrator", summary=f"r{i}"
@@ -991,6 +988,50 @@ class TestStateTailEvents:
         # recent old_filler rows — still part of the tail, not the head.
         assert types[:3] == ["recent", "recent", "recent"]
         assert types[3:] == ["old_filler", "old_filler"]
+
+
+def _bulk_record_filler(
+    unit_id: str,
+    feature_id: str,
+    event_type: str,
+    n: int,
+    *,
+    source: str = "orchestrator",
+    summary_prefix: str = "f",
+) -> None:
+    """Insert ``n`` filler events in a SINGLE transaction.
+
+    Per-row :func:`state.record_event` opens a connection and commits
+    (an fsync) on every call; the 9_000-row burial tests below time out
+    the suite on Windows CI as a result. Bulk-inserting in one
+    transaction is dramatically faster and order-faithful —
+    ``unit_events.id`` autoincrements in insert order, so the
+    ``(ts DESC, id DESC)`` tail walk sees these rows exactly as if they
+    had been recorded one-by-one.
+    """
+    ts = state._now()
+    with state._connect() as conn:
+        conn.executemany(
+            "INSERT INTO unit_events "
+            "(unit_id, feature_id, ts, event_type, source, cycle_number, "
+            "summary, details, session_id, dedupe_key) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    unit_id,
+                    feature_id,
+                    ts,
+                    event_type,
+                    source,
+                    None,
+                    f"{summary_prefix}{i}",
+                    "",
+                    "",
+                    None,
+                )
+                for i in range(n)
+            ],
+        )
 
 
 def _count_event_type(unit_id: str, event_type: str) -> int:
@@ -1039,10 +1080,7 @@ def test_consecutive_failed_spawns_uses_tail_past_event_window(tmp_state_db):
         session_id="sesn-buried",
     )
     # 250 ancient unrelated events on top of the reset signal.
-    for i in range(250):
-        state.record_event(
-            "F-016-U-1", "F-016", "old_filler", source="orchestrator", summary=f"f{i}"
-        )
+    _bulk_record_filler("F-016-U-1", "F-016", "old_filler", 250)
     # Three recent coder_error rows at cycle 0 — the cap-counting tail.
     for i in range(3):
         state.record_event(
@@ -1096,14 +1134,7 @@ def test_consecutive_failed_spawns_sees_buried_reset_signal(tmp_state_db):
         )
     # Heavy filler tail on top of the failures — the failures sit
     # near the bottom of the most-recent window.
-    for i in range(9_000):
-        state.record_event(
-            "F-016-U-1",
-            "F-016",
-            "noise",
-            source="orchestrator",
-            summary=f"n{i}",
-        )
+    _bulk_record_filler("F-016-U-1", "F-016", "noise", 9_000, summary_prefix="n")
 
     # Counter walks the wide tail, reaches the 3 failures, then stops
     # at the buried reset signal. Pre-fix this would have been 0
@@ -1136,10 +1167,7 @@ def test_should_emit_ci_drift_dedupes_past_tail_events_window(tmp_state_db, monk
         source="orchestrator",
         details="failing checks: test",
     )
-    for i in range(250):
-        state.record_event(
-            "F-016-U-1", "F-016", "old_filler", source="orchestrator", summary=f"f{i}"
-        )
+    _bulk_record_filler("F-016-U-1", "F-016", "old_filler", 250)
 
     tools_health._apply_action(unit, _drift_action(["test"]))
 
@@ -1160,10 +1188,7 @@ def test_should_emit_ci_drift_dedupes_with_very_deep_history(tmp_state_db, monke
         source="orchestrator",
         details="failing checks: test",
     )
-    for i in range(9_000):
-        state.record_event(
-            "F-016-U-1", "F-016", "old_filler", source="orchestrator", summary=f"f{i}"
-        )
+    _bulk_record_filler("F-016-U-1", "F-016", "old_filler", 9_000)
 
     tools_health._apply_action(unit, _drift_action(["test"]))
 
@@ -1183,13 +1208,11 @@ def test_last_event_of_type_returns_most_recent(tmp_state_db):
     # Oldest target row.
     state.record_event("F-016-U-1", "F-016", "ci_drift_detected", details="failing checks: a")
     # Burial: lots of unrelated events.
-    for i in range(500):
-        state.record_event("F-016-U-1", "F-016", "noise", summary=f"n{i}")
+    _bulk_record_filler("F-016-U-1", "F-016", "noise", 500, summary_prefix="n")
     # Newest target row.
     state.record_event("F-016-U-1", "F-016", "ci_drift_detected", details="failing checks: b")
     # Final burial.
-    for i in range(500):
-        state.record_event("F-016-U-1", "F-016", "more_noise", summary=f"m{i}")
+    _bulk_record_filler("F-016-U-1", "F-016", "more_noise", 500, summary_prefix="m")
 
     row = state.last_event_of_type("F-016-U-1", "ci_drift_detected")
     assert row is not None
