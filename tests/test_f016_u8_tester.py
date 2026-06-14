@@ -374,10 +374,12 @@ class TestDispatchOrBlockInvalidHeartbeatNudge:
         # Seed a daemon_locks row with a malformed heartbeat_at — same
         # technique tests/test_f016_u6_tester.py uses for its
         # ``test_invalid_heartbeat_treated_as_dead``.
-        import sqlite3
-
+        # PR #70 review M2: use ``state._connect`` rather than
+        # ``sqlite3.connect`` so the connection is closed on context
+        # exit (CONTRIBUTING.md § "Common pitfalls" — ``with
+        # sqlite3.Connection as conn`` commits but does not close).
         path = str(Path(state.STATE_DB).resolve())
-        with sqlite3.connect(state.STATE_DB) as conn:
+        with state._connect() as conn:
             conn.execute(
                 "INSERT INTO daemon_locks "
                 "(state_db_path, holder_id, heartbeat_at, started_at) "
@@ -425,10 +427,11 @@ class TestDispatchOrBlockInvalidHeartbeatNudge:
         """Belt-and-braces: a daemon row with a malformed heartbeat is
         ``running=False`` per :func:`_daemon_health`; the dispatcher
         MUST stay on the blocking branch."""
-        import sqlite3
-
+        # PR #70 review M2: use ``state._connect`` rather than
+        # ``sqlite3.connect`` — see the sibling test above for the
+        # CONTRIBUTING.md citation.
         path = str(Path(state.STATE_DB).resolve())
-        with sqlite3.connect(state.STATE_DB) as conn:
+        with state._connect() as conn:
             conn.execute(
                 "INSERT INTO daemon_locks "
                 "(state_db_path, holder_id, heartbeat_at, started_at) "

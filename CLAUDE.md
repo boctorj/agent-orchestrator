@@ -62,15 +62,22 @@ gate that refuses to spawn against repos without branch protection.
 
 **Testing, review, cycle loop (Stage 4):**
 - `spawn_tester(feature_id, unit_id)` — tester writes/runs tests on the
-  coder's branch. Returns `TESTS_PASS` / `BUG_FOUND` / `BLOCKED`. Under
-  NTFY+daemon: returns ≤3s. Without either: BLOCKS minutes (refuses if
-  CI is red on the PR — fix CI first or use `cycle_review` for the
-  automated CI-fix loop). Explicit `spawn_tester_async` /
-  `spawn_tester_blocking` always available.
+  coder's branch. Under NTFY+daemon: returns ≤3s with an async-handoff
+  envelope (daemon records `TESTS_PASS` / `BUG_FOUND` / `BLOCKED` on a
+  later tick — `TESTS_PASS` flips the unit to `in_ci`). Without either:
+  BLOCKS minutes and returns the marker inline (refuses if CI is red
+  on the PR — fix CI first or use `cycle_review` for the automated
+  CI-fix loop). Explicit `spawn_tester_async` / `spawn_tester_blocking`
+  always available.
 - `spawn_reviewer(feature_id, unit_id)` — read-only reviewer posts via
-  `gh pr review`. Returns `REVIEW_APPROVED` / `REVIEW_REQUEST_CHANGES` /
-  `REVIEW_COMMENT` / `BLOCKED`. Under NTFY+daemon: returns ≤3s. Without
-  either: BLOCKS minutes. **Same CI-red refusal.** Explicit
+  `gh pr review`. Under NTFY+daemon: returns ≤3s with an async-handoff
+  envelope (daemon records `REVIEW_RECOMMEND_MERGE` /
+  `REVIEW_REQUEST_CHANGES` / `REVIEW_COMMENT` / `BLOCKED` on a later
+  tick — `REVIEW_RECOMMEND_MERGE` flips the unit to
+  `approved_awaiting_merge`). Without either: BLOCKS minutes and
+  returns the marker inline. **Same CI-red refusal.** (`REVIEW_APPROVED`
+  is deprecated — the orchestrator never uses GitHub's `--approve`;
+  endorsement is `REVIEW_RECOMMEND_MERGE`.) Explicit
   `spawn_reviewer_async` / `spawn_reviewer_blocking` always available.
 - `address_review(unit_id, source, feedback)` — resume coder to address
   feedback from `tester`|`reviewer`|`ci`|`human`|`ultrareview`. Increments

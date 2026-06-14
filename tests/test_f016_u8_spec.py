@@ -150,10 +150,14 @@ class _FakeAsyncWorker:
 def _install_fake_async_worker(monkeypatch) -> dict[str, _FakeAsyncWorker]:
     """Patch ``make_worker`` to return per-role fakes; return the dict.
 
-    Patches ``make_worker`` at the import site used by the new Phase 6
-    helpers (``orchestrator.tools.execution.make_worker``) AND the
-    daemon's cached-worker entry so a daemon tick sees a deterministic
-    tail.
+    Patches only the dispatcher-side import (``orchestrator.tools.execution.make_worker``)
+    — these fakes are consumed by ``spawn_*_async`` / ``send_to_unit_async`` /
+    ``address_review_async``. The daemon resolves its own workers through
+    ``orchestrator.daemon._cached_worker``; daemon-tick tests
+    (:class:`TestDaemonDrivesAsyncDispatchedPhasesToTerminal`) patch
+    ``orchestrator.daemon.make_worker`` plus call
+    :func:`daemon.reset_worker_cache` explicitly. (PR #70 review thread on
+    this helper's docstring.)
     """
     workers: dict[str, _FakeAsyncWorker] = {
         "coder": _FakeAsyncWorker(role="coder", next_session_id="sess-coder"),
@@ -176,9 +180,14 @@ class TestDispatchOrBlockHelper:
     NTFY-vs-daemon gate's edge cases (PR #64 reviewer M1 fence).
     """
 
-    def test_async_branch_under_ntfy_plus_daemon(
+    def test_blocking_branch_runs_when_ntfy_set_but_daemon_down(
         self, tmp_state_db, with_ntfy_topic, with_github_token
     ):
+        """NTFY is set but no daemon lock is seeded → Risk R1 fallback
+        path takes the blocking branch. Earlier revisions of this test
+        were named ``test_async_branch_under_ntfy_plus_daemon`` which
+        was misleading: NTFY+daemon is what TestRunsAsyncBranch pins,
+        not this case (PR #70 review thread)."""
         calls: list[str] = []
         result = execution._dispatch_or_block(
             async_fn=lambda d: (calls.append(f"async/{d['running']}"), "ASYNC")[1],
@@ -752,6 +761,14 @@ class TestDaemonDrivesAsyncDispatchedPhasesToTerminal:
             },
         )
         monkeypatch.setattr("orchestrator.daemon.make_worker", lambda _r: worker)
+        # PR #70 review: ``daemon.reconcile_unit`` resolves workers via
+        # ``daemon._cached_worker`` which memoizes per-process. The
+        # autouse ``_reset_daemon_worker_cache`` fixture
+        # (tests/conftest.py) clears the cache between tests, but a
+        # test that calls ``_drive_with_marker`` more than once would
+        # otherwise reuse the first call's fake — drop the cache
+        # explicitly so the patched factory is consulted every call.
+        daemon.reset_worker_cache()
         # No PR-side F-014 probe — keep marker-only assertion scope.
         monkeypatch.setattr(daemon, "_probe_and_decide_unit", lambda _u: [])
         daemon.reconcile_unit(unit_id)
@@ -915,10 +932,192 @@ class TestParallelUnitsRoutesPerUnitThroughAsync:
         # Both units got past the spawn step (no "no_pr" early-bail).
         # The pre-U-8 _run_one would have returned outcome="no_pr"
         # for both — the post-U-8 contract chains through cycle_review.
+        # PR #70 review M4: also pin the positive contract — the spawn
+        # MUST land via the async daemon mode AND the cycle_review
+        # delegation MUST report mode=async_daemon — so a future
+        # regression that silently strands the unit on a different
+        # ``outcome`` breaks this test, not just the no_pr-specific case.
         for r in parsed["results"]:
             assert r.get("phase") != "spawn" or r.get("outcome") != "no_pr", (
                 f"unit {r['unit_id']} stranded on no_pr early-bail; "
                 "U-8 parallel_units must route async handoff through cycle_review"
             )
+            assert r.get("spawn_mode") == "async_daemon", (
+                f"unit {r['unit_id']} spawn did not flip to async_daemon mode under "
+                f"NTFY+daemon; got spawn_mode={r.get('spawn_mode')!r}, full result={r!r}"
+            )
+            assert r.get("cycle_mode") == "async_daemon", (
+                f"unit {r['unit_id']} cycle_review did not delegate to async_daemon; "
+                f"got cycle_mode={r.get('cycle_mode')!r}"
+            )
         # Both coder spawn_async submits landed.
         assert sum(1 for s in coder.submissions if s["op"] == "spawn_async") == 2
+
+
+# --------------------------- C1 race-fix regression ---------------------------
+
+
+class TestAsyncHelpersAcquireLockBeforeStateSeeding:
+    """PR #70 C1: async-resume helpers MUST take ``lead_advance_lock``
+    BEFORE incrementing review_round / flipping status / recording
+    audit events.
+
+    Coder, tester, and reviewer sessions are NOT archived between
+    phases, so the previous cycle's terminal marker stays in the tail
+    for the unit's whole lifetime. If the state seeding happens
+    outside the lock, a daemon tick interleaved between the status
+    flip and the lock claim can observe the stale marker, record it
+    under the bumped cycle_number (defeating dedupe), and flip status
+    prematurely — before the new prompt has even been submitted.
+
+    These tests verify the lock is held while ``state.touch_unit`` /
+    ``state.increment_review_round`` / ``state.record_event`` fire, by
+    making ``worker.resume_async`` / ``worker.spawn_async`` introspect
+    the row's ``owner`` column at the moment of the worker call.
+    """
+
+    def _coding_unit_with_session(self, status: str = "fixing") -> None:
+        """Seed a unit that's eligible for the async-resume helpers."""
+        _setup_feature()
+        state.upsert_unit_state(
+            WorkUnitState(
+                unit_id="F-016-U-8-T",
+                feature_id="F-001",
+                status=status,
+                branch="feat/branch",
+                pr_number=5,
+                coder_session_id="sesn-c",
+                tester_session_id="sesn-t",
+                reviewer_session_id="sesn-r",
+                review_round=0,
+            )
+        )
+
+    @staticmethod
+    def _owner_capturing_worker(captured: dict[str, Any]):
+        """Worker double whose ``resume_async`` / ``spawn_async`` capture
+        the unit's ``owner`` column at the moment of the worker call.
+
+        The daemon's ``_is_actionable`` reads the ``owner`` column via
+        :func:`state.has_active_advance_lock`; ``owner=='lead'`` is the
+        load-bearing signal it defers. If the column reads ``''`` at
+        the worker-call instant, the seeding ran outside the lock and
+        the daemon could have ticked in the gap.
+        """
+
+        class _Worker:
+            def spawn_async(self, task: str, *, title: str | None = None) -> str:
+                captured["lock_held_at_submit"] = state.has_active_advance_lock("F-016-U-8-T")
+                return "sess-new"
+
+            def resume_async(self, session_id: str, msg: str) -> None:
+                captured["lock_held_at_submit"] = state.has_active_advance_lock("F-016-U-8-T")
+
+        return _Worker()
+
+    @staticmethod
+    def _owner_capturing_at_touch(captured: dict[str, Any], monkeypatch) -> None:
+        """Patch ``state.touch_unit`` to record the lock state when the
+        status flip lands.
+
+        This is the load-bearing assertion: the lock MUST be held BEFORE
+        ``touch_unit`` runs. Pre-PR-70-C1 the lock was acquired AFTER
+        the status flip — so a daemon tick in the gap could observe the
+        stale marker and apply the per-marker terminal transition
+        before the lead's submit lands.
+        """
+        original = state.touch_unit
+
+        def capturing_touch(unit_id: str, **kwargs):
+            captured["lock_held_at_touch"] = state.has_active_advance_lock(unit_id)
+            return original(unit_id, **kwargs)
+
+        monkeypatch.setattr(state, "touch_unit", capturing_touch)
+
+    def test_address_review_async_holds_lock_during_state_seeding(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        self._coding_unit_with_session(status="in_ci")
+        captured: dict[str, Any] = {}
+        self._owner_capturing_at_touch(captured, monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.make_worker",
+            lambda _r: self._owner_capturing_worker(captured),
+        )
+        execution.address_review_async("F-016-U-8-T", "tester", "fix")
+        assert captured["lock_held_at_touch"] is True, (
+            "PR #70 C1: address_review_async flipped status='fixing' OUTSIDE "
+            "the lead_advance_lock — daemon could observe stale FIX_PUSHED "
+            "in the coder tail and flip fixing→in_ci before the new prompt "
+            "is submitted."
+        )
+        assert captured["lock_held_at_submit"] is True
+
+    def test_resume_tester_async_holds_lock_during_state_seeding(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        self._coding_unit_with_session(status="in_ci")
+        captured: dict[str, Any] = {}
+        self._owner_capturing_at_touch(captured, monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.make_worker",
+            lambda _r: self._owner_capturing_worker(captured),
+        )
+        # ``_resume_tester_async`` is exercised via ``spawn_tester_async``
+        # whenever the unit has a non-empty ``tester_session_id``.
+        execution.spawn_tester_async("F-001", "F-016-U-8-T")
+        assert captured["lock_held_at_touch"] is True, (
+            "PR #70 C1: _resume_tester_async flipped status='testing' OUTSIDE "
+            "the lead_advance_lock — daemon could observe stale TESTS_PASS "
+            "in the tester tail and flip testing→in_ci before the recovery "
+            "prompt is submitted."
+        )
+        assert captured["lock_held_at_submit"] is True
+
+    def test_resume_reviewer_async_holds_lock_during_state_seeding(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        self._coding_unit_with_session(status="in_ci")
+        captured: dict[str, Any] = {}
+        self._owner_capturing_at_touch(captured, monkeypatch)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.make_worker",
+            lambda _r: self._owner_capturing_worker(captured),
+        )
+        # ``_resume_reviewer_async`` runs when ``reviewer_session_id`` is set.
+        execution.spawn_reviewer_async("F-001", "F-016-U-8-T")
+        assert captured["lock_held_at_touch"] is True, (
+            "PR #70 C1: _resume_reviewer_async flipped status='reviewing' OUTSIDE "
+            "the lead_advance_lock — daemon could observe stale "
+            "REVIEW_RECOMMEND_MERGE in the reviewer tail and flip "
+            "reviewing→approved_awaiting_merge before the recovery prompt "
+            "is submitted."
+        )
+        assert captured["lock_held_at_submit"] is True
+
+    def test_review_round_bumped_inside_lock_on_address_review_async(
+        self, tmp_state_db, with_github_token, monkeypatch
+    ):
+        """Round bump under the lock matters too: if it happens outside,
+        the daemon's ``_record_marker`` writes the stale marker under
+        the bumped cycle_number and ``_apply_marker_transition`` lands
+        the transition (the dedupe key is keyed on cycle_number)."""
+        self._coding_unit_with_session(status="in_ci")
+        captured: dict[str, int] = {}
+        original = state.increment_review_round
+
+        def capturing_increment(unit_id: str) -> int:
+            captured["lock_held_at_increment"] = state.has_active_advance_lock(unit_id)
+            return original(unit_id)
+
+        monkeypatch.setattr(state, "increment_review_round", capturing_increment)
+        monkeypatch.setattr(
+            "orchestrator.tools.execution.make_worker",
+            lambda _r: self._owner_capturing_worker({}),
+        )
+        execution.address_review_async("F-016-U-8-T", "tester", "fix")
+        assert captured["lock_held_at_increment"] is True, (
+            "PR #70 C1: review_round was incremented OUTSIDE the lock; a "
+            "daemon tick in the gap will write the stale FIX_PUSHED under "
+            "the BUMPED cycle_number and bypass the dedupe key."
+        )

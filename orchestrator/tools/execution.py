@@ -125,7 +125,7 @@ def spawn_unit(feature_id: str, unit_id: str) -> str:
         return err
 
     return _dispatch_or_block(
-        async_fn=lambda _daemon_info: spawn_unit_async(feature_id, unit_id),
+        async_fn=lambda _daemon_info: _spawn_unit_async_impl(feature_id, unit_id),
         blocking_fn=lambda: _spawn_unit_blocking_impl(feature_id, unit_id),
     )
 
@@ -347,7 +347,20 @@ def spawn_unit_async(feature_id: str, unit_id: str) -> str:
     """
     if err := ensure_verified_for_feature(feature_id):
         return err
+    return _spawn_unit_async_impl(feature_id, unit_id)
 
+
+def _spawn_unit_async_impl(feature_id: str, unit_id: str) -> str:
+    """Engine body of :func:`spawn_unit_async` — assumes verified.
+
+    Direct callers (the Phase 6 :func:`spawn_unit` dispatcher) skip
+    the verify gate because the dispatcher already ran it; the public
+    :func:`spawn_unit_async` wrapper keeps the gate for explicit MCP
+    callers. PR #70 reviewer M3: matches the
+    ``_spawn_unit_blocking_impl`` / ``_address_review_*_impl`` shape
+    so every Phase 6 surface skips the redundant SQLite read the
+    dispatcher already paid for.
+    """
     feature = state.get_feature(feature_id)
     if not feature:
         return f"ERROR: feature {feature_id} not found"
@@ -656,17 +669,22 @@ def _spawn_tester_async_impl(feature_id: str, unit_id: str) -> str:
         github_token,
         **_task_context_kwargs(feature, unit),
     )
-    state.touch_unit(unit_id, status="testing")
-    state.record_event(
-        unit_id,
-        feature_id,
-        "spawn_tester_async",
-        source="orchestrator",
-        cycle_number=unit_state.review_round,
-        summary=f"Dispatching tester for {unit_id} (non-blocking)",
-    )
 
+    # PR #70 C1: cold-spawn path is "safe by accident" today (empty
+    # ``tester_session_id`` makes ``_scan_role`` short-circuit before
+    # any tail read), but mirror the lock-then-seed shape so a future
+    # change that pre-seeds a session id can't reintroduce the race.
+    # See :func:`_resume_tester_async` for the load-bearing case.
     with state.lead_advance_lock(unit_id):
+        state.touch_unit(unit_id, status="testing")
+        state.record_event(
+            unit_id,
+            feature_id,
+            "spawn_tester_async",
+            source="orchestrator",
+            cycle_number=unit_state.review_round,
+            summary=f"Dispatching tester for {unit_id} (non-blocking)",
+        )
         try:
             worker = make_worker("tester")
             session_id = worker.spawn_async(task, title=f"tester {unit_id}")
@@ -717,23 +735,31 @@ def _resume_tester_async(*, feature: Any, unit_state: WorkUnitState) -> str:
     the daemon observe the reply. Mirrors the synchronous helper's
     status flip + audit row so a later daemon tick picks the unit up
     with consistent state.
+
+    PR #70 C1: the advance lock wraps the entire "seed + submit"
+    section. Tester sessions are not archived between phases either,
+    so a previous cycle's ``TESTS_PASS`` lives in the tail; if we
+    flipped ``status='testing'`` outside the lock, a daemon tick in
+    the gap could re-apply the stale ``TESTS_PASS`` (per
+    ``_MARKER_SOURCE_STATUSES['testing']``) and prematurely flip
+    ``testing → in_ci`` before the recovery prompt is submitted.
     """
     unit_id = unit_state.unit_id
     session_id = unit_state.tester_session_id
     cycle_number = unit_state.review_round
     reason = _derive_recovery_reason(unit_state)
-    state.touch_unit(unit_id, status="testing", clear_error=True)
-    state.record_event(
-        unit_id,
-        feature.id,
-        "tester_resume_async",
-        source="orchestrator",
-        cycle_number=cycle_number,
-        session_id=session_id,
-        summary=f"Resuming orphaned tester session async ({reason})",
-    )
 
     with state.lead_advance_lock(unit_id):
+        state.touch_unit(unit_id, status="testing", clear_error=True)
+        state.record_event(
+            unit_id,
+            feature.id,
+            "tester_resume_async",
+            source="orchestrator",
+            cycle_number=cycle_number,
+            session_id=session_id,
+            summary=f"Resuming orphaned tester session async ({reason})",
+        )
         try:
             worker = make_worker("tester")
             worker.resume_async(
@@ -1042,17 +1068,19 @@ def _spawn_reviewer_async_impl(feature_id: str, unit_id: str) -> str:
     task = compose_reviewer_task(
         feature, unit, unit_state.pr_number, github_token, **reviewer_kwargs
     )
-    state.touch_unit(unit_id, status="reviewing")
-    state.record_event(
-        unit_id,
-        feature_id,
-        "spawn_reviewer_async",
-        source="orchestrator",
-        cycle_number=unit_state.review_round,
-        summary=f"Dispatching reviewer for {unit_id} (non-blocking)",
-    )
 
+    # PR #70 C1: same lock-then-seed shape as :func:`_spawn_tester_async_impl`
+    # — see that docstring for the cold-spawn "safe by accident" caveat.
     with state.lead_advance_lock(unit_id):
+        state.touch_unit(unit_id, status="reviewing")
+        state.record_event(
+            unit_id,
+            feature_id,
+            "spawn_reviewer_async",
+            source="orchestrator",
+            cycle_number=unit_state.review_round,
+            summary=f"Dispatching reviewer for {unit_id} (non-blocking)",
+        )
         try:
             worker = make_worker("reviewer")
             session_id = worker.spawn_async(task, title=f"reviewer {unit_id}")
@@ -1093,23 +1121,32 @@ def _spawn_reviewer_async_impl(feature_id: str, unit_id: str) -> str:
 
 
 def _resume_reviewer_async(*, feature: Any, unit_state: WorkUnitState) -> str:
-    """Async mirror of :func:`_resume_role_for_recovery` for the reviewer role."""
+    """Async mirror of :func:`_resume_role_for_recovery` for the reviewer role.
+
+    PR #70 C1: the advance lock wraps the entire "seed + submit"
+    section — see :func:`_resume_tester_async`'s docstring for the
+    stale-marker race. The reviewer role's case mirrors it:
+    ``_MARKER_SOURCE_STATUSES['reviewing']`` admits a stale
+    ``REVIEW_RECOMMEND_MERGE`` that would prematurely flip
+    ``reviewing → approved_awaiting_merge`` before the lead's
+    delta/recovery prompt is submitted.
+    """
     unit_id = unit_state.unit_id
     session_id = unit_state.reviewer_session_id
     cycle_number = unit_state.review_round
     reason = _derive_recovery_reason(unit_state)
-    state.touch_unit(unit_id, status="reviewing", clear_error=True)
-    state.record_event(
-        unit_id,
-        feature.id,
-        "reviewer_resume_async",
-        source="orchestrator",
-        cycle_number=cycle_number,
-        session_id=session_id,
-        summary=f"Resuming orphaned reviewer session async ({reason})",
-    )
 
     with state.lead_advance_lock(unit_id):
+        state.touch_unit(unit_id, status="reviewing", clear_error=True)
+        state.record_event(
+            unit_id,
+            feature.id,
+            "reviewer_resume_async",
+            source="orchestrator",
+            cycle_number=cycle_number,
+            session_id=session_id,
+            summary=f"Resuming orphaned reviewer session async ({reason})",
+        )
         try:
             worker = make_worker("reviewer")
             worker.resume_async(
@@ -1339,17 +1376,24 @@ def _format_reviewer_marker_response(
 _ADDRESS_REVIEW_SOURCES = ("tester", "reviewer", "ci", "human", "ultrareview", "merge")
 
 
-def _address_review_preflight(unit_id: str, source: str) -> str | None:
-    """Validate ``unit_id`` + ``source`` for both ``address_review`` paths.
+def _address_review_preflight(unit_id: str) -> str | None:
+    """Validate the unit-state preconditions for both ``address_review`` paths.
 
     Returns the canonical ERROR string the public surfaces and the
     impl helpers share — ``None`` means the request is actionable.
     Hoisted out of :func:`_address_review_blocking_impl` so the new
     :func:`_address_review_async_impl` surfaces the same diagnostics.
-    """
-    if source not in _ADDRESS_REVIEW_SOURCES:
-        return f"ERROR: source must be tester|reviewer|ci|human|ultrareview|merge, got {source!r}"
 
+    Source-vocabulary validation lives in every public entry point
+    (``address_review`` dispatcher + ``address_review_async`` /
+    ``address_review_blocking`` wrappers) because the
+    ``"source must be …"`` diagnostic MUST fire BEFORE the verify
+    gate — the order is pinned by
+    :class:`tests.test_tools_execution.TestAddressReview.test_bad_source`.
+    The preflight runs after those entry-point checks, so duplicating
+    the source check here is what PR #70 reviewer M1 flagged as drift
+    risk: one constant, one check site.
+    """
     unit_state = state.get_unit_state(unit_id)
     if not unit_state:
         return f"ERROR: no state for unit {unit_id}"
@@ -1444,7 +1488,7 @@ def _address_review_async_impl(unit_id: str, source: str, feedback: str) -> str:
     closes the loop by observing the worker's ``FIX_PUSHED`` /
     ``BLOCKED`` reply.
     """
-    if err := _address_review_preflight(unit_id, source):
+    if err := _address_review_preflight(unit_id):
         return err
     unit_state = state.get_unit_state(unit_id)
     # ``_address_review_preflight`` short-circuits on ``unit_state is None``
@@ -1459,22 +1503,6 @@ def _address_review_async_impl(unit_id: str, source: str, feedback: str) -> str:
     if not feature or not unit:
         return f"ERROR: feature/unit lookup failed for {unit_id}"
 
-    # F-018: merge source skips review_round bump — see blocking impl.
-    if source == "merge":
-        round_num = unit_state.review_round
-    else:
-        round_num = state.increment_review_round(unit_id)
-    state.touch_unit(unit_id, status="fixing")
-    state.record_event(
-        unit_id,
-        unit_state.feature_id,
-        "coder_resumed_async",
-        source=source,
-        cycle_number=round_num,
-        summary=f"Address feedback from {source} (async)",
-        details=feedback[:1000],
-    )
-
     fix_msg = compose_fix_task(
         feature,
         unit,
@@ -1485,10 +1513,37 @@ def _address_review_async_impl(unit_id: str, source: str, feedback: str) -> str:
         **_task_context_kwargs(feature, unit),
     )
 
-    # Hold the advance lock for the ~1s submit window so a same-tick
-    # daemon doesn't race ``advance_state_machine`` on this unit
-    # mid-submit. Same posture as :func:`send_to_unit_async`.
+    # PR #70 C1: acquire the advance lock BEFORE seeding cycle / status
+    # / event. Coder sessions are never archived between phases, so the
+    # previous cycle's ``FIX_PUSHED`` stays in the tail forever. If we
+    # bump ``review_round`` and flip ``status='fixing'`` outside the
+    # lock, a daemon tick in the gap will:
+    #   1. ``_scan_role('coder')`` reads the persistent FIX_PUSHED;
+    #   2. ``_record_marker`` writes a fresh row under the BUMPED
+    #      cycle_number (dedupe defeated);
+    #   3. ``_apply_marker_transition`` allows FIX_PUSHED from
+    #      ``fixing`` (per ``_MARKER_SOURCE_STATUSES``) and flips
+    #      ``fixing → in_ci`` BEFORE the lead actually submits the new
+    #      prompt.
+    # ``send_to_unit_async`` is the correct shape: the lock wraps both
+    # the state writes AND the submit so the daemon sees a coherent
+    # "seed + submit" transition.
     with state.lead_advance_lock(unit_id):
+        # F-018: merge source skips review_round bump — see blocking impl.
+        if source == "merge":
+            round_num = unit_state.review_round
+        else:
+            round_num = state.increment_review_round(unit_id)
+        state.touch_unit(unit_id, status="fixing")
+        state.record_event(
+            unit_id,
+            unit_state.feature_id,
+            "coder_resumed_async",
+            source=source,
+            cycle_number=round_num,
+            summary=f"Address feedback from {source} (async)",
+            details=feedback[:1000],
+        )
         try:
             worker = make_worker("coder")
             worker.resume_async(unit_state.coder_session_id, fix_msg)
@@ -1572,7 +1627,7 @@ def address_review_blocking(unit_id: str, source: str, feedback: str) -> str:
 
 def _address_review_blocking_impl(unit_id: str, source: str, feedback: str) -> str:
     """Engine body of :func:`address_review_blocking` — assumes verified."""
-    if err := _address_review_preflight(unit_id, source):
+    if err := _address_review_preflight(unit_id):
         return err
     unit_state = state.get_unit_state(unit_id)
     # See :func:`_address_review_async_impl` for the assert rationale —
