@@ -270,6 +270,14 @@ class TestSpawnUnitAsyncPersistsSessionId:
         assert "ERROR" in msg
 
     def test_rejects_unit_with_existing_coder_session(self, tmp_state_db):
+        """F-016-U-9 ghost-row guard: status-based refusal on re-spawn.
+
+        Pre-U-9 the guard fired on ``existing.coder_session_id != ""``.
+        The new guard is status-based — refuses on
+        ``{coding, opening_pr, in_ci, testing, reviewing, fixing,
+        escalated}`` so a failed blocking spawn (no session_id
+        persisted) is ALSO caught.
+        """
         _seed_feature()
         state.upsert_unit_state(
             WorkUnitState(
@@ -282,7 +290,7 @@ class TestSpawnUnitAsyncPersistsSessionId:
         )
         msg = execution.spawn_unit_async("F-016", "F-016-U-1")
         assert "ERROR" in msg
-        assert "sesn-existing" in msg
+        assert "status='coding'" in msg
 
     def test_spawn_async_failure_escalates(self, tmp_state_db, monkeypatch):
         """If worker.spawn_async raises (e.g. Anthropic API down), the unit

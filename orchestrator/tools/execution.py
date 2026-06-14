@@ -94,6 +94,201 @@ def _task_context_kwargs(feature: Feature, unit: WorkUnit) -> dict[str, Any]:
 REVIEWER_OWN_LOG_MIN_ROUND = 2
 
 
+# --------------------------- F-016-U-9 anti-loop hardening ---------------------------
+
+# Status-based ghost-row guard: refuse re-spawn when an existing row is
+# actively being worked, has escalated, OR carries a terminal/endorsed
+# merge record. The existing ``coder_session_id != ""`` check
+# (execution.py pre-U-9) fired only on successful first spawns; a
+# blocking spawn that died on a network read timeout never persisted
+# the session id and so the row stayed re-spawnable forever (root cause
+# of the 2026-06-10 12h re-spawn loop).
+#
+# Crucially this set INCLUDES ``done`` and ``approved_awaiting_merge``
+# (via :data:`TERMINAL_UNIT_STATUSES` and :data:`READY_TO_MERGE_STATUSES`).
+# Both carry a ``coder_session_id`` + ``pr_number`` from the original
+# spawn, and the upsert further down in ``spawn_unit`` would otherwise
+# blank those columns to constructor defaults — silently destroying
+# the merge record / endorsement on a stray re-spawn. The pre-U-9
+# ``coder_session_id != ""`` check caught that case; restoring it via
+# the status guard preserves the terminal-merge protection.
+#
+# Including ``escalated`` is the cap-3 backstop: a unit the cap pushed
+# to escalated must not be auto-resurrected by a caller that bypasses
+# the cap check. The documented recovery for a cap-escalated row is
+# ``cancel_unit → spawn_unit`` — see :func:`_is_cancel_refused` for
+# the carve-out that lets ``cancel_unit`` flip such rows back through
+# ``cancelled``.
+#
+# Statuses NOT in this set (``pending`` / ``cancelled``) accept a fresh
+# spawn — ``cancelled`` is the documented post-cancel re-dispatch path.
+_RESPAWN_REFUSED_STATUSES: frozenset[str] = (
+    ACTIVE_UNIT_STATUSES | READY_TO_MERGE_STATUSES | TERMINAL_UNIT_STATUSES
+)
+
+# Failed-spawn cap: after this many consecutive ``coder_error`` events at
+# ``cycle_number=0`` with no session_id ever persisted, the unit is
+# force-escalated and ntfy fires. Counter resets once a spawn successfully
+# persists a session_id (any of the PR_URL / BLOCKED / coder_no_marker
+# branches all write a session_id) or when the user explicitly resets
+# the row via ``cancel_unit`` (the ``unit_cancelled`` event is the
+# user-intent reset signal — see :func:`_consecutive_failed_spawns`).
+# Spec § U-9 attempt cap.
+SPAWN_FAILURE_CAP = 3
+
+# Sentinel prefix on ``last_error`` so :func:`_is_cancel_refused` can
+# distinguish a cap-escalated row (cancel_unit should reset it — the
+# documented recovery path) from a regular escalation (cancel_unit
+# refuses, preserving the triage anchor). Written by
+# :func:`_escalate_spawn_cap`.
+_SPAWN_FAILURE_CAP_LAST_ERROR_PREFIX = "BLOCKED [spawn_failure_cap]:"
+
+
+def _ghost_row_guard(unit_id: str) -> str | None:
+    """F-016-U-9: refuse re-spawn on an actively-worked / escalated row.
+
+    Returns an actionable error string when the row is in
+    :data:`_RESPAWN_REFUSED_STATUSES`; returns ``None`` on a clean first
+    spawn (no row, or a row in ``pending`` / ``cancelled`` /
+    ``approved_awaiting_merge`` / ``done``).
+
+    Two paths point the caller at the right recovery:
+
+    - **active status** (``coding`` / ``opening_pr`` / ``in_ci`` /
+      ``testing`` / ``reviewing`` / ``fixing``): a worker is (or was)
+      driving the unit. Either it's still alive — use
+      ``inspect_unit_health`` / ``resume_unit`` to confirm — or it died
+      mid-flight; clear with ``cancel_unit`` before re-dispatching.
+    - **escalated**: the cap has already surfaced this unit. The user
+      has not yet decided. ``cancel_unit`` (explicit reset) is the gate
+      for re-dispatch.
+    """
+    existing = state.get_unit_state(unit_id)
+    if existing is None:
+        return None
+    if existing.status not in _RESPAWN_REFUSED_STATUSES:
+        return None
+    return (
+        f"ERROR: unit {unit_id} already exists with status={existing.status!r}. "
+        f"Refusing to re-spawn — a stale row from a failed blocking spawn would "
+        f"otherwise loop forever. Use inspect_unit_health({unit_id}) or "
+        f"resume_unit({unit_id}, 'coder') to check the real worker state, or "
+        f"cancel_unit({unit_id}) to explicitly reset before re-dispatching."
+    )
+
+
+def _consecutive_failed_spawns(unit_id: str) -> int:
+    """Count ``coder_error`` events at ``cycle_number=0`` since the most
+    recent reset signal.
+
+    Reset rules (spec § U-9 + H1 cap recovery): the counter zeroes on
+    the first reset signal seen walking events newest-first. Two reset
+    signals are recognised:
+
+    1. Any row whose ``session_id`` column is non-empty — proof a
+       spawn successfully reached a state where a coder session
+       existed. Rows that carry a session id include:
+
+       - ``spawn_unit`` happy paths: ``pr_opened`` / ``coder_blocked`` /
+         ``coder_no_marker`` (each ``record_event`` call passes
+         ``session_id=session_id``).
+       - ``spawn_unit_async`` happy path: the ``coder_session_persisted``
+         event written right after the work_units row update.
+       - Downstream role events (marker scans, resumes) that carry the
+         session id.
+
+    2. A ``unit_cancelled`` event — explicit user intent to restart
+       from scratch. Without this, a cap-escalated row that the user
+       cancels (the documented post-cap recovery, see H1) would still
+       see the prior failures in the count and immediately re-escalate
+       via the cap path on the next spawn attempt. The cancel IS the
+       reset gesture.
+
+    Failure rows (``coder_error``) are emitted with ``session_id=""``,
+    so they never act as a reset signal — only as counter increments.
+
+    Uses :func:`state.tail_events` (newest-first) so the dedupe stays
+    correct on units past the ~200-event ``list_events`` LIMIT — a
+    long-lived unit with hundreds of fix-cycle events would otherwise
+    only see the oldest 200 rows and miscount the recent tail.
+    """
+    events = state.tail_events(unit_id)
+    count = 0
+    for ev in events:
+        if ev.get("session_id"):
+            return count
+        if ev.get("event_type") == "unit_cancelled":
+            return count
+        if ev.get("event_type") == "coder_error" and ev.get("cycle_number") == 0:
+            count += 1
+    return count
+
+
+def _escalate_spawn_cap(
+    unit_id: str,
+    feature_id: str,
+    *,
+    attempts: int,
+) -> str:
+    """Force-escalate a unit that hit :data:`SPAWN_FAILURE_CAP`. Returns the chat message.
+
+    Records the cap-hit event with a dedupe key so a same-process retry
+    (or a parallel ``spawn_unit`` + ``spawn_unit_async`` race) doesn't
+    double-emit. Fires the ntfy escalation push only when the event
+    actually landed (``record_event`` returns ``True``) — gating on
+    the dedupe result prevents a same-attempt re-check or a
+    cross-process race from double-paging the user (M2).
+
+    Uses :func:`state.touch_unit` for the column-selective status +
+    last_error update so any session-id columns another path may have
+    written stay intact (M1). The pre-U-9 path used
+    ``upsert_unit_state`` with a fresh :class:`WorkUnitState`, which
+    blanked ``coder_session_id`` / ``pr_number`` / ``review_round`` to
+    constructor defaults on every cap hit — fine in the cap's typical
+    "no session ever existed" path but a latent footgun once
+    downstream surfaces (U-8 dispatcher) route session-bearing rows
+    through here.
+    """
+    last_error = (
+        f"{_SPAWN_FAILURE_CAP_LAST_ERROR_PREFIX} {attempts} consecutive coder spawn "
+        f"failures with no persisted session_id — likely a worker-backend network "
+        f"read-timeout loop. Manual triage required."
+    )
+    # ``touch_unit`` is an UPDATE — the row must exist at this point,
+    # which is the case on every call path that reaches here (the
+    # blocking + async spawn helpers both ``upsert_unit_state`` /
+    # ``touch_unit`` the row before they call the cap helper). The
+    # column-selective UPDATE preserves any session_id / pr_number /
+    # review_round another path may have written.
+    state.touch_unit(unit_id, status="escalated", error=last_error)
+    # Per-attempt-bucket dedupe so a same-process retry that hits the
+    # cap again on the same lockstep counter writes exactly one row.
+    inserted = state.record_event(
+        unit_id,
+        feature_id,
+        "spawn_failure_cap_hit",
+        source="orchestrator",
+        cycle_number=0,
+        summary=(
+            f"cap-{SPAWN_FAILURE_CAP} on consecutive failed coder spawns "
+            f"({attempts} attempts, no session persisted)"
+        ),
+        details=last_error,
+        dedupe_key=f"spawn_failure_cap_hit:{unit_id}:{attempts}",
+    )
+    # Gate the push on the dedupe result so the user isn't double-paged
+    # by a retry / multi-process race that the dedupe_key suppressed
+    # at the event layer. M2.
+    if inserted:
+        ntfy.push_escalation(unit_id, last_error, reason_slug="spawn_failure_cap")
+    return (
+        f"ESCALATED — unit {unit_id} hit cap-{SPAWN_FAILURE_CAP} on consecutive "
+        f"coder spawn failures with no session persisted. Likely root cause: a "
+        f"worker-backend network read-timeout loop. Manual triage required.\n"
+        f"Last error: {last_error}"
+    )
+
+
 # --------------------------- spawn_unit (coder) ---------------------------
 
 
@@ -124,18 +319,26 @@ def spawn_unit(feature_id: str, unit_id: str) -> str:
     if not unit:
         return f"ERROR: unit {unit_id} not in plan for {feature_id}"
 
-    existing = state.get_unit_state(unit_id)
-    if existing and existing.coder_session_id:
-        return (
-            f"ERROR: unit {unit_id} already has coder session {existing.coder_session_id}. "
-            f"Use cycle_review or address_review to advance it."
-        )
+    if err := _ghost_row_guard(unit_id):
+        return err
 
     if err := need_github_token():
         return err
     github_token = get_agent_token()
 
     branch = branch_for(feature, unit)
+
+    # F-016-U-9 cap-3 backstop: if the prior N spawn attempts all died
+    # before persisting a session_id, refuse a fourth attempt and force-
+    # escalate. The ghost-row guard above is the first defence (it
+    # catches the in-active-status case); this cap catches the rarer
+    # case where a caller bypassed that guard (e.g. cancel_unit reset
+    # the row between attempts) yet the underlying failure cause is
+    # persistent.
+    failed = _consecutive_failed_spawns(unit_id)
+    if failed >= SPAWN_FAILURE_CAP:
+        return _escalate_spawn_cap(unit_id, feature_id, attempts=failed)
+
     task = compose_coder_task(
         feature, unit, branch, github_token, **_task_context_kwargs(feature, unit)
     )
@@ -165,6 +368,14 @@ def spawn_unit(feature_id: str, unit_id: str) -> str:
             cycle_number=0,
             summary=str(e),
         )
+        # Re-check the cap with the just-recorded failure included so a
+        # 3rd consecutive failure escalates here with a proper ntfy push
+        # rather than waiting for a 4th attempt the caller may never
+        # make. The status flip + last_error above seed the escalation;
+        # _escalate_spawn_cap's upsert keeps both.
+        failed_after = _consecutive_failed_spawns(unit_id)
+        if failed_after >= SPAWN_FAILURE_CAP:
+            return _escalate_spawn_cap(unit_id, feature_id, attempts=failed_after)
         return f"ERROR spawning coder for {unit_id}: {e}"
 
     pr_match = PR_URL_RE.search(response)
@@ -317,18 +528,24 @@ def spawn_unit_async(feature_id: str, unit_id: str) -> str:
     if not unit:
         return f"ERROR: unit {unit_id} not in plan for {feature_id}"
 
-    existing = state.get_unit_state(unit_id)
-    if existing and existing.coder_session_id:
-        return (
-            f"ERROR: unit {unit_id} already has coder session {existing.coder_session_id}. "
-            f"Use wait_unit, cycle_review, or address_review to advance it."
-        )
+    if err := _ghost_row_guard(unit_id):
+        return err
 
     if err := need_github_token():
         return err
     github_token = get_agent_token()
 
     branch = branch_for(feature, unit)
+
+    # F-016-U-9 cap-3 backstop — mirrors ``spawn_unit``. The async path
+    # is structurally less prone to the ghost-row loop (it persists
+    # ``coder_session_id`` before returning), but the cap still applies
+    # for symmetry: a worker backend whose ``spawn_async`` raises every
+    # call hits the same cap before the user is paged.
+    failed = _consecutive_failed_spawns(unit_id)
+    if failed >= SPAWN_FAILURE_CAP:
+        return _escalate_spawn_cap(unit_id, feature_id, attempts=failed)
+
     task = compose_coder_task(
         feature, unit, branch, github_token, **_task_context_kwargs(feature, unit)
     )
@@ -364,6 +581,11 @@ def spawn_unit_async(feature_id: str, unit_id: str) -> str:
             cycle_number=0,
             summary=str(e),
         )
+        # Re-check cap with the just-recorded failure (see ``spawn_unit``
+        # for the rationale — caller may not retry to discover the cap).
+        failed_after = _consecutive_failed_spawns(unit_id)
+        if failed_after >= SPAWN_FAILURE_CAP:
+            return _escalate_spawn_cap(unit_id, feature_id, attempts=failed_after)
         return f"ERROR spawning coder for {unit_id}: {e}"
 
     # Persist session_id immediately. A kill from here on still leaves
@@ -378,6 +600,21 @@ def spawn_unit_async(feature_id: str, unit_id: str) -> str:
             branch=branch,
             coder_session_id=session_id,
         )
+    )
+    # F-016-U-9 cap reset: record a session-persisted event so
+    # :func:`_consecutive_failed_spawns` (which walks ``unit_events``)
+    # sees a session-bearing row and zeroes the counter. Without this,
+    # the async happy path leaves no event-side signal of success
+    # (only the work_units column flips), so a later transient failure
+    # would be falsely counted against the cap chain.
+    state.record_event(
+        unit_id,
+        feature_id,
+        "coder_session_persisted",
+        source="orchestrator",
+        cycle_number=0,
+        summary=f"coder session {session_id} persisted (async)",
+        session_id=session_id,
     )
     refreshed = state.get_unit_state(unit_id)
 
@@ -3935,7 +4172,44 @@ def send_to_unit_async(unit_id: str, message: str, role: str = "") -> str:
 # indicator the user is waiting on, and flipping ``escalated``
 # overwrites the ``last_error`` triage anchor. The ``CANCELLED_UNIT_STATUSES``
 # member is the idempotent re-call path handled separately below.
+#
+# **Carve-out (F-016-U-9 H1):** an ``escalated`` row whose
+# ``last_error`` carries the :data:`_SPAWN_FAILURE_CAP_LAST_ERROR_PREFIX`
+# sentinel IS cancellable — the documented post-cap recovery is
+# ``cancel_unit → spawn_unit``, which would otherwise be a dead-end
+# (the ghost-row guard refuses re-spawn on ``escalated``, so without
+# this carve-out the user would have to do manual SQLite surgery). The
+# ``last_error`` triage value is preserved by the cap escalation
+# itself; cancelling is the explicit user-intent reset gesture.
 _CANCEL_REFUSED_STATUSES: frozenset[str] = TERMINAL_UNIT_STATUSES | READY_TO_MERGE_STATUSES
+
+
+def _is_cancel_refused(unit_state: WorkUnitState) -> bool:
+    """Status-based cancel refusal with the spawn-failure-cap carve-out.
+
+    Returns ``True`` when ``cancel_unit`` should refuse to mutate the
+    row, ``False`` when the cancel is allowed to proceed. Used in place
+    of a bare ``unit_state.status in _CANCEL_REFUSED_STATUSES`` so the
+    F-016-U-9 H1 recovery path (cap-escalated → cancel → re-dispatch)
+    actually works end-to-end.
+
+    Refusal rules:
+
+    - ``done`` / ``approved_awaiting_merge`` → always refused (silently
+      rewriting a merge record / endorsement to ``cancelled`` is the
+      bug PR #59 C1 fixed; the cap carve-out doesn't apply here).
+    - ``escalated`` with the spawn-failure-cap sentinel on
+      ``last_error`` → allowed (documented recovery path).
+    - ``escalated`` from any other source (coder BLOCKED, manual
+      escalation, etc.) → refused (preserve the triage anchor).
+    """
+    if unit_state.status not in _CANCEL_REFUSED_STATUSES:
+        return False
+    # Cap-escalated row: allow cancel (carve-out for documented recovery).
+    return not (
+        unit_state.status == "escalated"
+        and (unit_state.last_error or "").startswith(_SPAWN_FAILURE_CAP_LAST_ERROR_PREFIX)
+    )
 
 
 def _archive_unit_sessions(unit_state: WorkUnitState) -> dict[str, str]:
@@ -4011,7 +4285,7 @@ def cancel_unit(unit_id: str) -> str:
     if not unit_state:
         return f"ERROR: no state for unit {unit_id}"
 
-    if unit_state.status in _CANCEL_REFUSED_STATUSES:
+    if _is_cancel_refused(unit_state):
         return json.dumps(
             {
                 "unit_id": unit_id,
@@ -4044,7 +4318,7 @@ def cancel_unit(unit_id: str) -> str:
         unit_state = state.get_unit_state(unit_id)
         if not unit_state:
             return f"ERROR: no state for unit {unit_id} (row vanished under lock)"
-        if unit_state.status in _CANCEL_REFUSED_STATUSES:
+        if _is_cancel_refused(unit_state):
             return json.dumps(
                 {
                     "unit_id": unit_id,
