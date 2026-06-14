@@ -144,6 +144,21 @@ When all nine units merge:
   takeover and keys per workspace.
 - **Default-flip gated on `NTFY_TOPIC`** — without a feedback channel,
   a ≤1s `cycle_review` that goes quiet is worse UX than today's blocking.
+- **U-9's `ci_drift` tail-dedupe fix shipped as a follow-up PR, not a new
+  unit.** PR #69 was merged (2026-06-14 02:35) at U-9's round-1 fix, before
+  the reviewer's re-verify closed the loop. The re-review then found the
+  dedupe still tail-unsafe past 200 events (`_should_emit_ci_drift` /
+  `_consecutive_failed_spawns` walked `list_events`'s *oldest*-N) and a
+  regression test that passed whether or not the dedupe held. The completed
+  fix — bounded `last_event_of_type` / `tail_events` queries, a regression
+  test that fails on pre-fix code, comma-safe failing-set parsing, and the
+  M1 docstring correction — was stranded on the orphaned branch by the
+  squash merge, so it lands as a direct cherry-pick PR onto `main`. Why: the
+  code was already written and reviewed against; spinning a fresh unit would
+  re-run the full plan/cycle machinery for a two-commit graft. Lesson:
+  merging before the reviewer re-verify closes can strand the very fixes the
+  re-review demands — the human stays the merge authority, but the loop
+  should close first.
 
 ## Open questions
 
