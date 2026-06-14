@@ -145,6 +145,17 @@ def _run_one(feature_id: str, unit_id: str) -> dict:
     Phase 4 dispatcher (``NTFY_TOPIC`` + daemon health), so the parallel
     callers walk the same engine the chat persona does without a parallel
     blocking path.
+
+    F-016 Phase 6 (U-8): ``spawn_unit`` is now ALSO a dispatcher (async
+    handoff under NTFY+daemon, blocking otherwise). On the async branch
+    the spawn return carries ``{"delivered": true, "status": "coding",
+    "session_id": …}`` with no ``pr_url`` (the coder hasn't opened the
+    PR yet — that lands on a later daemon tick). Pre-U-8 ``_run_one``
+    bailed on "no pr_url" which short-circuited every async dispatch
+    into a ``no_pr`` result; the post-U-8 contract treats a successful
+    async handoff as a valid intermediate state and STILL chains
+    through to ``cycle_review`` so the daemon takes ownership of the
+    full pipeline.
     """
     try:
         spawn_result = spawn_unit(feature_id, unit_id)
@@ -162,7 +173,14 @@ def _run_one(feature_id: str, unit_id: str) -> dict:
             "raw": spawn_result,
         }
 
-    if "pr_url" not in sp:
+    spawn_delivered_async = sp.get("delivered") is True and sp.get("mode") == "async_daemon"
+    # Async handoff (Phase 6 U-8): the coder is dispatched, the PR will
+    # land on a later tick. Skip the pre-U-8 "no pr_url → bail" guard so
+    # ``cycle_review`` still routes through the daemon dispatcher. The
+    # blocking path still requires ``pr_url`` because a synchronous
+    # spawn that finished without one is a real error (coder emitted no
+    # PR_URL marker — escalated).
+    if not spawn_delivered_async and "pr_url" not in sp:
         return {
             "feature_id": feature_id,
             "unit_id": unit_id,
@@ -191,8 +209,14 @@ def _run_one(feature_id: str, unit_id: str) -> dict:
     return {
         "feature_id": feature_id,
         "unit_id": unit_id,
+        # ``pr_url`` is only populated on the blocking spawn branch;
+        # async handoff returns no PR (the coder will open it on a
+        # later daemon tick). ``spawn_mode`` lets a caller tell which
+        # branch we walked without re-running ``ntfy.is_configured()``.
         "pr_url": sp.get("pr_url"),
         "pr_number": sp.get("pr_number"),
+        "spawn_mode": sp.get("mode"),
+        "spawn_delivered": sp.get("delivered"),
         # ``cy`` may be either the terminal-emit JSON (``outcome``
         # populated, ``approved_awaiting_merge`` / ``escalated`` on the
         # blocking path) OR the Phase 4 async-handoff envelope

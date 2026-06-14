@@ -55,22 +55,32 @@ gate that refuses to spawn against repos without branch protection.
 - `list_features()`
 
 **Execution (Stage 3):**
-- `spawn_unit(feature_id, unit_id)` — coder opens the PR. BLOCKS minutes.
+- `spawn_unit(feature_id, unit_id)` — coder opens the PR. Under
+  NTFY+daemon: returns ≤3s (daemon observes the coder's PR_URL).
+  Without either: BLOCKS minutes. Explicit `spawn_unit_async` /
+  `spawn_unit_blocking` always available.
 
 **Testing, review, cycle loop (Stage 4):**
 - `spawn_tester(feature_id, unit_id)` — tester writes/runs tests on the
-  coder's branch. Returns `TESTS_PASS` / `BUG_FOUND` / `BLOCKED`. BLOCKS minutes.
-  **Refuses to spawn if CI is red on the PR** — fix CI first (or use
-  `cycle_review` for the automated CI-fix loop).
+  coder's branch. Returns `TESTS_PASS` / `BUG_FOUND` / `BLOCKED`. Under
+  NTFY+daemon: returns ≤3s. Without either: BLOCKS minutes (refuses if
+  CI is red on the PR — fix CI first or use `cycle_review` for the
+  automated CI-fix loop). Explicit `spawn_tester_async` /
+  `spawn_tester_blocking` always available.
 - `spawn_reviewer(feature_id, unit_id)` — read-only reviewer posts via
   `gh pr review`. Returns `REVIEW_APPROVED` / `REVIEW_REQUEST_CHANGES` /
-  `REVIEW_COMMENT` / `BLOCKED`. BLOCKS minutes. **Same CI-red refusal.**
+  `REVIEW_COMMENT` / `BLOCKED`. Under NTFY+daemon: returns ≤3s. Without
+  either: BLOCKS minutes. **Same CI-red refusal.** Explicit
+  `spawn_reviewer_async` / `spawn_reviewer_blocking` always available.
 - `address_review(unit_id, source, feedback)` — resume coder to address
   feedback from `tester`|`reviewer`|`ci`|`human`|`ultrareview`. Increments
-  cycle counter. BLOCKS minutes. Use `source='ci'` when forwarding a CI
-  failure manually; `source='ultrareview'` is normally driven by
-  `cycle_review` itself (F-007-U-4 fix-loop), available here for manual
-  re-runs after a human reads the meta-audit findings.
+  cycle counter. Under NTFY+daemon: returns ≤3s (daemon observes the
+  coder's FIX_PUSHED). Without either: BLOCKS minutes. Use `source='ci'`
+  when forwarding a CI failure manually; `source='ultrareview'` is
+  normally driven by `cycle_review` itself (F-007-U-4 fix-loop),
+  available here for manual re-runs after a human reads the meta-audit
+  findings. Explicit `address_review_async` / `address_review_blocking`
+  always available.
 - `cycle_review(feature_id, unit_id)` — **one-call automation:** wait CI →
   tester → fix-loop → wait CI → **request GitHub Copilot review + wait** →
   reviewer → fix-loop → wait CI → (if the feature row's
@@ -265,8 +275,11 @@ gate that refuses to spawn against repos without branch protection.
 
 **Low-level / introspection:**
 - `send_to_unit(unit_id, role, message)` — manually resume any role's
-  session with arbitrary text (synchronous; blocks for the worker's
-  reply). Use sparingly; prefer the structured tools.
+  session with arbitrary text. Under NTFY+daemon: ≤3s async submit
+  (daemon observes the worker's reply later). Without either: synchronous
+  blocking resume until the worker replies. Use sparingly; prefer the
+  structured tools. Explicit `send_to_unit_async` (Phase 2.5 primitive
+  below) / `send_to_unit_blocking` always available.
 - `get_unit_status(unit_id)`, `list_units(feature_id)`
 
 **Lead/daemon interaction primitives (F-016 Phase 2.5):**
