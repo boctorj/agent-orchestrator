@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -294,7 +295,42 @@ def _escalate_spawn_cap(
 
 @mcp.tool()
 def spawn_unit(feature_id: str, unit_id: str) -> str:
+    """F-016-U-8 Phase 6 dispatcher — picks async vs. blocking by ``NTFY_TOPIC``.
+
+    Mirrors :func:`cycle_review`'s gate so every long-running lead
+    surface flips uniformly by default. Spec § Acceptance 1: ``spawn_unit``
+    is one of the seven surfaces required to return in ≤3 s under
+    NTFY+daemon.
+
+    * ``NTFY_TOPIC`` set AND the watcher daemon alive →
+      :func:`spawn_unit_async`. Returns in ≤2 s; the daemon observes
+      the coder's ``PR_URL`` marker and flips ``coding → in_ci`` on
+      its next tick.
+    * Otherwise → :func:`spawn_unit_blocking` with the matching nudge
+      (NTFY unset / daemon down / corrupted lock) attached to the
+      JSON result. Bare-string ``ERROR:`` / ``BLOCKED —`` returns are
+      passed through unchanged (M2-class regression guard).
+
+    To opt out of the env-derived default, call
+    :func:`spawn_unit_async` or :func:`spawn_unit_blocking` directly.
+
+    Repo must be fresh-verified (call ``verify_repo(<url>)`` if blocked).
+    """
+    if err := ensure_verified_for_feature(feature_id):
+        return err
+
+    return _dispatch_or_block(
+        async_fn=lambda _daemon_info: _spawn_unit_async_impl(feature_id, unit_id),
+        blocking_fn=lambda: _spawn_unit_blocking_impl(feature_id, unit_id),
+    )
+
+
+@mcp.tool()
+def spawn_unit_blocking(feature_id: str, unit_id: str) -> str:
     """Spawn a coder Managed Agent for one work unit. BLOCKS for minutes.
+
+    Explicit blocking variant (F-016-U-8). Pre-Phase-6 behavior; always
+    available regardless of ``NTFY_TOPIC``.
 
     Preconditions: feature loaded, plan saved + approved, GITHUB_TOKEN set,
     feature.repo_path is a GitHub URL, and the repo passed verification
@@ -302,7 +338,18 @@ def spawn_unit(feature_id: str, unit_id: str) -> str:
     """
     if err := ensure_verified_for_feature(feature_id):
         return err
+    return _spawn_unit_blocking_impl(feature_id, unit_id)
 
+
+def _spawn_unit_blocking_impl(feature_id: str, unit_id: str) -> str:
+    """Engine body of :func:`spawn_unit_blocking` — assumes verified.
+
+    Direct callers (the Phase 6 dispatcher) skip the verify gate
+    because the dispatcher already ran it; the public
+    :func:`spawn_unit_blocking` wrapper keeps the gate for explicit
+    MCP callers. Mirrors :func:`_cycle_review_blocking_impl` so direct
+    callers and MCP callers share one engine path.
+    """
     feature = state.get_feature(feature_id)
     if not feature:
         return f"ERROR: feature {feature_id} not found"
@@ -511,7 +558,20 @@ def spawn_unit_async(feature_id: str, unit_id: str) -> str:
     """
     if err := ensure_verified_for_feature(feature_id):
         return err
+    return _spawn_unit_async_impl(feature_id, unit_id)
 
+
+def _spawn_unit_async_impl(feature_id: str, unit_id: str) -> str:
+    """Engine body of :func:`spawn_unit_async` — assumes verified.
+
+    Direct callers (the Phase 6 :func:`spawn_unit` dispatcher) skip
+    the verify gate because the dispatcher already ran it; the public
+    :func:`spawn_unit_async` wrapper keeps the gate for explicit MCP
+    callers. PR #70 reviewer M3: matches the
+    ``_spawn_unit_blocking_impl`` / ``_address_review_*_impl`` shape
+    so every Phase 6 surface skips the redundant SQLite read the
+    dispatcher already paid for.
+    """
     feature = state.get_feature(feature_id)
     if not feature:
         return f"ERROR: feature {feature_id} not found"
@@ -618,12 +678,23 @@ def spawn_unit_async(feature_id: str, unit_id: str) -> str:
     )
     refreshed = state.get_unit_state(unit_id)
 
+    # F-016-U-8 Phase 6: emit the same handoff-envelope shape every
+    # async surface uses (``delivered: true`` + ``mode: async_daemon``)
+    # so consumers — chiefly :func:`orchestrator.tools.scheduling._run_one`
+    # — can tell an async handoff apart from a synchronous spawn that
+    # finished without a PR_URL. Pre-U-8 the absence of these fields
+    # meant ``_run_one`` short-circuited on "no_pr" and never routed
+    # the unit through ``cycle_review``; the Phase 6 contract requires
+    # the dispatcher to pass through to ``cycle_review`` so the daemon
+    # owns the full pipeline.
     result: dict[str, Any] = {
         "unit_id": unit_id,
         "feature_id": feature_id,
         "session_id": session_id,
         "branch": branch,
         "status": "coding",
+        "delivered": True,
+        "mode": "async_daemon",
         "submitted_at": refreshed.last_activity if refreshed else "",
     }
     return json.dumps(result, indent=2)
@@ -740,7 +811,231 @@ def wait_unit(unit_id: str, role: str = "coder", timeout_s: int = 600) -> str:
 
 @mcp.tool()
 def spawn_tester(feature_id: str, unit_id: str) -> str:
-    """Spawn OR resume a tester Managed Agent for a unit whose coder has opened a PR.
+    """F-016-U-8 Phase 6 dispatcher — picks async vs. blocking by ``NTFY_TOPIC``.
+
+    * ``NTFY_TOPIC`` set AND daemon alive → :func:`spawn_tester_async`.
+      Returns in ≤2 s; the daemon observes the tester's ``TESTS_PASS``
+      marker on its next tick (``testing → in_ci``). ``BUG_FOUND`` /
+      ``BLOCKED`` are recorded as events but do not flip status; the
+      lead handles the fix-loop dispatch (matches U-5/U-7 daemon
+      scope — autonomous tester→fix loop drive ships later).
+    * Otherwise → :func:`spawn_tester_blocking` with the matching
+      nudge.
+
+    Repo must be fresh-verified (call ``verify_repo(<url>)`` if blocked).
+    """
+    if err := ensure_verified_for_feature(feature_id):
+        return err
+
+    return _dispatch_or_block(
+        async_fn=lambda _daemon_info: _spawn_tester_async_impl(feature_id, unit_id),
+        blocking_fn=lambda: _spawn_tester_blocking_impl(feature_id, unit_id),
+    )
+
+
+def _spawn_tester_prelude(feature_id: str, unit_id: str) -> tuple[Any, Any, Any, str | None]:
+    """Resolve feature / unit_state / unit row + needs-token check.
+
+    Shared by both ``spawn_tester_async`` / ``spawn_tester_blocking``
+    so the structured-error vocabulary stays in one place. Returns
+    ``(feature, unit_state, unit, err_or_None)`` — when ``err`` is a
+    string the public surface returns it verbatim.
+    """
+    feature = state.get_feature(feature_id)
+    if not feature:
+        return None, None, None, f"ERROR: feature {feature_id} not found"
+    unit_state = state.get_unit_state(unit_id)
+    if not unit_state:
+        return feature, None, None, f"ERROR: no state for unit {unit_id} — spawn coder first"
+    if not unit_state.branch or not unit_state.pr_number:
+        return feature, unit_state, None, f"ERROR: unit {unit_id} has no branch/PR yet"
+    plan = state.get_plan(feature_id)
+    unit = next((u for u in plan.units if u.id == unit_id), None) if plan else None
+    if not unit:
+        return feature, unit_state, None, f"ERROR: unit {unit_id} not in plan"
+    if err := need_github_token():
+        return feature, unit_state, unit, err
+    return feature, unit_state, unit, None
+
+
+@mcp.tool()
+def spawn_tester_async(feature_id: str, unit_id: str) -> str:
+    """F-016-U-8 Phase 6 — submit-only tester spawn / resume. Returns in ≤2 s.
+
+    Async counterpart to :func:`spawn_tester_blocking`. Same
+    preconditions (PR open, branch set, etc.) but the worker handoff
+    uses ``worker.spawn_async`` (or ``worker.resume_async`` for a
+    unit with an existing ``tester_session_id``) so the dispatcher
+    returns immediately. The daemon's per-tick ``_scan_role`` observes
+    ``TESTS_PASS`` / ``BUG_FOUND`` / ``BLOCKED`` in the tester's tail
+    and applies the per-marker transition (``testing → in_ci`` on
+    TESTS_PASS, no flip on BUG_FOUND).
+
+    Skips the synchronous CI gate :func:`_check_ci_or_refuse` runs —
+    waiting up to ``DEFAULT_TIMEOUT_SECONDS`` (10 min) on CI would
+    defeat the ≤3 s acceptance. The daemon's F-014 CI-drift detection
+    picks up red CI on a later tick instead.
+
+    Repo must be fresh-verified (call ``verify_repo(<url>)`` if blocked).
+    """
+    if err := ensure_verified_for_feature(feature_id):
+        return err
+    return _spawn_tester_async_impl(feature_id, unit_id)
+
+
+def _spawn_tester_async_impl(feature_id: str, unit_id: str) -> str:
+    """Engine body of :func:`spawn_tester_async` — assumes verified."""
+    feature, unit_state, unit, err = _spawn_tester_prelude(feature_id, unit_id)
+    if err:
+        return err
+    assert feature is not None and unit_state is not None and unit is not None
+
+    # Resume-or-spawn parity with the blocking variant — but use
+    # ``resume_async`` so we don't block on the recovery prompt's reply.
+    # ``_resume_role_for_recovery`` would block; replicate its
+    # status-flip + audit-event sequence here against the async submit.
+    if unit_state.tester_session_id:
+        return _resume_tester_async(feature=feature, unit_state=unit_state)
+
+    github_token = get_agent_token()
+    task = compose_tester_task(
+        feature,
+        unit,
+        unit_state.branch,
+        unit_state.pr_number,
+        github_token,
+        **_task_context_kwargs(feature, unit),
+    )
+
+    # PR #70 C1: cold-spawn path is "safe by accident" today (empty
+    # ``tester_session_id`` makes ``_scan_role`` short-circuit before
+    # any tail read), but mirror the lock-then-seed shape so a future
+    # change that pre-seeds a session id can't reintroduce the race.
+    # See :func:`_resume_tester_async` for the load-bearing case.
+    with state.lead_advance_lock(unit_id):
+        state.touch_unit(unit_id, status="testing")
+        state.record_event(
+            unit_id,
+            feature_id,
+            "spawn_tester_async",
+            source="orchestrator",
+            cycle_number=unit_state.review_round,
+            summary=f"Dispatching tester for {unit_id} (non-blocking)",
+        )
+        try:
+            worker = make_worker("tester")
+            session_id = worker.spawn_async(task, title=f"tester {unit_id}")
+        except Exception as e:  # noqa: BLE001 — surface as orchestrator error
+            state.touch_unit(unit_id, status="escalated", error=str(e))
+            state.record_event(
+                unit_id,
+                feature_id,
+                "tester_error",
+                source="orchestrator",
+                cycle_number=unit_state.review_round,
+                summary=str(e),
+            )
+            return f"ERROR spawning tester (async): {e}"
+
+        # Re-read after the status flip so the upsert below doesn't
+        # roll back ``status='testing'`` (the in-memory ``unit_state``
+        # we captured during the prelude still carried the pre-flip
+        # status). Mirrors the post-touch refresh in
+        # :func:`spawn_unit_async`.
+        latest = state.get_unit_state(unit_id) or unit_state
+        latest.tester_session_id = session_id
+        state.upsert_unit_state(latest)
+
+    return json.dumps(
+        {
+            "unit_id": unit_id,
+            "delivered": True,
+            "mode": "async_daemon",
+            "role": "tester",
+            "session_id": session_id,
+            "status": "testing",
+            "message": (
+                "Tester dispatched; daemon will record TESTS_PASS / BUG_FOUND "
+                "/ BLOCKED on its next tick (TESTS_PASS → in_ci; BUG_FOUND "
+                "leaves status to the fix-loop dispatch)."
+            ),
+        },
+        indent=2,
+    )
+
+
+def _resume_tester_async(*, feature: Any, unit_state: WorkUnitState) -> str:
+    """Async mirror of :func:`_resume_role_for_recovery` for the tester role.
+
+    The blocking helper calls ``worker.resume`` and waits for the
+    marker; we submit a recovery prompt via ``resume_async`` and let
+    the daemon observe the reply. Mirrors the synchronous helper's
+    status flip + audit row so a later daemon tick picks the unit up
+    with consistent state.
+
+    PR #70 C1: the advance lock wraps the entire "seed + submit"
+    section. Tester sessions are not archived between phases either,
+    so a previous cycle's ``TESTS_PASS`` lives in the tail; if we
+    flipped ``status='testing'`` outside the lock, a daemon tick in
+    the gap could re-apply the stale ``TESTS_PASS`` (per
+    ``_MARKER_SOURCE_STATUSES['testing']``) and prematurely flip
+    ``testing → in_ci`` before the recovery prompt is submitted.
+    """
+    unit_id = unit_state.unit_id
+    session_id = unit_state.tester_session_id
+    cycle_number = unit_state.review_round
+    reason = _derive_recovery_reason(unit_state)
+
+    with state.lead_advance_lock(unit_id):
+        state.touch_unit(unit_id, status="testing", clear_error=True)
+        state.record_event(
+            unit_id,
+            feature.id,
+            "tester_resume_async",
+            source="orchestrator",
+            cycle_number=cycle_number,
+            session_id=session_id,
+            summary=f"Resuming orphaned tester session async ({reason})",
+        )
+        try:
+            worker = make_worker("tester")
+            worker.resume_async(
+                session_id,
+                build_recovery_prompt("tester", reason, last_error=unit_state.last_error),
+            )
+        except Exception as e:  # noqa: BLE001
+            state.touch_unit(unit_id, status="escalated", error=str(e))
+            state.record_event(
+                unit_id,
+                feature.id,
+                "tester_resume_error",
+                source="orchestrator",
+                cycle_number=cycle_number,
+                summary=str(e),
+            )
+            return f"ERROR resuming tester (async): {e}"
+
+    return json.dumps(
+        {
+            "unit_id": unit_id,
+            "delivered": True,
+            "mode": "async_daemon",
+            "role": "tester",
+            "session_id": session_id,
+            "status": "testing",
+            "recovery_reason": reason,
+            "message": "Tester resume submitted; daemon will observe the marker on next tick.",
+        },
+        indent=2,
+    )
+
+
+@mcp.tool()
+def spawn_tester_blocking(feature_id: str, unit_id: str) -> str:
+    """Spawn OR resume a tester Managed Agent (synchronous; BLOCKS minutes).
+
+    Explicit blocking variant (F-016-U-8). Today's pre-Phase-6 behavior;
+    always available regardless of ``NTFY_TOPIC``.
 
     **Idempotent on units with a prior ``tester_session_id``** — instead of
     refusing (the pre-F-009-U-3 contract), the existing worker session is
@@ -761,26 +1056,18 @@ def spawn_tester(feature_id: str, unit_id: str) -> str:
     """
     if err := ensure_verified_for_feature(feature_id):
         return err
+    return _spawn_tester_blocking_impl(feature_id, unit_id)
 
+
+def _spawn_tester_blocking_impl(feature_id: str, unit_id: str) -> str:
+    """Engine body of :func:`spawn_tester_blocking` — assumes verified."""
     if err := _check_ci_or_refuse(feature_id, unit_id, label="tester"):
         return err
 
-    feature = state.get_feature(feature_id)
-    if not feature:
-        return f"ERROR: feature {feature_id} not found"
-    unit_state = state.get_unit_state(unit_id)
-    if not unit_state:
-        return f"ERROR: no state for unit {unit_id} — spawn coder first"
-    if not unit_state.branch or not unit_state.pr_number:
-        return f"ERROR: unit {unit_id} has no branch/PR yet"
-
-    plan = state.get_plan(feature_id)
-    unit = next((u for u in plan.units if u.id == unit_id), None) if plan else None
-    if not unit:
-        return f"ERROR: unit {unit_id} not in plan"
-
-    if err := need_github_token():
+    feature, unit_state, unit, err = _spawn_tester_prelude(feature_id, unit_id)
+    if err:
         return err
+    assert feature is not None and unit_state is not None and unit is not None
 
     # Resume-or-spawn: a prior session_id means the worker holds accumulated
     # context for this unit — resume it instead of cold-starting. Covers
@@ -932,7 +1219,210 @@ def _format_tester_marker_response(
 
 @mcp.tool()
 def spawn_reviewer(feature_id: str, unit_id: str) -> str:
-    """Spawn OR resume a reviewer Managed Agent for a unit's PR.
+    """F-016-U-8 Phase 6 dispatcher — picks async vs. blocking by ``NTFY_TOPIC``.
+
+    * ``NTFY_TOPIC`` set AND daemon alive → :func:`spawn_reviewer_async`.
+      Returns in ≤2 s; the daemon observes the reviewer's
+      ``REVIEW_RECOMMEND_MERGE`` / ``REVIEW_COMMENT`` marker on its
+      next tick (``reviewing → approved_awaiting_merge`` /
+      ``reviewing → in_ci``). ``REVIEW_REQUEST_CHANGES`` is recorded
+      as an event but does not flip status; the lead handles the
+      fix-loop dispatch.
+    * Otherwise → :func:`spawn_reviewer_blocking` with the matching
+      nudge.
+
+    Repo must be fresh-verified (call ``verify_repo(<url>)`` if blocked).
+    """
+    if err := ensure_verified_for_feature(feature_id):
+        return err
+
+    return _dispatch_or_block(
+        async_fn=lambda _daemon_info: _spawn_reviewer_async_impl(feature_id, unit_id),
+        blocking_fn=lambda: _spawn_reviewer_blocking_impl(feature_id, unit_id),
+    )
+
+
+def _spawn_reviewer_prelude(feature_id: str, unit_id: str) -> tuple[Any, Any, Any, str | None]:
+    """Resolve feature / unit_state / unit row + needs-token check.
+
+    Shared by both ``spawn_reviewer_async`` / ``spawn_reviewer_blocking``.
+    """
+    feature = state.get_feature(feature_id)
+    if not feature:
+        return None, None, None, f"ERROR: feature {feature_id} not found"
+    unit_state = state.get_unit_state(unit_id)
+    if not unit_state or not unit_state.pr_number:
+        return feature, unit_state, None, f"ERROR: unit {unit_id} has no PR yet"
+    plan = state.get_plan(feature_id)
+    unit = next((u for u in plan.units if u.id == unit_id), None) if plan else None
+    if not unit:
+        return feature, unit_state, None, f"ERROR: unit {unit_id} not in plan"
+    if err := need_github_token():
+        return feature, unit_state, unit, err
+    return feature, unit_state, unit, None
+
+
+@mcp.tool()
+def spawn_reviewer_async(feature_id: str, unit_id: str) -> str:
+    """F-016-U-8 Phase 6 — submit-only reviewer spawn / resume. Returns in ≤2 s.
+
+    Async counterpart to :func:`spawn_reviewer_blocking`. The worker
+    handoff uses ``worker.spawn_async`` (or ``worker.resume_async`` for
+    a unit with an existing ``reviewer_session_id``) so the dispatcher
+    returns immediately. The daemon's per-tick ``_scan_role`` observes
+    ``REVIEW_RECOMMEND_MERGE`` / ``REVIEW_COMMENT`` / ``BLOCKED`` in
+    the reviewer's tail and applies the per-marker transition. The
+    F-018 stale-marker classifier still routes through the same
+    daemon path so a delta-review prompt fires when the SHA drifts
+    (no behavior change to that path).
+
+    Skips the synchronous CI gate :func:`_check_ci_or_refuse` runs —
+    same reasoning as :func:`spawn_tester_async`: a 10 min CI wait
+    inline would defeat the ≤3 s acceptance, and the daemon's F-014
+    CI-drift detection picks up red CI on a later tick.
+
+    Repo must be fresh-verified (call ``verify_repo(<url>)`` if blocked).
+    """
+    if err := ensure_verified_for_feature(feature_id):
+        return err
+    return _spawn_reviewer_async_impl(feature_id, unit_id)
+
+
+def _spawn_reviewer_async_impl(feature_id: str, unit_id: str) -> str:
+    """Engine body of :func:`spawn_reviewer_async` — assumes verified."""
+    feature, unit_state, unit, err = _spawn_reviewer_prelude(feature_id, unit_id)
+    if err:
+        return err
+    assert feature is not None and unit_state is not None and unit is not None
+
+    if unit_state.reviewer_session_id:
+        return _resume_reviewer_async(feature=feature, unit_state=unit_state)
+
+    github_token = get_agent_token()
+    reviewer_kwargs = _task_context_kwargs(feature, unit)
+    if unit_state.review_round >= REVIEWER_OWN_LOG_MIN_ROUND:
+        reviewer_kwargs["own_cycle_log"] = cycle_log.read_cycle_log(unit_id)
+    task = compose_reviewer_task(
+        feature, unit, unit_state.pr_number, github_token, **reviewer_kwargs
+    )
+
+    # PR #70 C1: same lock-then-seed shape as :func:`_spawn_tester_async_impl`
+    # — see that docstring for the cold-spawn "safe by accident" caveat.
+    with state.lead_advance_lock(unit_id):
+        state.touch_unit(unit_id, status="reviewing")
+        state.record_event(
+            unit_id,
+            feature_id,
+            "spawn_reviewer_async",
+            source="orchestrator",
+            cycle_number=unit_state.review_round,
+            summary=f"Dispatching reviewer for {unit_id} (non-blocking)",
+        )
+        try:
+            worker = make_worker("reviewer")
+            session_id = worker.spawn_async(task, title=f"reviewer {unit_id}")
+        except Exception as e:  # noqa: BLE001
+            state.touch_unit(unit_id, status="escalated", error=str(e))
+            state.record_event(
+                unit_id,
+                feature_id,
+                "reviewer_error",
+                source="orchestrator",
+                cycle_number=unit_state.review_round,
+                summary=str(e),
+            )
+            return f"ERROR spawning reviewer (async): {e}"
+
+        # Re-read so the upsert below preserves the ``status='reviewing'``
+        # flip — symmetric to the tester async path.
+        latest = state.get_unit_state(unit_id) or unit_state
+        latest.reviewer_session_id = session_id
+        state.upsert_unit_state(latest)
+
+    return json.dumps(
+        {
+            "unit_id": unit_id,
+            "delivered": True,
+            "mode": "async_daemon",
+            "role": "reviewer",
+            "session_id": session_id,
+            "status": "reviewing",
+            "message": (
+                "Reviewer dispatched; daemon will record REVIEW_RECOMMEND_MERGE "
+                "/ REVIEW_REQUEST_CHANGES / REVIEW_COMMENT / BLOCKED on its "
+                "next tick (REVIEW_RECOMMEND_MERGE → approved_awaiting_merge)."
+            ),
+        },
+        indent=2,
+    )
+
+
+def _resume_reviewer_async(*, feature: Any, unit_state: WorkUnitState) -> str:
+    """Async mirror of :func:`_resume_role_for_recovery` for the reviewer role.
+
+    PR #70 C1: the advance lock wraps the entire "seed + submit"
+    section — see :func:`_resume_tester_async`'s docstring for the
+    stale-marker race. The reviewer role's case mirrors it:
+    ``_MARKER_SOURCE_STATUSES['reviewing']`` admits a stale
+    ``REVIEW_RECOMMEND_MERGE`` that would prematurely flip
+    ``reviewing → approved_awaiting_merge`` before the lead's
+    delta/recovery prompt is submitted.
+    """
+    unit_id = unit_state.unit_id
+    session_id = unit_state.reviewer_session_id
+    cycle_number = unit_state.review_round
+    reason = _derive_recovery_reason(unit_state)
+
+    with state.lead_advance_lock(unit_id):
+        state.touch_unit(unit_id, status="reviewing", clear_error=True)
+        state.record_event(
+            unit_id,
+            feature.id,
+            "reviewer_resume_async",
+            source="orchestrator",
+            cycle_number=cycle_number,
+            session_id=session_id,
+            summary=f"Resuming orphaned reviewer session async ({reason})",
+        )
+        try:
+            worker = make_worker("reviewer")
+            worker.resume_async(
+                session_id,
+                build_recovery_prompt("reviewer", reason, last_error=unit_state.last_error),
+            )
+        except Exception as e:  # noqa: BLE001
+            state.touch_unit(unit_id, status="escalated", error=str(e))
+            state.record_event(
+                unit_id,
+                feature.id,
+                "reviewer_resume_error",
+                source="orchestrator",
+                cycle_number=cycle_number,
+                summary=str(e),
+            )
+            return f"ERROR resuming reviewer (async): {e}"
+
+    return json.dumps(
+        {
+            "unit_id": unit_id,
+            "delivered": True,
+            "mode": "async_daemon",
+            "role": "reviewer",
+            "session_id": session_id,
+            "status": "reviewing",
+            "recovery_reason": reason,
+            "message": "Reviewer resume submitted; daemon will observe the marker on next tick.",
+        },
+        indent=2,
+    )
+
+
+@mcp.tool()
+def spawn_reviewer_blocking(feature_id: str, unit_id: str) -> str:
+    """Spawn OR resume a reviewer Managed Agent (synchronous; BLOCKS minutes).
+
+    Explicit blocking variant (F-016-U-8). Today's pre-Phase-6 behavior;
+    always available regardless of ``NTFY_TOPIC``.
 
     **Idempotent on units with a prior ``reviewer_session_id``** — instead
     of refusing (the pre-F-009-U-3 contract), the existing worker session
@@ -957,24 +1447,18 @@ def spawn_reviewer(feature_id: str, unit_id: str) -> str:
     """
     if err := ensure_verified_for_feature(feature_id):
         return err
+    return _spawn_reviewer_blocking_impl(feature_id, unit_id)
 
+
+def _spawn_reviewer_blocking_impl(feature_id: str, unit_id: str) -> str:
+    """Engine body of :func:`spawn_reviewer_blocking` — assumes verified."""
     if err := _check_ci_or_refuse(feature_id, unit_id, label="reviewer"):
         return err
 
-    feature = state.get_feature(feature_id)
-    if not feature:
-        return f"ERROR: feature {feature_id} not found"
-    unit_state = state.get_unit_state(unit_id)
-    if not unit_state or not unit_state.pr_number:
-        return f"ERROR: unit {unit_id} has no PR yet"
-
-    plan = state.get_plan(feature_id)
-    unit = next((u for u in plan.units if u.id == unit_id), None) if plan else None
-    if not unit:
-        return f"ERROR: unit {unit_id} not in plan"
-
-    if err := need_github_token():
+    feature, unit_state, unit, err = _spawn_reviewer_prelude(feature_id, unit_id)
+    if err:
         return err
+    assert feature is not None and unit_state is not None and unit is not None
 
     # Resume-or-spawn: prior session_id means the worker holds accumulated
     # context (PR inventory, prior verdict) — resume rather than cold-start.
@@ -1126,9 +1610,216 @@ def _format_reviewer_marker_response(
 # --------------------------- address_review (coder resume) ---------------------------
 
 
+_ADDRESS_REVIEW_SOURCES = ("tester", "reviewer", "ci", "human", "ultrareview", "merge")
+
+
+def _address_review_preflight(unit_id: str) -> str | None:
+    """Validate the unit-state preconditions for both ``address_review`` paths.
+
+    Returns the canonical ERROR string the public surfaces and the
+    impl helpers share — ``None`` means the request is actionable.
+    Hoisted out of :func:`_address_review_blocking_impl` so the new
+    :func:`_address_review_async_impl` surfaces the same diagnostics.
+
+    Source-vocabulary validation lives in every public entry point
+    (``address_review`` dispatcher + ``address_review_async`` /
+    ``address_review_blocking`` wrappers) because the
+    ``"source must be …"`` diagnostic MUST fire BEFORE the verify
+    gate — the order is pinned by
+    :class:`tests.test_tools_execution.TestAddressReview.test_bad_source`.
+    The preflight runs after those entry-point checks, so duplicating
+    the source check here is what PR #70 reviewer M1 flagged as drift
+    risk: one constant, one check site.
+    """
+    unit_state = state.get_unit_state(unit_id)
+    if not unit_state:
+        return f"ERROR: no state for unit {unit_id}"
+    if not unit_state.coder_session_id:
+        return f"ERROR: no coder session for {unit_id}"
+    if not unit_state.pr_number:
+        return f"ERROR: no PR for unit {unit_id} — spawn coder first"
+    # Done units have a merged PR — re-opening via a coder resume would
+    # silently flip status away from terminal. Recovery for merged units
+    # goes through reconcile_unit_pr (which is idempotent and read-only
+    # against the worker session). Symmetric to the `done` guard in
+    # `_resume_role_for_recovery`.
+    if unit_state.status == "done":
+        return (
+            f"ERROR: unit {unit_id} is already done (PR merged). "
+            f"Refusing to resume coder — use reconcile_unit_pr to refresh "
+            f"state if needed."
+        )
+    return None
+
+
 @mcp.tool()
 def address_review(unit_id: str, source: str, feedback: str) -> str:
-    """Resume the coder session to address feedback (from tester/reviewer/ci/human/ultrareview/merge).
+    """F-016-U-8 Phase 6 dispatcher — picks async vs. blocking by ``NTFY_TOPIC``.
+
+    Mirrors :func:`cycle_review`'s gate:
+
+    * ``NTFY_TOPIC`` set AND daemon alive → :func:`address_review_async`.
+      Returns in ≤2 s; the coder is resumed via ``worker.resume_async``
+      (submit-only) and the daemon observes the resulting ``FIX_PUSHED``
+      marker on its next tick (``fixing → in_ci``).
+    * Otherwise → :func:`address_review_blocking` with the matching
+      nudge. Original pre-Phase-6 behavior — blocks until the coder
+      replies.
+
+    Same preconditions as the explicit variants (see
+    :func:`address_review_blocking`'s docstring): coder session set,
+    PR open, unit not ``done``.
+
+    Repo must be fresh-verified (call ``verify_repo(<url>)`` if blocked).
+    """
+    # Source-vocabulary check fires BEFORE the verification gate so a
+    # caller typoing ``source`` sees the structured diagnostic instead of
+    # a less-specific "no state for unit" error from the verify gate.
+    # Matches the pre-Phase-6 order in ``address_review`` (the test
+    # ``TestAddressReview.test_bad_source`` pins this contract).
+    if source not in _ADDRESS_REVIEW_SOURCES:
+        return f"ERROR: source must be tester|reviewer|ci|human|ultrareview|merge, got {source!r}"
+
+    if err := ensure_verified_for_unit(unit_id):
+        return err
+
+    return _dispatch_or_block(
+        async_fn=lambda _daemon_info: _address_review_async_impl(unit_id, source, feedback),
+        blocking_fn=lambda: _address_review_blocking_impl(unit_id, source, feedback),
+    )
+
+
+@mcp.tool()
+def address_review_async(unit_id: str, source: str, feedback: str) -> str:
+    """F-016-U-8 Phase 6 — submit-only address_review. Returns in ≤2 s.
+
+    Async counterpart to :func:`address_review_blocking`. Resumes the
+    coder session via ``worker.resume_async`` (the same submit-only
+    primitive :func:`send_to_unit_async` uses), persists the round
+    bump + ``status='fixing'`` flip, and returns immediately. The
+    daemon's poll loop observes the resulting ``FIX_PUSHED`` marker
+    in the coder's tail and applies the ``fixing → in_ci`` transition
+    on its next tick.
+
+    Same round-bump / cap-3 semantics as the blocking variant:
+    ``source='merge'`` skips the ``review_round`` bump (the caller
+    owns ``conflict_fix_attempts``); every other source bumps the
+    quality budget.
+
+    Repo must be fresh-verified (call ``verify_repo(<url>)`` if blocked).
+    """
+    if source not in _ADDRESS_REVIEW_SOURCES:
+        return f"ERROR: source must be tester|reviewer|ci|human|ultrareview|merge, got {source!r}"
+    if err := ensure_verified_for_unit(unit_id):
+        return err
+    return _address_review_async_impl(unit_id, source, feedback)
+
+
+def _address_review_async_impl(unit_id: str, source: str, feedback: str) -> str:
+    """Engine body of :func:`address_review_async` — assumes verified.
+
+    Mirrors the early-validation / state-seeding shape of the blocking
+    impl up to the worker call; swaps ``worker.resume`` for
+    ``worker.resume_async`` and returns a handoff envelope instead of
+    waiting for the marker. The daemon's per-tick ``_scan_role``
+    closes the loop by observing the worker's ``FIX_PUSHED`` /
+    ``BLOCKED`` reply.
+    """
+    if err := _address_review_preflight(unit_id):
+        return err
+    unit_state = state.get_unit_state(unit_id)
+    # ``_address_review_preflight`` short-circuits on ``unit_state is None``
+    # and on ``unit_state.pr_number is None`` — both ``assert``s give
+    # mypy the narrowing it can't infer through the helper.
+    assert unit_state is not None
+    assert unit_state.pr_number is not None
+
+    feature = state.get_feature(unit_state.feature_id)
+    plan = state.get_plan(unit_state.feature_id)
+    unit = next((u for u in plan.units if u.id == unit_id), None) if plan else None
+    if not feature or not unit:
+        return f"ERROR: feature/unit lookup failed for {unit_id}"
+
+    fix_msg = compose_fix_task(
+        feature,
+        unit,
+        unit_state.branch,
+        unit_state.pr_number,
+        source,
+        feedback,
+        **_task_context_kwargs(feature, unit),
+    )
+
+    # PR #70 C1: acquire the advance lock BEFORE seeding cycle / status
+    # / event. Coder sessions are never archived between phases, so the
+    # previous cycle's ``FIX_PUSHED`` stays in the tail forever. If we
+    # bump ``review_round`` and flip ``status='fixing'`` outside the
+    # lock, a daemon tick in the gap will:
+    #   1. ``_scan_role('coder')`` reads the persistent FIX_PUSHED;
+    #   2. ``_record_marker`` writes a fresh row under the BUMPED
+    #      cycle_number (dedupe defeated);
+    #   3. ``_apply_marker_transition`` allows FIX_PUSHED from
+    #      ``fixing`` (per ``_MARKER_SOURCE_STATUSES``) and flips
+    #      ``fixing → in_ci`` BEFORE the lead actually submits the new
+    #      prompt.
+    # ``send_to_unit_async`` is the correct shape: the lock wraps both
+    # the state writes AND the submit so the daemon sees a coherent
+    # "seed + submit" transition.
+    with state.lead_advance_lock(unit_id):
+        # F-018: merge source skips review_round bump — see blocking impl.
+        if source == "merge":
+            round_num = unit_state.review_round
+        else:
+            round_num = state.increment_review_round(unit_id)
+        state.touch_unit(unit_id, status="fixing")
+        state.record_event(
+            unit_id,
+            unit_state.feature_id,
+            "coder_resumed_async",
+            source=source,
+            cycle_number=round_num,
+            summary=f"Address feedback from {source} (async)",
+            details=feedback[:1000],
+        )
+        try:
+            worker = make_worker("coder")
+            worker.resume_async(unit_state.coder_session_id, fix_msg)
+        except Exception as e:  # noqa: BLE001 — surface as orchestrator error
+            state.touch_unit(unit_id, status="escalated", error=str(e))
+            state.record_event(
+                unit_id,
+                unit_state.feature_id,
+                "coder_resume_error",
+                source="orchestrator",
+                cycle_number=round_num,
+                summary=str(e),
+            )
+            return f"ERROR resuming coder (async): {e}"
+
+    return json.dumps(
+        {
+            "unit_id": unit_id,
+            "cycle": round_num,
+            "delivered": True,
+            "mode": "async_daemon",
+            "role": "coder",
+            "session_id": unit_state.coder_session_id,
+            "source": source,
+            "message": (
+                "Fix prompt submitted; daemon will record the FIX_PUSHED "
+                "marker on its next tick (fixing → in_ci)."
+            ),
+        },
+        indent=2,
+    )
+
+
+@mcp.tool()
+def address_review_blocking(unit_id: str, source: str, feedback: str) -> str:
+    """Resume the coder session to address feedback (synchronous; BLOCKS minutes).
+
+    Explicit blocking variant (F-016-U-8). Today's pre-Phase-6 behavior;
+    always available regardless of ``NTFY_TOPIC``.
 
     **Idempotent on any status with a ``coder_session_id``, EXCEPT ``done``.**
     The session_id is the source of truth — as long as ``coder_session_id``
@@ -1164,30 +1855,22 @@ def address_review(unit_id: str, source: str, feedback: str) -> str:
 
     Repo must be fresh-verified (call ``verify_repo(<url>)`` if blocked).
     """
-    if source not in ("tester", "reviewer", "ci", "human", "ultrareview", "merge"):
+    if source not in _ADDRESS_REVIEW_SOURCES:
         return f"ERROR: source must be tester|reviewer|ci|human|ultrareview|merge, got {source!r}"
-
     if err := ensure_verified_for_unit(unit_id):
         return err
+    return _address_review_blocking_impl(unit_id, source, feedback)
 
+
+def _address_review_blocking_impl(unit_id: str, source: str, feedback: str) -> str:
+    """Engine body of :func:`address_review_blocking` — assumes verified."""
+    if err := _address_review_preflight(unit_id):
+        return err
     unit_state = state.get_unit_state(unit_id)
-    if not unit_state:
-        return f"ERROR: no state for unit {unit_id}"
-    if not unit_state.coder_session_id:
-        return f"ERROR: no coder session for {unit_id}"
-    if not unit_state.pr_number:
-        return f"ERROR: no PR for unit {unit_id} — spawn coder first"
-    # Done units have a merged PR — re-opening via a coder resume would
-    # silently flip status away from terminal. Recovery for merged units
-    # goes through reconcile_unit_pr (which is idempotent and read-only
-    # against the worker session). Symmetric to the `done` guard in
-    # `_resume_role_for_recovery`.
-    if unit_state.status == "done":
-        return (
-            f"ERROR: unit {unit_id} is already done (PR merged). "
-            f"Refusing to resume coder — use reconcile_unit_pr to refresh "
-            f"state if needed."
-        )
+    # See :func:`_address_review_async_impl` for the assert rationale —
+    # the helper's branches narrow these but mypy can't follow.
+    assert unit_state is not None
+    assert unit_state.pr_number is not None
 
     feature = state.get_feature(unit_state.feature_id)
     plan = state.get_plan(unit_state.feature_id)
@@ -3483,6 +4166,97 @@ def _daemon_health() -> dict[str, Any]:
     }
 
 
+# --------------------------- F-016-U-8 Phase 6 dispatch helper ---------------------------
+#
+# Phase 6 generalizes the per-tool NTFY+daemon gate U-6 built into
+# ``cycle_review`` and applies it to every long-running lead-facing
+# command. Each public surface (``spawn_unit`` / ``send_to_unit`` /
+# ``address_review`` / ``spawn_tester`` / ``spawn_reviewer`` /
+# ``cycle_review`` / ``parallel_units``) is a thin wrapper that hands
+# this helper an ``async_fn`` + ``blocking_fn`` pair; the routing
+# decision (and the matching nudge attachment) lives in exactly one
+# place. Spec § Acceptance 1: "spawn_unit, address_review, spawn_tester,
+# spawn_reviewer, send_to_unit, cycle_review, parallel_units,
+# parallel_units_global all return in ≤3s under NTFY+daemon".
+
+
+def _attach_nudge(result: str, nudge: str) -> str:
+    """Attach a one-time setup nudge to a tool result.
+
+    Blocking surfaces that emit a JSON dict (``_emit_terminal``'s
+    output, the new ``*_blocking`` variants' success envelopes) get a
+    ``"nudge"`` field added — that's where the lead persona reads
+    one-time setup hints. Surfaces that return a bare string (``ERROR:
+    target repo … not verified``, ``BLOCKED — coder couldn't apply fix
+    [reason]``) are returned unchanged: prepending a setup nudge to an
+    unrelated ERROR is the M2 regression class U-6 fixed for
+    ``cycle_review``; the same fix applies uniformly here.
+    """
+    try:
+        parsed = json.loads(result)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return result
+    if not isinstance(parsed, dict):
+        return result
+    parsed["nudge"] = nudge
+    return json.dumps(parsed, indent=2)
+
+
+def _dispatch_or_block(
+    *,
+    async_fn: Callable[[dict[str, Any] | None], str],
+    blocking_fn: Callable[[], str],
+) -> str:
+    """F-016-U-8: route to ``async_fn`` under NTFY+daemon, else ``blocking_fn``.
+
+    The factored peer of U-6's ``cycle_review`` dispatcher. Owns the
+    gate (``NTFY_TOPIC`` set AND :func:`_daemon_health` reports
+    ``running``) and the nudge attachment so every Phase 6 surface
+    reads identically and shares one ``_daemon_health`` round-trip
+    per dispatch entry (PR #64 reviewer M1: one read, not two).
+
+    ``async_fn`` accepts the pre-computed daemon snapshot so it can
+    embed the snapshot in its handoff envelope without a second
+    SQLite read (mirrors :func:`_cycle_review_async_impl`'s
+    ``daemon_info=`` plumbing — the impl uses the snapshot the
+    dispatcher already paid for and the two callers can't disagree
+    about liveness).
+
+    On the blocking path:
+      * NTFY unset → :data:`_CYCLE_REVIEW_NTFY_NUDGE` (the
+        "set NTFY_TOPIC to enable non-blocking mode" hint).
+      * NTFY set but daemon down → :func:`_daemon_down_nudge_for`
+        picks the "start the daemon" vs. "delete the corrupted lock
+        row" variant by reason. Mirrors U-6 verbatim.
+    The nudge field is attached to JSON results only; bare-string
+    responses (ERROR / BLOCKED lines) are passed through unchanged.
+
+    The verification gate is the caller's responsibility — keeping it
+    in each public surface lets the gate's ERROR short-circuit before
+    any nudge logic runs, the same way ``cycle_review`` already
+    handles it (the ``ERROR: target repo …`` string is the real
+    blocker; a nudge prepended to it would bury the user's actual
+    next step — PR #64 reviewer M2).
+    """
+    ntfy_set = ntfy.is_configured()
+    # Single ``_daemon_health`` round-trip per dispatcher entry. Two
+    # reads on the ≤3 s path is wasteful AND opens a TOCTOU window
+    # where the gate and the async impl could disagree about
+    # liveness. Threading the snapshot down closes both.
+    daemon_info = _daemon_health() if ntfy_set else None
+
+    if ntfy_set and daemon_info is not None and daemon_info["running"]:
+        return async_fn(daemon_info)
+
+    if ntfy_set:
+        assert daemon_info is not None  # invariant of the ntfy_set branch above
+        nudge = _daemon_down_nudge_for(daemon_info)
+    else:
+        nudge = _CYCLE_REVIEW_NTFY_NUDGE
+
+    return _attach_nudge(blocking_fn(), nudge)
+
+
 @mcp.tool()
 def cycle_review_async(feature_id: str, unit_id: str) -> str:
     """F-016 Phase 4 — daemon-driven cycle review. Returns in ≤2s.
@@ -3733,6 +4507,10 @@ def cycle_review(feature_id: str, unit_id: str) -> str:
       our reviewer → (if CHANGES: address_review → reviewer) → optional
       ultrareview gate (if feature.ultrareview_enabled) → terminal.
 
+    F-016-U-8: this dispatcher is now one of seven that share the
+    :func:`_dispatch_or_block` gate (every long-running lead surface
+    flips by default under NTFY+daemon, not just ``cycle_review``).
+
     Repo must be fresh-verified (call ``verify_repo(<url>)`` if blocked).
     Verification is checked here at the dispatcher entry so the ERROR
     short-circuits before any nudge-prepend logic — otherwise the
@@ -3743,42 +4521,12 @@ def cycle_review(feature_id: str, unit_id: str) -> str:
     if err := ensure_verified_for_feature(feature_id):
         return err
 
-    ntfy_set = ntfy.is_configured()
-    # Single ``_daemon_health`` round-trip per dispatcher entry, both for
-    # latency (two SQLite reads on the ≤2 s p95 path is wasteful) and to
-    # close the TOCTOU window: the cached snapshot decides BOTH the
-    # async-vs-blocking branch and what the lead persona reports — they
-    # can't disagree if they share one row read (PR #64 reviewer M1).
-    daemon_info = _daemon_health() if ntfy_set else None
-
-    if ntfy_set and daemon_info is not None and daemon_info["running"]:
-        return _cycle_review_async_impl(feature_id, unit_id, daemon_info=daemon_info)
-
-    # Blocking path. Pick the nudge based on WHY we're here so the lead
-    # persona surfaces the right hint:
-    #   * ntfy unset       → "set NTFY_TOPIC to enable non-blocking mode"
-    #   * daemon not alive → start-the-daemon, or for the corrupted
-    #     ``invalid_heartbeat`` case the manual delete-the-row recovery
-    #     (claim_daemon_lock refuses takeover on unparseable heartbeats,
-    #     so "start the daemon" alone would fail silently — Copilot
-    #     finding).
-    # Both are one-time setup nudges, not per-call noise.
-    if ntfy_set:
-        assert daemon_info is not None  # invariant of the ntfy_set branch above
-        nudge = _daemon_down_nudge_for(daemon_info)
-    else:
-        nudge = _CYCLE_REVIEW_NTFY_NUDGE
-
-    # Call the impl directly (skipping the redundant verify gate; we
-    # already verified at the dispatcher entry, PR #64 reviewer M2).
-    # The impl is guaranteed to return JSON from ``_emit_terminal``, so
-    # the dispatcher can attach ``nudge`` unconditionally — no risk of
-    # the original M2 bug class where the NTFY hint piggybacked on an
-    # unrelated ``ERROR: target repo … not verified`` string.
-    blocking_result = _cycle_review_blocking_impl(feature_id, unit_id)
-    parsed = json.loads(blocking_result)
-    parsed["nudge"] = nudge
-    return json.dumps(parsed, indent=2)
+    return _dispatch_or_block(
+        async_fn=lambda daemon_info: _cycle_review_async_impl(
+            feature_id, unit_id, daemon_info=daemon_info
+        ),
+        blocking_fn=lambda: _cycle_review_blocking_impl(feature_id, unit_id),
+    )
 
 
 # --------------------------- send_to_unit (low-level) ---------------------------
@@ -3841,7 +4589,39 @@ def _record_manual_message(
 
 @mcp.tool()
 def send_to_unit(unit_id: str, role: str, message: str) -> str:
-    """Low-level: resume a role's session with an arbitrary message.
+    """F-016-U-8 Phase 6 dispatcher — picks async vs. blocking by ``NTFY_TOPIC``.
+
+    * ``NTFY_TOPIC`` set AND daemon alive → :func:`send_to_unit_async`
+      (≤1s submit window; daemon observes the worker's reply later).
+    * Else → :func:`send_to_unit_blocking` (synchronous resume; blocks
+      for the worker's reply) with the matching nudge.
+
+    Args carry the original ``send_to_unit`` signature
+    ``(unit_id, role, message)`` for backward compatibility; the async
+    helper accepts ``(unit_id, message, role)`` and the dispatcher
+    routes accordingly.
+
+    Repo must be fresh-verified (call `verify_repo(<url>)` if blocked).
+    """
+    if role not in ("coder", "tester", "reviewer"):
+        return f"ERROR: role must be coder|tester|reviewer, got {role!r}"
+
+    if err := ensure_verified_for_unit(unit_id):
+        return err
+
+    return _dispatch_or_block(
+        async_fn=lambda _daemon_info: send_to_unit_async(unit_id, message, role),
+        blocking_fn=lambda: _send_to_unit_blocking_impl(unit_id, role, message),
+    )
+
+
+@mcp.tool()
+def send_to_unit_blocking(unit_id: str, role: str, message: str) -> str:
+    """Low-level: resume a role's session with an arbitrary message (blocking).
+
+    Explicit blocking variant (F-016-U-8). Today's pre-Phase-6 behavior;
+    always available regardless of ``NTFY_TOPIC``. Returns the worker's
+    full reply.
 
     Prefer address_review / cycle_review for normal flow.
 
@@ -3853,6 +4633,11 @@ def send_to_unit(unit_id: str, role: str, message: str) -> str:
     if err := ensure_verified_for_unit(unit_id):
         return err
 
+    return _send_to_unit_blocking_impl(unit_id, role, message)
+
+
+def _send_to_unit_blocking_impl(unit_id: str, role: str, message: str) -> str:
+    """Engine body of :func:`send_to_unit_blocking` — assumes verified."""
     unit_state = state.get_unit_state(unit_id)
     if not unit_state:
         return f"ERROR: no state for unit {unit_id}"
