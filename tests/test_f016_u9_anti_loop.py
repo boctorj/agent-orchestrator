@@ -236,9 +236,16 @@ class TestGhostRowGuardRefusesActiveStatus:
 
 
 class TestCleanFirstSpawnSucceeds:
-    """No row, or a row with a non-active status (``pending`` /
-    ``cancelled`` / ``done``), accepts a fresh spawn — the guard is
-    a *refusal* of active state, not a blanket re-dispatch ban.
+    """No row, or a row with a non-active / non-terminal status
+    (``pending`` / ``cancelled``), accepts a fresh spawn — the guard
+    is a *refusal* of in-flight + terminal-record state, not a blanket
+    re-dispatch ban.
+
+    Note ``done`` and ``approved_awaiting_merge`` are intentionally NOT
+    in this parametrize list — they carry session_id / pr_number / merge
+    evidence from the original spawn, and re-spawn on them would blank
+    those columns via the upsert in ``spawn_unit``. They're covered by
+    :class:`TestTerminalRowsRefuseRespawn` below.
     """
 
     def test_no_row_succeeds(self, tmp_state_db, monkeypatch):
@@ -254,7 +261,7 @@ class TestCleanFirstSpawnSucceeds:
         assert row is not None
         assert row.coder_session_id.startswith("sesn-success-")
 
-    @pytest.mark.parametrize("status", ("pending", "cancelled", "done", "approved_awaiting_merge"))
+    @pytest.mark.parametrize("status", ("pending", "cancelled"))
     def test_non_active_row_succeeds(self, tmp_state_db, monkeypatch, status):
         _seed_feature()
         state.upsert_unit_state(
@@ -278,12 +285,109 @@ class TestCleanFirstSpawnSucceeds:
 
 
 # ============================================================================
+# (1d) Terminal-merge rows refuse re-spawn (C1 regression guard)
+# ============================================================================
+
+
+class TestTerminalRowsRefuseRespawn:
+    """The pre-U-9 guard refused re-spawn on ANY row whose
+    ``coder_session_id`` was set — including ``done`` /
+    ``approved_awaiting_merge``, both of which carry the session id
+    from the original ``pr_opened`` event. PR #69 C1: the status-based
+    guard initially excluded those two terminal statuses, which would
+    have let a stray re-spawn upsert overwrite ``coder_session_id`` /
+    ``pr_number`` / ``review_round`` with constructor defaults —
+    destroying the merge record.
+
+    These tests pin the fix: ``done`` and ``approved_awaiting_merge``
+    rows REFUSE re-spawn even when the row carries a real session id
+    (the realistic case the original C1 finding pointed at).
+    """
+
+    @pytest.mark.parametrize("status", ("done", "approved_awaiting_merge"))
+    def test_spawn_unit_refuses_terminal_row_with_session(self, tmp_state_db, monkeypatch, status):
+        _seed_feature()
+        # Realistic terminal row: session_id populated, pr_number set,
+        # review_round non-zero (the columns the upsert would blank).
+        state.upsert_unit_state(
+            WorkUnitState(
+                unit_id="F-016-U-1",
+                feature_id="F-016",
+                status=status,
+                branch="b",
+                coder_session_id="sesn-merge-record",
+                pr_number=42,
+                review_round=2,
+            )
+        )
+        _install_failing_blocking_worker(monkeypatch)
+
+        msg = execution.spawn_unit("F-016", "F-016-U-1")
+
+        assert "ERROR" in msg
+        assert f"status={status!r}" in msg
+        # Worker NOT invoked — guard fired pre-dispatch.
+        assert _FailingWorker.spawn_calls == 0
+        # Merge record preserved bit-for-bit.
+        row = state.get_unit_state("F-016-U-1")
+        assert row.coder_session_id == "sesn-merge-record"
+        assert row.pr_number == 42
+        assert row.review_round == 2
+
+    @pytest.mark.parametrize("status", ("done", "approved_awaiting_merge"))
+    def test_spawn_unit_async_refuses_terminal_row_with_session(
+        self, tmp_state_db, monkeypatch, status
+    ):
+        _seed_feature()
+        state.upsert_unit_state(
+            WorkUnitState(
+                unit_id="F-016-U-1",
+                feature_id="F-016",
+                status=status,
+                branch="b",
+                coder_session_id="sesn-merge-record",
+                pr_number=42,
+                review_round=2,
+            )
+        )
+        _install_failing_async_worker(monkeypatch)
+
+        msg = execution.spawn_unit_async("F-016", "F-016-U-1")
+
+        assert "ERROR" in msg
+        assert f"status={status!r}" in msg
+        assert _FailingAsyncWorker.spawn_async_calls == 0
+        row = state.get_unit_state("F-016-U-1")
+        assert row.coder_session_id == "sesn-merge-record"
+        assert row.pr_number == 42
+        assert row.review_round == 2
+
+
+# ============================================================================
 # (1c) cancel_unit → re-dispatch works
 # ============================================================================
 
 
+def _stub_archive_for_cancel(monkeypatch) -> None:
+    """The MCP ``cancel_unit`` calls ``_archive_unit_sessions`` which
+    invokes ``make_worker(role).archive(session_id)`` for each role. The
+    tests don't care about archival semantics — short-circuit it so the
+    cancel path itself is what's exercised.
+    """
+    monkeypatch.setattr(
+        "orchestrator.tools.execution._archive_unit_sessions",
+        lambda _u: {"coder": "no_session", "tester": "no_session", "reviewer": "no_session"},
+    )
+
+
 def test_cancel_then_respawn_works(tmp_state_db, monkeypatch):
     """The documented recovery path: cancel a stuck unit, then re-dispatch.
+
+    Exercises the MCP-tool ``execution.cancel_unit`` (not the state-level
+    ``state.cancel_unit`` helper) so the test catches a regression in
+    the user-facing surface — that surface layers a terminal-status
+    refusal on top of the state helper, which is what the F-016-U-9 H1
+    carve-out has to thread through.
 
     After ``cancel_unit`` the row is in ``cancelled`` (NOT in the
     refuse set), so a fresh ``spawn_unit_async`` succeeds and lands a
@@ -299,8 +403,11 @@ def test_cancel_then_respawn_works(tmp_state_db, monkeypatch):
             coder_session_id="sesn-stuck",
         )
     )
-    # Simulate cancel: flip status + sticky-stamp cancelled_at.
-    assert state.cancel_unit("F-016-U-1") is True
+    _stub_archive_for_cancel(monkeypatch)
+
+    # MCP tool surface, not the bare state helper.
+    cancel_result = execution.cancel_unit("F-016-U-1")
+    assert '"outcome": "cancelled"' in cancel_result
     cancelled = state.get_unit_state("F-016-U-1")
     assert cancelled.status == "cancelled"
     assert cancelled.cancelled_at is not None
@@ -315,6 +422,125 @@ def test_cancel_then_respawn_works(tmp_state_db, monkeypatch):
     assert row is not None
     assert row.status == "coding"
     assert row.coder_session_id == "sesn-success-1"
+
+
+def test_post_cap_cancel_unit_then_respawn_works(tmp_state_db, monkeypatch):
+    """H1 dead-end fix: a cap-escalated unit must be recoverable via the
+    documented ``cancel_unit → spawn_unit`` path.
+
+    Pre-fix: the cap escalation flipped status to ``escalated`` →
+    ``cancel_unit`` (MCP) refused (``escalated`` ∈
+    ``_CANCEL_REFUSED_STATUSES``) → ``spawn_unit`` refused
+    (``escalated`` ∈ ``_RESPAWN_REFUSED_STATUSES``) → the only escape
+    was manual SQLite surgery.
+
+    Post-fix: the ``cancel_unit`` MCP tool detects the spawn-failure-cap
+    sentinel on ``last_error`` and allows the flip back to
+    ``cancelled``; the ``unit_cancelled`` event also resets the failed-
+    spawn counter so the next ``spawn_unit_async`` doesn't immediately
+    re-trip the cap.
+    """
+    _seed_feature()
+    pushes: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        "orchestrator.tools.execution.ntfy.push_escalation",
+        lambda u, reason, *, reason_slug="unknown", **k: pushes.append((u, reason, reason_slug)),
+    )
+    _install_failing_blocking_worker(monkeypatch)
+    _stub_archive_for_cancel(monkeypatch)
+
+    # Drive the unit to cap-escalated via the same path the incident took.
+    # Bypass the ghost-row guard between attempts so the cap is what fires,
+    # but NOT after the final iteration — the cap's ``status=escalated``
+    # is what we need to land on for the recovery test.
+    for i in range(3):
+        execution.spawn_unit("F-016", "F-016-U-1")
+        if i < 2:
+            state.cancel_unit("F-016-U-1")
+
+    post_cap = state.get_unit_state("F-016-U-1")
+    assert post_cap.status == "escalated"
+    assert post_cap.last_error.startswith(execution._SPAWN_FAILURE_CAP_LAST_ERROR_PREFIX)
+    # One cap-specific ntfy push so far.
+    cap_pushes = [p for p in pushes if p[2] == "spawn_failure_cap"]
+    assert len(cap_pushes) == 1
+
+    # MCP-tool cancel_unit must accept the cap-escalated row — without
+    # this, the documented recovery path is a dead-end.
+    cancel_result = execution.cancel_unit("F-016-U-1")
+    assert '"outcome": "cancelled"' in cancel_result, cancel_result
+    cancelled = state.get_unit_state("F-016-U-1")
+    assert cancelled.status == "cancelled"
+    assert cancelled.cancelled_at is not None
+
+    # Re-dispatch with a working worker → succeeds, NOT re-tripped by the cap.
+    worker = _SuccessAsyncWorker("coder")
+    monkeypatch.setattr("orchestrator.tools.execution.make_worker", lambda _r: worker)
+
+    msg = execution.spawn_unit_async("F-016", "F-016-U-1")
+    assert "ERROR" not in msg, msg
+    row = state.get_unit_state("F-016-U-1")
+    assert row.status == "coding"
+    assert row.coder_session_id == "sesn-success-1"
+
+    # No additional cap pushes from the recovery attempt.
+    cap_pushes_after = [p for p in pushes if p[2] == "spawn_failure_cap"]
+    assert len(cap_pushes_after) == 1
+
+
+def test_mcp_cancel_unit_still_refuses_non_cap_escalation(tmp_state_db, monkeypatch):
+    """The cap carve-out is narrow: a non-cap ``escalated`` row (e.g.
+    coder BLOCKED, manual escalation) must STILL be refused so the
+    triage anchor (``last_error``) isn't silently rewritten.
+    """
+    _seed_feature()
+    state.upsert_unit_state(
+        WorkUnitState(
+            unit_id="F-016-U-1",
+            feature_id="F-016",
+            status="escalated",
+            branch="b",
+            coder_session_id="sesn-blocked",
+            last_error="BLOCKED [worker_blocked]: coder emitted explicit BLOCKED marker",
+        )
+    )
+    _stub_archive_for_cancel(monkeypatch)
+
+    result = execution.cancel_unit("F-016-U-1")
+    assert '"outcome": "refused"' in result
+    # Row untouched.
+    row = state.get_unit_state("F-016-U-1")
+    assert row.status == "escalated"
+    assert row.last_error.startswith("BLOCKED [worker_blocked]:")
+    assert row.coder_session_id == "sesn-blocked"
+
+
+def test_mcp_cancel_unit_still_refuses_done_and_awaiting_merge(tmp_state_db, monkeypatch):
+    """The H1 carve-out applies ONLY to spawn-failure-cap escalations.
+    Real merge / endorsement records must STILL be protected.
+    """
+    _seed_feature()
+    _stub_archive_for_cancel(monkeypatch)
+
+    for status in ("done", "approved_awaiting_merge"):
+        state.upsert_unit_state(
+            WorkUnitState(
+                unit_id="F-016-U-1",
+                feature_id="F-016",
+                status=status,
+                branch="b",
+                coder_session_id="sesn-merge",
+                pr_number=99,
+            )
+        )
+
+        result = execution.cancel_unit("F-016-U-1")
+        assert '"outcome": "refused"' in result, f"status={status} unexpectedly accepted"
+
+        row = state.get_unit_state("F-016-U-1")
+        assert row.status == status
+        assert row.coder_session_id == "sesn-merge"
+        assert row.pr_number == 99
 
 
 # ============================================================================
@@ -702,3 +928,205 @@ class TestCiDriftDedupe:
             e for e in state.list_events("F-016-U-1") if e["event_type"] == "ci_drift_detected"
         ]
         assert len(drift_rows) == 1
+
+
+# ============================================================================
+# (4) state.tail_events helper — newest-first event tail
+# ============================================================================
+
+
+class TestStateTailEvents:
+    """The dedupe / counter helpers must read the most-recent N events,
+    not the oldest N. ``list_events`` returns the oldest 200 (it's an
+    ascending ORDER BY with LIMIT) — a long-lived unit past the 200-row
+    threshold would have the most recent activity invisible to a
+    ``reversed(list_events(...))`` walker.
+    """
+
+    def _seed_unit(self) -> None:
+        """``unit_events`` has a FOREIGN KEY on ``work_units(unit_id)`` —
+        the row must exist before any ``record_event`` insert. Tests that
+        write raw events without going through the spawn path seed the
+        row explicitly here."""
+        state.save_feature(
+            Feature(id="F-016", title="t", description="d", repo_path="https://github.com/o/r")
+        )
+        state.upsert_unit_state(
+            WorkUnitState(unit_id="F-016-U-1", feature_id="F-016", status="pending", branch="b")
+        )
+
+    def test_returns_newest_first(self, tmp_state_db):
+        self._seed_unit()
+        for i in range(5):
+            state.record_event(
+                "F-016-U-1",
+                "F-016",
+                f"event_{i}",
+                source="orchestrator",
+                summary=f"row {i}",
+            )
+
+        events = state.tail_events("F-016-U-1", limit=3)
+        assert [e["event_type"] for e in events] == ["event_4", "event_3", "event_2"]
+
+    def test_returns_tail_past_list_events_window(self, tmp_state_db):
+        """The point of ``tail_events``: walks the recent tail even past
+        the ~200-row ``list_events`` LIMIT. Old failures buried beyond
+        row 200 must NOT be visible to a tail-only consumer.
+        """
+        self._seed_unit()
+        # 250 old rows + 3 recent ones the dedupe should see.
+        for i in range(250):
+            state.record_event(
+                "F-016-U-1", "F-016", "old_filler", source="orchestrator", summary=f"f{i}"
+            )
+        for i in range(3):
+            state.record_event(
+                "F-016-U-1", "F-016", "recent", source="orchestrator", summary=f"r{i}"
+            )
+
+        events = state.tail_events("F-016-U-1", limit=5)
+        types = [e["event_type"] for e in events]
+        # The first three are the recent rows; the 4th/5th are the most-
+        # recent old_filler rows — still part of the tail, not the head.
+        assert types[:3] == ["recent", "recent", "recent"]
+        assert types[3:] == ["old_filler", "old_filler"]
+
+
+def test_consecutive_failed_spawns_uses_tail_past_event_window(tmp_state_db):
+    """Regression guard for H2: the cap counter must walk the tail of
+    ``unit_events``, not the head. A unit with >200 events whose tail
+    contains 3 fresh ``coder_error`` rows MUST still report 3 — the
+    pre-fix ``reversed(list_events(...))`` walked the oldest 200 rows
+    and missed the recent failures, so the cap silently never fired.
+    """
+    state.save_feature(
+        Feature(id="F-016", title="t", description="d", repo_path="https://github.com/o/r")
+    )
+    state.upsert_unit_state(
+        WorkUnitState(unit_id="F-016-U-1", feature_id="F-016", status="pending", branch="b")
+    )
+    # 250 ancient unrelated events.
+    for i in range(250):
+        state.record_event(
+            "F-016-U-1", "F-016", "old_filler", source="orchestrator", summary=f"f{i}"
+        )
+    # Three recent coder_error rows at cycle 0 — the cap-counting tail.
+    for i in range(3):
+        state.record_event(
+            "F-016-U-1",
+            "F-016",
+            "coder_error",
+            source="orchestrator",
+            cycle_number=0,
+            summary=f"e{i}",
+        )
+
+    assert execution._consecutive_failed_spawns("F-016-U-1") == 3
+
+
+def test_should_emit_ci_drift_uses_tail_past_event_window(tmp_state_db, monkeypatch):
+    """Sibling regression guard for H2 on the drift-dedupe side. A unit
+    with >200 events whose most-recent ``ci_drift_detected`` row carries
+    the SAME failing-set as the incoming action must dedupe — the pre-
+    fix ``reversed(list_events(...))`` couldn't see the most-recent
+    drift row past the 200-row head window, so it always re-emitted.
+    """
+    monkeypatch.setenv("ORCH_HEALTH_SNAPSHOT_INTERVAL_HOURS", "24")
+    unit = _seed_unit_for_drift()
+    # Bury the FIRST drift row under 250 unrelated events.
+    state.record_event(
+        "F-016-U-1",
+        "F-016",
+        "ci_drift_detected",
+        source="orchestrator",
+        details="failing checks: test",
+    )
+    for i in range(250):
+        state.record_event(
+            "F-016-U-1", "F-016", "old_filler", source="orchestrator", summary=f"f{i}"
+        )
+
+    # Re-fire with the same failing set — must be suppressed because
+    # ``tail_events`` sees the buried prior drift row in the recent tail
+    # (the 250 fillers shift it down but it's still in the most-recent N).
+    tools_health._apply_action(unit, _drift_action(["test"]))
+
+    drift_rows = [
+        e for e in state.list_events("F-016-U-1") if e["event_type"] == "ci_drift_detected"
+    ]
+    # Exactly one drift row — the original one. The dedupe held even with
+    # a deep event history between the prior drift and now.
+    assert len(drift_rows) == 1
+
+
+# ============================================================================
+# (5) _escalate_spawn_cap uses touch_unit + gates ntfy on record_event (M1, M2)
+# ============================================================================
+
+
+def test_escalate_spawn_cap_preserves_other_columns(tmp_state_db, monkeypatch):
+    """M1: ``_escalate_spawn_cap`` must use ``touch_unit`` (column-
+    selective UPDATE), NOT ``upsert_unit_state`` with a fresh
+    ``WorkUnitState`` (which blanks every column to constructor
+    defaults). Hypothetical future caller may have a session-id-bearing
+    row land in the cap path; the columns MUST survive.
+    """
+    state.save_feature(
+        Feature(id="F-016", title="t", description="d", repo_path="https://github.com/o/r")
+    )
+    state.upsert_unit_state(
+        WorkUnitState(
+            unit_id="F-016-U-1",
+            feature_id="F-016",
+            status="coding",
+            branch="b",
+            coder_session_id="sesn-preserved",
+            pr_number=77,
+            review_round=3,
+        )
+    )
+    monkeypatch.setattr("orchestrator.tools.execution.ntfy.push_escalation", lambda *a, **k: True)
+
+    execution._escalate_spawn_cap("F-016-U-1", "F-016", attempts=3)
+
+    row = state.get_unit_state("F-016-U-1")
+    assert row.status == "escalated"
+    assert row.last_error.startswith(execution._SPAWN_FAILURE_CAP_LAST_ERROR_PREFIX)
+    # The columns ``upsert_unit_state(WorkUnitState(...))`` would have
+    # blanked — these MUST survive the cap escalation.
+    assert row.coder_session_id == "sesn-preserved"
+    assert row.pr_number == 77
+    assert row.review_round == 3
+
+
+def test_escalate_spawn_cap_ntfy_gated_on_record_event_insert(tmp_state_db, monkeypatch):
+    """M2: the ntfy push fires only when the ``spawn_failure_cap_hit``
+    event was actually inserted. A same-attempt re-check (or a multi-
+    process race) hits the dedupe_key and the event INSERT silently
+    drops; the push must drop with it so the user isn't double-paged.
+    """
+    state.save_feature(
+        Feature(id="F-016", title="t", description="d", repo_path="https://github.com/o/r")
+    )
+    state.upsert_unit_state(
+        WorkUnitState(unit_id="F-016-U-1", feature_id="F-016", status="coding", branch="b")
+    )
+    pushes: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        "orchestrator.tools.execution.ntfy.push_escalation",
+        lambda u, reason, *, reason_slug="unknown", **k: pushes.append((u, reason, reason_slug)),
+    )
+
+    # First call → inserts the event → pushes.
+    execution._escalate_spawn_cap("F-016-U-1", "F-016", attempts=3)
+    # Second call with the SAME attempts → dedupe_key collision →
+    # record_event returns False → push gated off.
+    execution._escalate_spawn_cap("F-016-U-1", "F-016", attempts=3)
+
+    cap_events = [
+        e for e in state.list_events("F-016-U-1") if e["event_type"] == "spawn_failure_cap_hit"
+    ]
+    assert len(cap_events) == 1
+    cap_pushes = [p for p in pushes if p[2] == "spawn_failure_cap"]
+    assert len(cap_pushes) == 1

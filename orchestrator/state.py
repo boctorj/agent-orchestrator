@@ -910,6 +910,25 @@ def list_events(unit_id: str, limit: int = 200) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def tail_events(unit_id: str, limit: int = 200) -> list[dict]:
+    """Return the most-recent ``limit`` events for a unit, newest first.
+
+    Counterpart to :func:`list_events`: same ordering rules (``ts`` then
+    ``id``) but DESCending, so the ``LIMIT`` returns the *tail* of the
+    timeline rather than the head. Callers that only need the latest
+    few rows (e.g. dedupe-against-most-recent-prior, last-marker scans)
+    must use this — ``list_events`` with a small limit silently returns
+    the OLDEST N events instead, which on units past ~200 events
+    compares against stale rows and breaks the dedupe contract.
+    """
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM unit_events WHERE unit_id = ? ORDER BY ts DESC, id DESC LIMIT ?",
+            (unit_id, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def summarize_unit(unit_id: str) -> dict:
     """Build a human-friendly digest of a unit's lifecycle.
 

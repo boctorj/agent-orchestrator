@@ -83,14 +83,17 @@ def _snapshot_interval_hours() -> int:
 # on every ~6s daemon poll (no dedupe). Hammered the GitHub API and bloated
 # unit_events with hundreds of identical rows.
 #
-# Dedupe rules (both must agree to write a new row):
-#   1. **Failing-check-set changed.** If the failing checks for THIS probe
-#      match the most-recent prior ci_drift_detected row, the situation has
-#      not evolved and the event is a no-op.
-#   2. **Rate-limit window expired.** Same as ``health_report_snapshot``,
-#      governed by ``ORCH_HEALTH_SNAPSHOT_INTERVAL_HOURS``. A re-emit fires
-#      only when the prior drift row is older than the window OR the set
-#      changes.
+# Dedupe rules (re-emit fires when ANY of these holds — the first emit on a
+# unit with no prior row also always fires):
+#   1. **Failing-check-set changed.** The failing checks for THIS probe
+#      differ from the most-recent prior ci_drift_detected row for the unit.
+#      A new check going red or one recovering counts as drift evolution
+#      worth surfacing.
+#   2. **Rate-limit window expired.** The most-recent prior row is older
+#      than ``ORCH_HEALTH_SNAPSHOT_INTERVAL_HOURS`` (the same throttle knob
+#      ``health_report_snapshot`` uses). Time backstop so a still-broken
+#      PR re-surfaces in the daily-ish digest rather than silently never
+#      again.
 # ---------------------------------------------------------------------------
 
 
@@ -123,12 +126,17 @@ def _should_emit_ci_drift(unit_state: WorkUnitState, action: Action) -> bool:
 
     The first ``ci_drift_detected`` for a unit (no prior row) always
     fires — there's nothing to dedupe against.
+
+    Walks :func:`state.tail_events` (newest-first) rather than reversing
+    a :func:`list_events` page — ``list_events`` returns the OLDEST 200
+    rows so a long-lived unit's most recent drift would be invisible to
+    the dedupe and the contract would silently break.
     """
     interval = _snapshot_interval_hours()
     now = datetime.now(UTC)
     incoming = _parse_failing_set(action.details)
-    events = state.list_events(unit_state.unit_id)
-    for ev in reversed(events):  # most-recent first
+    events = state.tail_events(unit_state.unit_id)
+    for ev in events:  # newest-first
         if ev.get("event_type") != "ci_drift_detected":
             continue
         prior_set = _parse_failing_set(ev.get("details") or "")

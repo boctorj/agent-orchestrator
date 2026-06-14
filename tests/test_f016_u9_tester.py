@@ -55,8 +55,16 @@ FEATURE_ID = "F-016"
 UNIT_ID = "F-016-U-1"
 REPO_URL = "https://github.com/o/r"
 SPAWN_CAP_EXPECTED = 3  # spec § attempt cap
-GUARDED_STATUSES = sorted(ACTIVE_UNIT_STATUSES | {"escalated"})
-NON_GUARDED_STATUSES = ("pending", "cancelled", "done", "approved_awaiting_merge")
+# Re-spawn refused on every in-flight status + ``escalated`` + the two
+# terminal-merge statuses (``done`` / ``approved_awaiting_merge``). PR
+# #69 C1: the latter two carry the session id / pr_number from the
+# original spawn, and a stray re-spawn would blank those columns via
+# the upsert in ``spawn_unit`` — silently destroying the merge record.
+GUARDED_STATUSES = sorted(ACTIVE_UNIT_STATUSES | {"escalated", "done", "approved_awaiting_merge"})
+# Only ``pending`` and ``cancelled`` accept a fresh spawn. ``done`` /
+# ``approved_awaiting_merge`` are intentionally NOT here — see
+# ``GUARDED_STATUSES``.
+NON_GUARDED_STATUSES = ("pending", "cancelled")
 
 
 # ---------------------------------------------------------------------------
