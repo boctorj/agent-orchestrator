@@ -138,7 +138,7 @@ def _failing_set_from_action(action: Action) -> frozenset[str]:
     least-common-denominator producer.
     """
     raw = action.payload.get("failing")
-    if isinstance(raw, list | tuple | set | frozenset):
+    if isinstance(raw, (list, tuple, set, frozenset)):
         return frozenset(str(item) for item in raw if str(item).strip())
     return _parse_failing_set(action.details)
 
@@ -182,9 +182,9 @@ def _should_emit_ci_drift(unit_state: WorkUnitState, action: Action) -> bool:
     if prior_set != incoming:
         return True  # set changed → real drift evolution → emit
     if interval <= 0:
-        # Rate-limit disabled — still respect set-equality (which just
-        # failed), so unchanged-set + disabled-throttle is a no-op.
-        # Preserves the dedupe-by-content guarantee while letting
+        # Rate-limit disabled — still respect set-equality (already
+        # confirmed above), so unchanged-set + disabled-throttle is a
+        # no-op. Preserves the dedupe-by-content guarantee while letting
         # operators opt-out of the time window.
         return False
     ts = prior.get("ts") or ""
