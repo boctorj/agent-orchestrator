@@ -105,6 +105,14 @@ def _parse_failing_set(details: str) -> frozenset[str]:
     match (a malformed legacy row, or a future details-format change) —
     that yields a conservative "treat as different set" outcome, so a
     real drift always fires through.
+
+    **Fragile to literal commas in check names** — ``"a, b, c".split(",")``
+    treats embedded commas as separators. GitHub check names rarely
+    contain commas in practice, so the dedupe-by-content guarantee
+    survives the common case, but the incoming side now prefers
+    :func:`_failing_set_from_action` which reads the structured payload
+    directly. This parser remains for the prior-from-DB side where
+    only the ``details`` string is persisted.
     """
     prefix = "failing checks: "
     if not details.startswith(prefix):
@@ -113,6 +121,26 @@ def _parse_failing_set(details: str) -> frozenset[str]:
     if not payload:
         return frozenset()
     return frozenset(item.strip() for item in payload.split(",") if item.strip())
+
+
+def _failing_set_from_action(action: Action) -> frozenset[str]:
+    """Robust failing-set extraction for the *incoming* drift action.
+
+    Prefers the structured ``action.payload["failing"]`` list (set by
+    :func:`orchestrator.health._ci_drift_event`) over comma-parsing
+    ``action.details``. The payload preserves check names verbatim,
+    including any with embedded commas — :func:`_parse_failing_set`'s
+    comma-split would mangle those.
+
+    Falls back to ``_parse_failing_set(action.details)`` if the payload
+    is missing or malformed (e.g. a future producer that doesn't set
+    ``payload['failing']``). That keeps the dedupe robust to the
+    least-common-denominator producer.
+    """
+    raw = action.payload.get("failing")
+    if isinstance(raw, list | tuple | set | frozenset):
+        return frozenset(str(item) for item in raw if str(item).strip())
+    return _parse_failing_set(action.details)
 
 
 def _should_emit_ci_drift(unit_state: WorkUnitState, action: Action) -> bool:
@@ -137,10 +165,19 @@ def _should_emit_ci_drift(unit_state: WorkUnitState, action: Action) -> bool:
     """
     interval = _snapshot_interval_hours()
     now = datetime.now(UTC)
-    incoming = _parse_failing_set(action.details)
+    # Incoming: prefer the structured ``payload['failing']`` over
+    # comma-parsing ``details`` so check names with embedded commas
+    # round-trip correctly through the dedupe. See
+    # :func:`_failing_set_from_action` for the fallback contract.
+    incoming = _failing_set_from_action(action)
     prior = state.last_event_of_type(unit_state.unit_id, "ci_drift_detected")
     if prior is None:
         return True  # no prior ci_drift_detected row — first emit always fires
+    # Prior: only ``details`` is persisted on the DB row, so the
+    # legacy comma-parse is the only option. Symmetry with the
+    # incoming side requires the producer's stored ``details`` form
+    # to also avoid commas in check names — true today (GitHub check
+    # names don't contain commas in practice).
     prior_set = _parse_failing_set(prior.get("details") or "")
     if prior_set != incoming:
         return True  # set changed → real drift evolution → emit

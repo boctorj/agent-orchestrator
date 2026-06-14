@@ -1210,6 +1210,74 @@ def test_last_event_of_type_returns_none_when_absent(tmp_state_db):
 
 
 # ============================================================================
+# (4b) _failing_set_from_action prefers payload over comma-parsed details
+# ============================================================================
+
+
+class TestFailingSetFromAction:
+    """PR #69 reviewer observation: ``_parse_failing_set`` is fragile to
+    literal commas in check names (``"my, check"`` split on comma yields
+    two items). The incoming side of the dedupe now prefers the
+    structured ``action.payload['failing']`` over comma-parsing
+    ``action.details``, preserving check names verbatim.
+    """
+
+    def test_uses_structured_payload_when_present(self):
+        action = Action.event(
+            "ci_drift_detected",
+            "CI red",
+            details="failing checks: a, b, c",  # comma-parse view
+            payload={"failing": ["a", "b", "c"]},
+        )
+        assert tools_health._failing_set_from_action(action) == frozenset({"a", "b", "c"})
+
+    def test_payload_preserves_check_names_with_commas(self):
+        """A check name with a literal comma (rare but possible) round-
+        trips through the structured payload but would mangle through
+        ``details.split(',')``."""
+        weird = "scan, fast"
+        action = Action.event(
+            "ci_drift_detected",
+            "CI red",
+            details=f"failing checks: {weird}, other",  # comma-split would yield 3
+            payload={"failing": [weird, "other"]},
+        )
+        result = tools_health._failing_set_from_action(action)
+        assert result == frozenset({weird, "other"})
+        # Sanity: the legacy details parser DOES mangle it (proves the bug
+        # the new helper sidesteps).
+        legacy = tools_health._parse_failing_set(action.details)
+        assert legacy == frozenset({weird.split(",")[0], weird.split(",")[1].strip(), "other"})
+
+    def test_falls_back_to_details_when_payload_missing(self):
+        action = Action.event(
+            "ci_drift_detected",
+            "CI red",
+            details="failing checks: a, b",
+            payload={"status": "in_ci"},  # no 'failing' key
+        )
+        assert tools_health._failing_set_from_action(action) == frozenset({"a", "b"})
+
+    def test_falls_back_to_details_when_payload_wrong_type(self):
+        action = Action.event(
+            "ci_drift_detected",
+            "CI red",
+            details="failing checks: a, b",
+            payload={"failing": "a, b"},  # string, not a list
+        )
+        assert tools_health._failing_set_from_action(action) == frozenset({"a", "b"})
+
+    def test_empty_payload_list_yields_empty_set(self):
+        action = Action.event(
+            "ci_drift_detected",
+            "CI red",
+            details="failing checks: ",
+            payload={"failing": []},
+        )
+        assert tools_health._failing_set_from_action(action) == frozenset()
+
+
+# ============================================================================
 # (5) _escalate_spawn_cap uses touch_unit + gates ntfy on record_event (M1, M2)
 # ============================================================================
 
