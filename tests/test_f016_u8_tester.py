@@ -48,7 +48,6 @@ from orchestrator.ci_wait import CIWaitResult
 from orchestrator.models import Feature, WorkUnit, WorkUnitState
 from orchestrator.tools import execution
 
-
 # --------------------------- shared fixtures (mirrors spec file) ---------------------------
 
 
@@ -227,9 +226,7 @@ class TestSurfaceTimingUnderNtfyPlusDaemon:
         from orchestrator.tools import scheduling
 
         start = time.monotonic()
-        out = scheduling.parallel_units(
-            "F-001", ["F-016-U-8-A", "F-016-U-8-B", "F-016-U-8-C"]
-        )
+        out = scheduling.parallel_units("F-001", ["F-016-U-8-A", "F-016-U-8-B", "F-016-U-8-C"])
         elapsed = time.monotonic() - start
         parsed = json.loads(out)
         assert parsed["unit_count"] == 3
@@ -286,9 +283,7 @@ class TestSurfaceTimingUnderNtfyPlusDaemon:
         elapsed = time.monotonic() - start
         parsed = json.loads(out)
         assert parsed["unit_count"] == 3
-        assert elapsed < 3.0, (
-            f"parallel_units_global(3 units) took {elapsed:.2f}s; acceptance ≤3 s"
-        )
+        assert elapsed < 3.0, f"parallel_units_global(3 units) took {elapsed:.2f}s; acceptance ≤3 s"
 
 
 # --------------------------- Acceptance #2: killed-lead doesn't strand ---------------------------
@@ -550,9 +545,7 @@ class TestRunOneChainsAsyncSpawnIntoCycleReview:
             cycle_calls.append((fid, uid))
             return original_cycle(fid, uid)
 
-        monkeypatch.setattr(
-            "orchestrator.tools.scheduling.cycle_review", counting_cycle
-        )
+        monkeypatch.setattr("orchestrator.tools.scheduling.cycle_review", counting_cycle)
 
         from orchestrator.tools import scheduling
 
