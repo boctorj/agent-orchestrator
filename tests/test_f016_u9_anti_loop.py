@@ -976,10 +976,7 @@ class TestStateTailEvents:
         """
         self._seed_unit()
         # 250 old rows + 3 recent ones the dedupe should see.
-        for i in range(250):
-            state.record_event(
-                "F-016-U-1", "F-016", "old_filler", source="orchestrator", summary=f"f{i}"
-            )
+        _bulk_record_filler("F-016-U-1", "F-016", "old_filler", 250)
         for i in range(3):
             state.record_event(
                 "F-016-U-1", "F-016", "recent", source="orchestrator", summary=f"r{i}"
@@ -993,12 +990,78 @@ class TestStateTailEvents:
         assert types[3:] == ["old_filler", "old_filler"]
 
 
+def _bulk_record_filler(
+    unit_id: str,
+    feature_id: str,
+    event_type: str,
+    n: int,
+    *,
+    source: str = "orchestrator",
+    summary_prefix: str = "f",
+) -> None:
+    """Insert ``n`` filler events in a SINGLE transaction.
+
+    Per-row :func:`state.record_event` opens a connection and commits
+    (an fsync) on every call; the 9_000-row burial tests below time out
+    the suite on Windows CI as a result. Bulk-inserting in one
+    transaction is dramatically faster and order-faithful —
+    ``unit_events.id`` autoincrements in insert order, so the
+    ``(ts DESC, id DESC)`` tail walk sees these rows exactly as if they
+    had been recorded one-by-one.
+    """
+    ts = state._now()
+    with state._connect() as conn:
+        conn.executemany(
+            "INSERT INTO unit_events "
+            "(unit_id, feature_id, ts, event_type, source, cycle_number, "
+            "summary, details, session_id, dedupe_key) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    unit_id,
+                    feature_id,
+                    ts,
+                    event_type,
+                    source,
+                    None,
+                    f"{summary_prefix}{i}",
+                    "",
+                    "",
+                    None,
+                )
+                for i in range(n)
+            ],
+        )
+
+
+def _count_event_type(unit_id: str, event_type: str) -> int:
+    """Raw ``COUNT(*)`` for an event_type on a unit — bypasses any
+    ``LIMIT``-bound helper so the count reflects what's actually in
+    ``unit_events``. The pre-fix regression tests used
+    ``list_events`` (oldest 200) which itself was windowed, so a new
+    drift row at position 252+ was invisible and the assertion passed
+    whether the dedupe held or not (PR #69 reviewer H1).
+    """
+    with state._connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM unit_events WHERE unit_id = ? AND event_type = ?",
+            (unit_id, event_type),
+        ).fetchone()
+    return int(row["c"]) if row else 0
+
+
 def test_consecutive_failed_spawns_uses_tail_past_event_window(tmp_state_db):
     """Regression guard for H2: the cap counter must walk the tail of
     ``unit_events``, not the head. A unit with >200 events whose tail
     contains 3 fresh ``coder_error`` rows MUST still report 3 — the
     pre-fix ``reversed(list_events(...))`` walked the oldest 200 rows
     and missed the recent failures, so the cap silently never fired.
+
+    Also seeds a session-id-bearing reset signal 250+ events back to
+    pin the PR #69 H1 follow-up: the reset signal must remain visible
+    even when buried beyond the default ``tail_events`` window — pre-
+    fix the cap counter used the default ``limit=200`` and would miss
+    a buried reset signal, then falsely cap-escalate.
     """
     state.save_feature(
         Feature(id="F-016", title="t", description="d", repo_path="https://github.com/o/r")
@@ -1006,11 +1069,18 @@ def test_consecutive_failed_spawns_uses_tail_past_event_window(tmp_state_db):
     state.upsert_unit_state(
         WorkUnitState(unit_id="F-016-U-1", feature_id="F-016", status="pending", branch="b")
     )
-    # 250 ancient unrelated events.
-    for i in range(250):
-        state.record_event(
-            "F-016-U-1", "F-016", "old_filler", source="orchestrator", summary=f"f{i}"
-        )
+    # Reset signal at the very bottom of the timeline (oldest row).
+    state.record_event(
+        "F-016-U-1",
+        "F-016",
+        "pr_opened",
+        source="coder",
+        cycle_number=0,
+        summary="early reset signal",
+        session_id="sesn-buried",
+    )
+    # 250 ancient unrelated events on top of the reset signal.
+    _bulk_record_filler("F-016-U-1", "F-016", "old_filler", 250)
     # Three recent coder_error rows at cycle 0 — the cap-counting tail.
     for i in range(3):
         state.record_event(
@@ -1022,19 +1092,74 @@ def test_consecutive_failed_spawns_uses_tail_past_event_window(tmp_state_db):
             summary=f"e{i}",
         )
 
+    # With the buried reset signal visible (wide tail), the count is
+    # exactly the 3 fresh failures since the reset — NOT 3 plus any
+    # phantom older errors, and crucially NOT 0 (which would happen
+    # if the walker stopped early on a row it couldn't see).
     assert execution._consecutive_failed_spawns("F-016-U-1") == 3
 
 
-def test_should_emit_ci_drift_uses_tail_past_event_window(tmp_state_db, monkeypatch):
-    """Sibling regression guard for H2 on the drift-dedupe side. A unit
-    with >200 events whose most-recent ``ci_drift_detected`` row carries
-    the SAME failing-set as the incoming action must dedupe — the pre-
-    fix ``reversed(list_events(...))`` couldn't see the most-recent
-    drift row past the 200-row head window, so it always re-emitted.
+def test_consecutive_failed_spawns_sees_buried_reset_signal(tmp_state_db):
+    """Direct pin for the PR #69 H1 follow-up on the cap-counter side.
+
+    Layout: reset_signal → 3 failures → 9_000 filler rows. With a
+    9_000-row tail the failures are nowhere near the head; the cap
+    counter MUST still report 3 (not 0 from missing the failures, and
+    not >3 from missing the reset). Pre-fix at ``limit=200`` the
+    failures+reset would be nowhere in view → reported 0.
+    """
+    state.save_feature(
+        Feature(id="F-016", title="t", description="d", repo_path="https://github.com/o/r")
+    )
+    state.upsert_unit_state(
+        WorkUnitState(unit_id="F-016-U-1", feature_id="F-016", status="pending", branch="b")
+    )
+    state.record_event(
+        "F-016-U-1",
+        "F-016",
+        "pr_opened",
+        source="coder",
+        cycle_number=0,
+        summary="reset",
+        session_id="sesn-deep",
+    )
+    for i in range(3):
+        state.record_event(
+            "F-016-U-1",
+            "F-016",
+            "coder_error",
+            source="orchestrator",
+            cycle_number=0,
+            summary=f"e{i}",
+        )
+    # Heavy filler tail on top of the failures — the failures sit
+    # near the bottom of the most-recent window.
+    _bulk_record_filler("F-016-U-1", "F-016", "noise", 9_000, summary_prefix="n")
+
+    # Counter walks the wide tail, reaches the 3 failures, then stops
+    # at the buried reset signal. Pre-fix this would have been 0
+    # (default 200-row window saw only the most-recent noise).
+    assert execution._consecutive_failed_spawns("F-016-U-1") == 3
+
+
+def test_should_emit_ci_drift_dedupes_past_tail_events_window(tmp_state_db, monkeypatch):
+    """PR #69 reviewer H1 (follow-up): the ci_drift dedupe MUST survive
+    a deep event history between two same-set drift candidates.
+
+    Layout: 1 prior ``ci_drift_detected`` (set ``["test"]``) → 250
+    unrelated events → re-fire with the same set. Pre-fix (default
+    ``tail_events(limit=200)``) the walker couldn't see the prior
+    drift row → "no prior" → emitted a fresh drift → 2 rows. The
+    post-fix targeted ``last_event_of_type`` query is unaffected by
+    the event volume — sees the prior, dedupes, total stays at 1.
+
+    Asserts via a raw ``COUNT(*)`` query (not ``list_events`` /
+    ``tail_events``) so the regression actually fails if the dedupe
+    fails — the pre-fix companion test used ``list_events`` whose
+    own 200-row window hid the false-emitted row, masking the bug.
     """
     monkeypatch.setenv("ORCH_HEALTH_SNAPSHOT_INTERVAL_HOURS", "24")
     unit = _seed_unit_for_drift()
-    # Bury the FIRST drift row under 250 unrelated events.
     state.record_event(
         "F-016-U-1",
         "F-016",
@@ -1042,22 +1167,137 @@ def test_should_emit_ci_drift_uses_tail_past_event_window(tmp_state_db, monkeypa
         source="orchestrator",
         details="failing checks: test",
     )
-    for i in range(250):
-        state.record_event(
-            "F-016-U-1", "F-016", "old_filler", source="orchestrator", summary=f"f{i}"
-        )
+    _bulk_record_filler("F-016-U-1", "F-016", "old_filler", 250)
 
-    # Re-fire with the same failing set — must be suppressed because
-    # ``tail_events`` sees the buried prior drift row in the recent tail
-    # (the 250 fillers shift it down but it's still in the most-recent N).
     tools_health._apply_action(unit, _drift_action(["test"]))
 
-    drift_rows = [
-        e for e in state.list_events("F-016-U-1") if e["event_type"] == "ci_drift_detected"
-    ]
-    # Exactly one drift row — the original one. The dedupe held even with
-    # a deep event history between the prior drift and now.
-    assert len(drift_rows) == 1
+    # Raw COUNT — unaffected by any windowed helper.
+    assert _count_event_type("F-016-U-1", "ci_drift_detected") == 1
+
+
+def test_should_emit_ci_drift_dedupes_with_very_deep_history(tmp_state_db, monkeypatch):
+    """Extreme variant of the H1 follow-up: 9_000 unrelated events
+    between the prior drift row and the re-fire. The targeted SQL
+    query sees the prior drift regardless of how deep the burial is."""
+    monkeypatch.setenv("ORCH_HEALTH_SNAPSHOT_INTERVAL_HOURS", "24")
+    unit = _seed_unit_for_drift()
+    state.record_event(
+        "F-016-U-1",
+        "F-016",
+        "ci_drift_detected",
+        source="orchestrator",
+        details="failing checks: test",
+    )
+    _bulk_record_filler("F-016-U-1", "F-016", "old_filler", 9_000)
+
+    tools_health._apply_action(unit, _drift_action(["test"]))
+
+    assert _count_event_type("F-016-U-1", "ci_drift_detected") == 1
+
+
+def test_last_event_of_type_returns_most_recent(tmp_state_db):
+    """The new ``state.last_event_of_type`` helper underlying
+    ``_should_emit_ci_drift``: must return the MOST RECENT event of the
+    requested type regardless of how many other events exist."""
+    state.save_feature(
+        Feature(id="F-016", title="t", description="d", repo_path="https://github.com/o/r")
+    )
+    state.upsert_unit_state(
+        WorkUnitState(unit_id="F-016-U-1", feature_id="F-016", status="pending", branch="b")
+    )
+    # Oldest target row.
+    state.record_event("F-016-U-1", "F-016", "ci_drift_detected", details="failing checks: a")
+    # Burial: lots of unrelated events.
+    _bulk_record_filler("F-016-U-1", "F-016", "noise", 500, summary_prefix="n")
+    # Newest target row.
+    state.record_event("F-016-U-1", "F-016", "ci_drift_detected", details="failing checks: b")
+    # Final burial.
+    _bulk_record_filler("F-016-U-1", "F-016", "more_noise", 500, summary_prefix="m")
+
+    row = state.last_event_of_type("F-016-U-1", "ci_drift_detected")
+    assert row is not None
+    assert row["details"] == "failing checks: b"
+
+
+def test_last_event_of_type_returns_none_when_absent(tmp_state_db):
+    state.save_feature(
+        Feature(id="F-016", title="t", description="d", repo_path="https://github.com/o/r")
+    )
+    state.upsert_unit_state(
+        WorkUnitState(unit_id="F-016-U-1", feature_id="F-016", status="pending", branch="b")
+    )
+    for i in range(10):
+        state.record_event("F-016-U-1", "F-016", "noise", summary=f"n{i}")
+
+    assert state.last_event_of_type("F-016-U-1", "ci_drift_detected") is None
+
+
+# ============================================================================
+# (4b) _failing_set_from_action prefers payload over comma-parsed details
+# ============================================================================
+
+
+class TestFailingSetFromAction:
+    """PR #69 reviewer observation: ``_parse_failing_set`` is fragile to
+    literal commas in check names (``"my, check"`` split on comma yields
+    two items). The incoming side of the dedupe now prefers the
+    structured ``action.payload['failing']`` over comma-parsing
+    ``action.details``, preserving check names verbatim.
+    """
+
+    def test_uses_structured_payload_when_present(self):
+        action = Action.event(
+            "ci_drift_detected",
+            "CI red",
+            details="failing checks: a, b, c",  # comma-parse view
+            payload={"failing": ["a", "b", "c"]},
+        )
+        assert tools_health._failing_set_from_action(action) == frozenset({"a", "b", "c"})
+
+    def test_payload_preserves_check_names_with_commas(self):
+        """A check name with a literal comma (rare but possible) round-
+        trips through the structured payload but would mangle through
+        ``details.split(',')``."""
+        weird = "scan, fast"
+        action = Action.event(
+            "ci_drift_detected",
+            "CI red",
+            details=f"failing checks: {weird}, other",  # comma-split would yield 3
+            payload={"failing": [weird, "other"]},
+        )
+        result = tools_health._failing_set_from_action(action)
+        assert result == frozenset({weird, "other"})
+        # Sanity: the legacy details parser DOES mangle it (proves the bug
+        # the new helper sidesteps).
+        legacy = tools_health._parse_failing_set(action.details)
+        assert legacy == frozenset({weird.split(",")[0], weird.split(",")[1].strip(), "other"})
+
+    def test_falls_back_to_details_when_payload_missing(self):
+        action = Action.event(
+            "ci_drift_detected",
+            "CI red",
+            details="failing checks: a, b",
+            payload={"status": "in_ci"},  # no 'failing' key
+        )
+        assert tools_health._failing_set_from_action(action) == frozenset({"a", "b"})
+
+    def test_falls_back_to_details_when_payload_wrong_type(self):
+        action = Action.event(
+            "ci_drift_detected",
+            "CI red",
+            details="failing checks: a, b",
+            payload={"failing": "a, b"},  # string, not a list
+        )
+        assert tools_health._failing_set_from_action(action) == frozenset({"a", "b"})
+
+    def test_empty_payload_list_yields_empty_set(self):
+        action = Action.event(
+            "ci_drift_detected",
+            "CI red",
+            details="failing checks: ",
+            payload={"failing": []},
+        )
+        assert tools_health._failing_set_from_action(action) == frozenset()
 
 
 # ============================================================================
